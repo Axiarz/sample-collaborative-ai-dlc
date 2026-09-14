@@ -76,6 +76,7 @@ import {
 } from './section.js';
 import { runQuorumEdit } from './quorum-edit.js';
 import { buildIntentAttribution } from './pr-attribution.js';
+import { bindGateCallback } from './gate-callback.js';
 import { OVERRIDE_REASON_MAX } from '../shared/gate-answer.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
@@ -944,7 +945,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         const expectedStageInstanceId = result.stageInstanceId ?? stage.stageInstanceId ?? null;
         const expectedCallbackOwner = `stage:${expectedStageInstanceId ?? label}`;
         const callbackBound = await ctxArg.step(`bind-callback-${humanTaskId}`, () =>
-          store.setGateCallbackId({
+          bindGateCallback(store, {
             executionId,
             humanTaskId,
             callbackId,
@@ -1069,7 +1070,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // over the fresh row — field incident). Verify we still own the run
         // BEFORE dispatching anything.
         const ownerRunId = await ctxArg.step(`run-owner-${humanTaskId}`, async () => {
-          const currentMeta = await store.getExecution(executionId);
+          const currentMeta = await store.getExecution(executionId, { consistentRead: true });
           return currentMeta?.orchestratorRunId ?? null;
         });
         if (runId && ownerRunId && ownerRunId !== runId) {

@@ -1868,7 +1868,11 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
 
   const getUnitPlan = async (executionId) => {
     const { Item } = await ddb.send(
-      new GetCommand({ TableName: table(), Key: unitPlanKey(executionId) }),
+      new GetCommand({
+        TableName: table(),
+        Key: unitPlanKey(executionId),
+        ConsistentRead: true,
+      }),
     );
     return Item ?? null;
   };
