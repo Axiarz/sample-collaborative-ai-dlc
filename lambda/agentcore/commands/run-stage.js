@@ -30,6 +30,7 @@ import { withCredentialSession } from '../credential-session.js';
 
 import { Logger } from '@aws-lambda-powertools/logger';
 import { createHash, randomUUID } from 'node:crypto';
+import { scopeStageAttempt } from '../../shared/stage-attempt.js';
 import {
   selectCli,
   getDriver,
@@ -1596,7 +1597,7 @@ const mergeCodeCommitRefs = (priorRefs, gitResult) => {
   return refs;
 };
 
-const runStageImplementation = async (
+const runStageAttempt = async (
   {
     projectId,
     intentId,
@@ -1685,6 +1686,7 @@ const runStageImplementation = async (
     // traceability/operator recovery; the callback itself is completed by
     // run-stage-start's background job, not here. Null on the legacy sync path.
     stageCallbackId = null,
+    orchestratorRunId = null,
     // Agent launching time (cold start) in ms — orchestrator dispatch → job
     // accept, computed by run-stage-start. Recorded below as an `agentLaunchMs`
     // metric sample (gauge). Null on the legacy sync path / old dispatchers.
@@ -1693,7 +1695,7 @@ const runStageImplementation = async (
   deps,
 ) => {
   const {
-    store,
+    store: processStore,
     loadLibrary,
     resolveEnsembleTopology = defaultResolveEnsembleTopology,
     loadBlockBody,
@@ -1765,6 +1767,7 @@ const runStageImplementation = async (
     // of the two bounds comes first. Injected for tests.
     processUptimeMs = () => process.uptime() * 1000,
   } = deps;
+  let store = processStore;
 
   const now = () => clock();
   const stageStartedAtMs = nowMs();
@@ -1836,7 +1839,7 @@ const runStageImplementation = async (
       detail: detail ? String(detail).slice(0, 300) : null,
     });
     if (stageInstanceId) {
-      await store
+      const saved = await store
         .updateStageState({
           executionId,
           stageInstanceId,
@@ -1848,7 +1851,12 @@ const runStageImplementation = async (
             : {}),
           ...(clearPending ? { pendingHumanTaskId: null } : {}),
         })
-        .catch(() => {});
+        .then(() => true)
+        .catch((error) => {
+          if (error?.name === 'ConditionalCheckFailedException') return false;
+          return true; // preserve the original failure during a storage outage
+        });
+      if (!saved) return { ok: false, reason: 'retired' };
     }
     await store
       .appendEvent({
@@ -1982,6 +1990,14 @@ const runStageImplementation = async (
   const stageInstanceId = unitSlug
     ? planStageInstanceId(plan.namespace, stageId, unitSlug, sectionIndex)
     : stage.stageInstanceId;
+  const ownership =
+    orchestratorRunId && stageCallbackId
+      ? { orchestratorRunId, stageCallbackId, stageInstanceId }
+      : null;
+  store = scopeStageAttempt(processStore, ownership);
+  if (ownership) {
+    await processStore.claimStageAttempt({ executionId, ownership });
+  }
 
   // A lane run must reference a unit the promoted UNITPLAN actually knows —
   // scheduling truth is the DDB snapshot, never the dispatch payload alone.
@@ -2488,6 +2504,8 @@ const runStageImplementation = async (
     unitSlug,
     sectionIndex,
     stageAttempt: priorStageRow?.attempt ?? 0,
+    orchestratorRunId,
+    stageCallbackId,
     role: 'author',
     model,
     // Carries the resolved policy to the MCP server, which registers the
@@ -4161,12 +4179,20 @@ const runStageImplementation = async (
         );
       });
     if (!unitSlug) {
-      await store.updateExecution({ executionId, pendingHumanTaskId: null }).catch((error) => {
-        console.error(
-          `[run-stage] failed to clear pending gate execution=${executionId} stage=${stageInstanceId} reason=${reason}`,
-          error,
-        );
-      });
+      await store
+        .updateExecution({
+          executionId,
+          pendingHumanTaskId: null,
+          ...(ownership
+            ? { ifOrchestratorRunId: orchestratorRunId, ifPendingHumanTaskId: parked.humanTaskId }
+            : {}),
+        })
+        .catch((error) => {
+          console.error(
+            `[run-stage] failed to clear pending gate execution=${executionId} stage=${stageInstanceId} reason=${reason}`,
+            error,
+          );
+        });
     }
     return fail(stageInstanceId, reason, detail, { clearPending: true });
   };
@@ -5073,6 +5099,15 @@ const runStageImplementation = async (
     ...(Array.isArray(producedHeads) ? { producedHeads } : {}),
     ...(producedHeadsUnavailable ? { producedHeadsUnavailable: true } : {}),
   };
+};
+
+const runStageImplementation = async (...args) => {
+  try {
+    return await runStageAttempt(...args);
+  } catch (error) {
+    if (error?.name === 'ConditionalCheckFailedException') return { ok: false, reason: 'retired' };
+    throw error;
+  }
 };
 
 // Exposed for unit tests (pure helpers; the runStage flow is integration-tested).

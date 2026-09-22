@@ -446,7 +446,7 @@ describe('orchestrator durable handler', () => {
     deps.store.getHumanTask = vi
       .fn()
       .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce({
+      .mockResolvedValue({
         humanTaskId: 'eg-validation-si-a-0',
         status: 'approved',
         answer: { decision: 'approve' },
@@ -498,8 +498,13 @@ describe('orchestrator durable handler', () => {
         status: 'rejected',
         answer: { decision: 'request-changes', feedback: 'tighten scope' },
       })
-      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({
+        humanTaskId: 'eg-validation-si-a-0',
+        status: 'rejected',
+        answer: { decision: 'request-changes', feedback: 'tighten scope' },
+      })
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue({
         humanTaskId: 'eg-validation-si-a-1',
         status: 'approved',
         answer: { decision: 'approve' },
