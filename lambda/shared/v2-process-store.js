@@ -113,6 +113,23 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
   const now = () => (clock ? clock() : new Date().toISOString());
   const nextId = () => (ids ? ids() : randomUUID());
 
+  const transact = async (TransactItems) => {
+    try {
+      await ddb.send(new TransactWriteCommand({ TransactItems }));
+    } catch (error) {
+      if (
+        error?.name === 'TransactionCanceledException' &&
+        error.CancellationReasons?.some((reason) => reason.Code === 'ConditionalCheckFailed')
+      ) {
+        throw Object.assign(new Error('Conditional transaction did not commit'), {
+          name: 'ConditionalCheckFailedException',
+          cause: error,
+        });
+      }
+      throw error;
+    }
+  };
+
   // Ownership invariant for worker writes: META still names this run and
   // STAGE still names this callback attempt. Check both in the SAME transaction
   // as the mutation; a read followed by an unconditional write cannot fence a
@@ -172,28 +189,11 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       }
       return { [type]: input };
     });
-    try {
-      await ddb.send(
-        new TransactWriteCommand({
-          TransactItems: [
-            ...(!writesMeta ? [{ ConditionCheck: ownsRun }] : []),
-            ...(!writesStage ? [{ ConditionCheck: ownsStage }] : []),
-            ...guarded,
-          ],
-        }),
-      );
-    } catch (error) {
-      if (
-        error?.name === 'TransactionCanceledException' &&
-        error.CancellationReasons?.some((reason) => reason.Code === 'ConditionalCheckFailed')
-      ) {
-        throw Object.assign(new Error('Stage attempt no longer owns this execution'), {
-          name: 'ConditionalCheckFailedException',
-          cause: error,
-        });
-      }
-      throw error;
-    }
+    await transact([
+      ...(!writesMeta ? [{ ConditionCheck: ownsRun }] : []),
+      ...(!writesStage ? [{ ConditionCheck: ownsStage }] : []),
+      ...guarded,
+    ]);
   };
 
   const claimStageAttempt = async ({ executionId, ownership }) => {
@@ -678,6 +678,11 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       });
       return { executionId, status };
     }
+    if (additionalWrites.length) {
+      const { ReturnValues: _returnValues, ...update } = params;
+      await transact([...additionalWrites, { Update: update }]);
+      return { executionId, status };
+    }
     if (credentialBinding !== undefined) {
       const row = { ...executionMetaKey(executionId), projectId, credentialBinding };
       const { ReturnValues: _returnValues, ...write } = params;
@@ -992,6 +997,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     loopBackNote,
     humanTaskId,
     ownership = null,
+    orchestratorRunId = null,
   }) => {
     const id = humanTaskId ?? nextId();
     const item = buildHumanTaskRow({
@@ -1060,6 +1066,25 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
           ownership,
           additionalWrites: writes,
         });
+      return item;
+    }
+    if (orchestratorRunId) {
+      item.orchestratorRunId = orchestratorRunId;
+      await updateExecution({
+        executionId,
+        status: 'WAITING',
+        pendingHumanTaskId: id,
+        ifOrchestratorRunId: orchestratorRunId,
+        additionalWrites: [
+          {
+            Put: {
+              TableName: table(),
+              Item: item,
+              ConditionExpression: 'attribute_not_exists(pk)',
+            },
+          },
+        ],
+      });
       return item;
     }
     await ddb.send(
@@ -1186,13 +1211,56 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     },
   });
 
+  const humanTaskAnswerOwnershipChecks = ({
+    executionId,
+    ifOrchestratorRunId,
+    ifStageCallbackId,
+    stageInstanceId,
+  }) =>
+    ifOrchestratorRunId
+      ? [
+          {
+            ConditionCheck: {
+              TableName: table(),
+              Key: executionMetaKey(executionId),
+              ConditionExpression: 'orchestratorRunId = :run AND #status IN (:running, :waiting)',
+              ExpressionAttributeNames: { '#status': 'status' },
+              ExpressionAttributeValues: {
+                ':run': ifOrchestratorRunId,
+                ':running': 'RUNNING',
+                ':waiting': 'WAITING',
+              },
+            },
+          },
+          ...(ifStageCallbackId && stageInstanceId
+            ? [
+                {
+                  ConditionCheck: {
+                    TableName: table(),
+                    Key: stageKey(executionId, stageInstanceId),
+                    ConditionExpression: 'stageCallbackId = :callback',
+                    ExpressionAttributeValues: { ':callback': ifStageCallbackId },
+                  },
+                },
+              ]
+            : []),
+        ]
+      : [];
+
   // Resolve a pending human gate (CAS on status=pending so it can't be answered
   // twice). `answer` is the structured answer payload.
   const answerHumanTask = async (input) => {
     try {
+      const update = humanTaskAnswerUpdate({ ...input, answeredAt: now() });
+      if (input.ifOrchestratorRunId) {
+        await transact([...humanTaskAnswerOwnershipChecks(input), { Update: update }]);
+        // Transactions have no ALL_NEW. Read the committed callback, which may
+        // have been bound while the answer was in flight.
+        return getHumanTask(input.executionId, input.humanTaskId, { consistentRead: true });
+      }
       const { Attributes } = await ddb.send(
         new UpdateCommand({
-          ...humanTaskAnswerUpdate({ ...input, answeredAt: now() }),
+          ...update,
           ReturnValues: 'ALL_NEW',
         }),
       );
@@ -1215,37 +1283,25 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       now: ts,
     });
     try {
-      await ddb.send(
-        new TransactWriteCommand({
-          TransactItems: [
-            { Update: humanTaskAnswerUpdate({ ...answerInput, answeredAt: ts }) },
-            {
-              Put: {
-                TableName: table(),
-                Item: steer,
-                ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
-              },
-            },
-          ],
-        }),
-      );
-      return {
-        answered: {
-          ...answerInput,
-          answer: answerInput.answer ?? null,
-          answeredBy: answerInput.answeredBy ?? null,
-          answeredByName: answerInput.answeredByName ?? null,
-          answeredAt: ts,
+      await transact([
+        ...humanTaskAnswerOwnershipChecks(answerInput),
+        { Update: humanTaskAnswerUpdate({ ...answerInput, answeredAt: ts }) },
+        {
+          Put: {
+            TableName: table(),
+            Item: steer,
+            ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
+          },
         },
+      ]);
+      return {
+        answered: await getHumanTask(answerInput.executionId, answerInput.humanTaskId, {
+          consistentRead: true,
+        }),
         steering: steer,
       };
     } catch (e) {
-      if (
-        e?.name === 'TransactionCanceledException' ||
-        e?.name === 'ConditionalCheckFailedException'
-      ) {
-        return null;
-      }
+      if (e?.name === 'ConditionalCheckFailedException') return null;
       throw e;
     }
   };
