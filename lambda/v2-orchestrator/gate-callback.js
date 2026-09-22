@@ -20,3 +20,45 @@ export const bindGateCallback = async (store, input) => {
   }
   return gate;
 };
+
+// Shared by engine and stage gates. The mutation and its recovery check must
+// agree on ownership: a committed write with a lost checkpoint is success.
+export const unparkGate = async (store, { executionId, humanTaskId, runId, unitSlug = null }) => {
+  // Lane gates never park META: another lane may own its single pending
+  // gate pointer, and this lane's META status has remained RUNNING. The
+  // conditional ownership update leaves that status and pointer intact.
+  if (unitSlug) {
+    try {
+      await store.updateExecution({
+        executionId,
+        orchestratorRunId: runId,
+        ifOrchestratorRunId: runId,
+      });
+      return true;
+    } catch (error) {
+      if (error?.name === 'ConditionalCheckFailedException') return false;
+      throw error;
+    }
+  }
+  try {
+    await store.updateExecution({
+      executionId,
+      status: 'RUNNING',
+      pendingHumanTaskId: null,
+      resumeRequired: null,
+      fromStatus: 'WAITING',
+      ifOrchestratorRunId: runId,
+      ifPendingHumanTaskId: humanTaskId,
+    });
+    return true;
+  } catch (error) {
+    if (error?.name !== 'ConditionalCheckFailedException') throw error;
+    const meta = await store.getExecution(executionId, { consistentRead: true });
+    return Boolean(
+      meta &&
+      meta.orchestratorRunId === runId &&
+      meta.status === 'RUNNING' &&
+      !meta.pendingHumanTaskId,
+    );
+  }
+};

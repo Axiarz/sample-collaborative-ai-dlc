@@ -52,7 +52,7 @@
 import processKeysPkg from '../shared/v2-process-keys.js';
 import { stageIsNoopForUnit } from '../shared/unit-kind-pruning.js';
 import { buildIntentAttribution } from './pr-attribution.js';
-import { bindGateCallback } from './gate-callback.js';
+import { bindGateCallback, unparkGate } from './gate-callback.js';
 import { assertPrStrategySupported } from '../shared/pr-strategy.js';
 import { repoProvider as sharedRepoProvider } from '../shared/repo-provider.js';
 import { parseChoice } from '../shared/gate-answer.js';
@@ -295,23 +295,9 @@ export const awaitEngineGate = async (
     store.getHumanTask(executionId, humanTaskId, { consistentRead: true }),
   );
   if (!gate || gate.status === 'superseded') return { superseded: true };
-  const unparked = await ctxArg.step(`gate-unpark-${name}`, async () => {
-    try {
-      // The answer reached the run, so any resume marker for it is resolved.
-      await store.updateExecution({
-        executionId,
-        status: 'RUNNING',
-        pendingHumanTaskId: null,
-        resumeRequired: null,
-        fromStatus: 'WAITING',
-        ifOrchestratorRunId: runId,
-      });
-      return true;
-    } catch (error) {
-      if (error?.name === 'ConditionalCheckFailedException') return false;
-      throw error;
-    }
-  });
+  const unparked = await ctxArg.step(`gate-unpark-${name}`, () =>
+    unparkGate(store, { executionId, humanTaskId, runId }),
+  );
   if (unparked === false) return { superseded: true };
   return { gate };
 };

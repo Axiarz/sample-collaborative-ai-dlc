@@ -217,6 +217,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     status,
     fromStatus = null,
     ifOrchestratorRunId = null,
+    ifPendingHumanTaskId,
     orchestratorRunId,
     durableExecutionName,
     durableExecutionArn,
@@ -537,6 +538,10 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     if (ifResumeRequiredFor !== null) {
       conditions.push('resumeRequired.humanTaskId = :ifRrh');
       params.ExpressionAttributeValues[':ifRrh'] = ifResumeRequiredFor;
+    }
+    if (ifPendingHumanTaskId !== undefined) {
+      conditions.push('pendingHumanTaskId = :ifPendingHumanTaskId');
+      params.ExpressionAttributeValues[':ifPendingHumanTaskId'] = ifPendingHumanTaskId;
     }
     if (ifAttachmentRevision !== null) {
       conditions.push(
