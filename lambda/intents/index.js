@@ -2880,14 +2880,16 @@ export const handler = async (event, context) => {
       // older sibling gate just records the durable Q&A — the run is parked on a
       // different callback. SendDurableExecutionCallbackSuccess resumes the
       // EXISTING execution; a fresh Invoke would start a new one.
-      if (gate.callbackId) {
+      // Binding can finish after the initial GET. ALL_NEW from the answer CAS
+      // is the authoritative callback owner at the instant the answer commits.
+      if (answered.callbackId) {
         try {
-          await resumeDurableCallback(gate.callbackId, answered.answer);
+          await resumeDurableCallback(answered.callbackId, answered.answer);
           await (
             store.markGateCallbackConsumed?.({
               executionId: intentId,
               humanTaskId,
-              callbackId: gate.callbackId,
+              callbackId: answered.callbackId,
             }) ?? Promise.resolve()
           ).catch((markErr) =>
             logger.error('Gate callback consumption marker write failed', markErr),
