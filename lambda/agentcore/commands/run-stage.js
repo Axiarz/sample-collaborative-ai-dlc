@@ -2301,9 +2301,13 @@ const runStageAttempt = async (
     const retriesFeedbackRound = resumeGate?.stageInstanceId == null && row?.state === 'FAILED';
     if (
       resumeFrom && !freshFromGate &&
-      ((resumeGate.stageInstanceId != null && resumeGate.stageInstanceId !== stageInstanceId) ||
-        (resumeGate.unitSlug != null && resumeGate.unitSlug !== unitSlug) ||
-        (resumeGate.sectionIndex ?? null) !== sectionIndex ||
+      (!humanTaskMatchesOwner({
+        task: resumeGate,
+        stageInstanceId,
+        unitSlug,
+        sectionIndex,
+        engineGates: true,
+      }) ||
         (row?.state != null &&
           !['WAITING_FOR_HUMAN', 'SUCCEEDED'].includes(row.state) &&
           !retriesFeedbackRound &&
@@ -5131,7 +5135,7 @@ const ownershipConflict = async (store, { executionId, orchestratorRunId }) => {
   };
 };
 
-export const runStage = async (payload, deps) => {
+const runStageImplementation = async (payload, deps) => {
   try {
     return await runStageAttempt(payload, deps);
   } catch (error) {
