@@ -2041,6 +2041,96 @@ describe('runStage — fresh run persists the CLI session + parks on a pending g
     ).toBe(true);
   });
 
+  it.each(['retry', 'already-saved'])(
+    'preserves a resumable Claude gate after a failed park write: %s',
+    async (mode) => {
+      const seed = pendingGateSeed('q-1');
+      Object.assign(seed.stage, {
+        state: 'WAITING_FOR_HUMAN',
+        cli: 'claude',
+        cliSessionId: 'forced-uuid',
+        parkedAt: '2026-07-16T12:00:00.000Z',
+      });
+      const store = spyStore(seed);
+      let attempts = 0;
+      store.updateStageState = vi.fn(async (row) => {
+        if (row.state === 'WAITING_FOR_HUMAN') {
+          attempts++;
+          if (mode === 'already-saved' || attempts === 1) throw new Error('lost acknowledgment');
+        }
+        return row;
+      });
+      expect(
+        await runStage(
+          baseArgs,
+          baseDeps({
+            store,
+            spawnFn: okSpawn,
+            ids: () => 'forced-uuid',
+          }),
+        ),
+      ).toMatchObject({ ok: true, state: 'WAITING_FOR_HUMAN', humanTaskId: 'q-1' });
+      expect(attempts).toBe(2);
+      expect(store.calls.some(([op]) => op === 'supersedeHumanTask')).toBe(false);
+      expect(store.updateStageState.mock.calls.some(([row]) => row.state === 'FAILED')).toBe(false);
+    },
+  );
+
+  it.each([
+    ['this run', { orchestratorRunId: 'run1' }, 'stage_attempt_conflict'],
+    ['a replacement run', { orchestratorRunId: 'run2' }, 'retired'],
+  ])('does not retry a park write that lost ownership to %s', async (_label, meta, reason) => {
+    const seed = pendingGateSeed('q-1');
+    const store = spyStore(seed);
+    let attempts = 0;
+    store.updateStageState = vi.fn(async (row) => {
+      if (row.state === 'WAITING_FOR_HUMAN') {
+        attempts++;
+        throw Object.assign(new Error('replaced'), { name: 'ConditionalCheckFailedException' });
+      }
+      return row;
+    });
+    const getExecution = store.getExecution;
+    store.getExecution = async (executionId, options) =>
+      options?.consistentRead && attempts > 0 ? meta : getExecution(executionId, options);
+    const res = await runStage(
+      { ...baseArgs, orchestratorRunId: 'run1' },
+      baseDeps({ store, spawnFn: okSpawn, ids: () => 'forced-uuid' }),
+    );
+    expect(res).toMatchObject({ ok: false, reason });
+    expect(attempts).toBe(1);
+  });
+
+  it('fails a park whose saved row lacks this attempt commit refs', async () => {
+    const seed = pendingGateSeed('q-1');
+    Object.assign(seed.stage, {
+      state: 'WAITING_FOR_HUMAN',
+      cli: 'claude',
+      cliSessionId: 'forced-uuid',
+      parkedAt: '2026-07-16T12:00:00.000Z',
+      pendingCodeCommitRefs: null,
+    });
+    const store = spyStore(seed);
+    store.updateStageState = vi.fn(async (row) => {
+      if (row.state === 'WAITING_FOR_HUMAN') throw new Error('lost acknowledgment');
+      return row;
+    });
+    const res = await runStage(
+      baseArgs,
+      baseDeps({
+        store,
+        spawnFn: okSpawn,
+        ids: () => 'forced-uuid',
+        commitAndPushAll: async () => ({
+          ok: true,
+          committed: true,
+          results: [{ repo: 'owner/repo', sha: 'abc123', committed: true, pushed: true }],
+        }),
+      }),
+    );
+    expect(res).toMatchObject({ ok: false, reason: 'stage_park_persist_failed' });
+  });
+
   it('parks and resumes when the gate is answered after grace but before CLI exit', async () => {
     const deps = baseDeps({
       spawnFn: okSpawn,
@@ -2081,39 +2171,6 @@ describe('runStage — fresh run persists the CLI session + parks on a pending g
       { consistentRead: true },
     ]);
   });
-  it.each(['retry', 'already-saved'])(
-    'preserves a resumable Claude gate after a failed park write: %s',
-    async (mode) => {
-      const seed = pendingGateSeed('q-1');
-      Object.assign(seed.stage, {
-        state: 'WAITING_FOR_HUMAN',
-        cli: 'claude',
-        cliSessionId: 'forced-uuid',
-      });
-      const store = spyStore(seed);
-      let attempts = 0;
-      store.updateStageState = vi.fn(async (row) => {
-        if (row.state === 'WAITING_FOR_HUMAN') {
-          attempts++;
-          if (mode === 'already-saved' || attempts === 1) throw new Error('lost acknowledgment');
-        }
-        return row;
-      });
-      expect(
-        await runStage(
-          baseArgs,
-          baseDeps({
-            store,
-            spawnFn: okSpawn,
-            ids: () => 'forced-uuid',
-          }),
-        ),
-      ).toMatchObject({ ok: true, state: 'WAITING_FOR_HUMAN', humanTaskId: 'q-1' });
-      expect(attempts).toBe(2);
-      expect(store.calls.some(([op]) => op === 'supersedeHumanTask')).toBe(false);
-      expect(store.updateStageState.mock.calls.some(([row]) => row.state === 'FAILED')).toBe(false);
-    },
-  );
 
   it('re-stamps parkedAt with the gate ASK time so the exit-time write never shortens the wait', async () => {
     const deps = baseDeps({
