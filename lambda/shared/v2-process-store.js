@@ -3336,5 +3336,5 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
   };
 };
 
-export { createProcessStore };
+export { createProcessStore, isTransactionConflict };
 export default { createProcessStore };

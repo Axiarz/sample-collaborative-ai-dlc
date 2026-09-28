@@ -133,26 +133,67 @@ describe('answer/bind interleaving', () => {
       }
     },
   );
-  it('does not answer or wake a gate after its run loses ownership', async () => {
-    const gate = {
-      humanTaskId: 'h1',
-      status: 'pending',
-      callbackId: 'old-cb',
-      orchestratorRunId: 'old-run',
-    };
+  it.each([false, true])(
+    'does not answer or wake a gate after its run loses ownership (steering: %s)',
+    async (withSteering) => {
+      const gate = {
+        humanTaskId: 'h1',
+        status: 'pending',
+        callbackId: 'old-cb',
+        orchestratorRunId: 'old-run',
+      };
+      ddb.on(GetCommand).callsFake(({ Key }) => ({
+        Item:
+          Key.sk === 'META'
+            ? { projectId: 'p1', orchestratorRunId: 'new-run', status: 'WAITING' }
+            : gate,
+      }));
+      ddb.on(QueryCommand).resolves({ Items: [] });
+      ddb.on(TransactWriteCommand).rejects(
+        Object.assign(new Error('rewound'), {
+          name: 'TransactionCanceledException',
+          CancellationReasons: [{ Code: 'ConditionalCheckFailed' }],
+        }),
+      );
+      const response = await handler({
+        httpMethod: 'POST',
+        path: '/projects/p1/intents/i1/gates/h1/answer',
+        pathParameters: { projectId: 'p1', intentId: 'i1', humanTaskId: 'h1' },
+        requestContext: { authorizer: { claims: { sub: 'u1' } } },
+        body: JSON.stringify({
+          answer: 'approve',
+          ...(withSteering ? { steering: 'Use the event bus.' } : {}),
+        }),
+      });
+      expect(response.statusCode).toBe(409);
+      expect(gate.status).toBe('pending');
+      expect(lambda.commandCalls(SendDurableExecutionCallbackSuccessCommand)).toHaveLength(0);
+    },
+  );
+  it.each([
+    ['clears after a retry', 1, 200],
+    ['outlasts the retries', Infinity, 409],
+  ])('answers through a META write conflict that %s', async (_label, conflicts, statusCode) => {
+    const gate = { humanTaskId: 'h1', status: 'pending', orchestratorRunId: 'run1' };
     ddb.on(GetCommand).callsFake(({ Key }) => ({
       Item:
         Key.sk === 'META'
-          ? { projectId: 'p1', orchestratorRunId: 'new-run', status: 'WAITING' }
+          ? { projectId: 'p1', orchestratorRunId: 'run1', status: 'WAITING' }
           : gate,
     }));
     ddb.on(QueryCommand).resolves({ Items: [] });
-    ddb.on(TransactWriteCommand).rejects(
-      Object.assign(new Error('rewound'), {
-        name: 'TransactionCanceledException',
-        CancellationReasons: [{ Code: 'ConditionalCheckFailed' }],
-      }),
-    );
+    let attempts = 0;
+    ddb.on(TransactWriteCommand).callsFake(() => {
+      attempts++;
+      if (attempts <= conflicts) {
+        throw Object.assign(new Error('META busy'), {
+          name: 'TransactionCanceledException',
+          CancellationReasons: [{ Code: 'TransactionConflict' }, { Code: 'None' }],
+        });
+      }
+      Object.assign(gate, { status: 'answered', answer: 'approve' });
+      return {};
+    });
     const response = await handler({
       httpMethod: 'POST',
       path: '/projects/p1/intents/i1/gates/h1/answer',
@@ -160,8 +201,17 @@ describe('answer/bind interleaving', () => {
       requestContext: { authorizer: { claims: { sub: 'u1' } } },
       body: JSON.stringify({ answer: 'approve' }),
     });
-    expect(response.statusCode).toBe(409);
-    expect(gate.status).toBe('pending');
-    expect(lambda.commandCalls(SendDurableExecutionCallbackSuccessCommand)).toHaveLength(0);
+    expect(response.statusCode).toBe(statusCode);
+    if (statusCode === 409) {
+      expect(JSON.parse(response.body)).toMatchObject({
+        code: 'gate_answer_conflict',
+        retryable: true,
+      });
+      expect(gate.status).toBe('pending');
+      expect(attempts).toBe(5);
+    } else {
+      expect(gate.status).toBe('answered');
+      expect(attempts).toBe(2);
+    }
   });
 });
