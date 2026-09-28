@@ -116,7 +116,7 @@ const unitWorkflow = () => ({
 
 // A spy process store recording the calls run-stage makes. `seed` pre-loads the
 // gate / stage / execution rows the resume + park paths read back.
-const spyStore = (seed = {}) => {
+const spyStore = (seed = {}, { persistStageWrites = false } = {}) => {
   const calls = [];
   const rec = (name) => async (args) => {
     calls.push([name, args]);
