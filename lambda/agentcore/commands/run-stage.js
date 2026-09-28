@@ -2295,6 +2295,10 @@ const runStageAttempt = async (
     // receipt, so nothing is lost and nothing is re-asked.
     const preAgentGate = isChangeControlGate(resumeGate);
     const freshFromGate = preAgentGate || isLoopBackAnswer(resumeGate, stageId);
+    // Engine feedback gates (batch/skeleton request-changes) belong to no
+    // stage: a halt-and-ask retry of the revision round re-dispatches the lane
+    // stage that failed while revising, so its FAILED row resumes as well.
+    const retriesFeedbackRound = resumeGate?.stageInstanceId == null && row?.state === 'FAILED';
     if (
       resumeFrom && !freshFromGate &&
       ((resumeGate.stageInstanceId != null && resumeGate.stageInstanceId !== stageInstanceId) ||
@@ -2302,6 +2306,7 @@ const runStageAttempt = async (
         (resumeGate.sectionIndex ?? null) !== sectionIndex ||
         (row?.state != null &&
           !['WAITING_FOR_HUMAN', 'SUCCEEDED'].includes(row.state) &&
+          !retriesFeedbackRound &&
           !(
             row.state === 'RUNNING' &&
             stageCallbackId &&
