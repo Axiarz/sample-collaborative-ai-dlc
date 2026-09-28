@@ -719,12 +719,13 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
         ownership,
         writes: [...additionalWrites, { Update: params }],
       });
-      return { executionId, status };
+      // Transactions cannot return ALL_NEW; read the committed row instead.
+      return getExecution(executionId, { consistentRead: true });
     }
     if (additionalWrites.length) {
       const { ReturnValues: _returnValues, ...update } = params;
       await transact([...additionalWrites, { Update: update }]);
-      return { executionId, status };
+      return getExecution(executionId, { consistentRead: true });
     }
     if (credentialBinding !== undefined) {
       const row = { ...executionMetaKey(executionId), projectId, credentialBinding };
@@ -847,7 +848,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     };
     if (ownership) {
       await writeStageAttempt({ executionId, ownership, writes: [{ Update: input }] });
-      return { stageInstanceId, state };
+      return getStage(executionId, stageInstanceId, { consistentRead: true });
     }
     const { Attributes } = await ddb.send(new UpdateCommand(input));
     return Attributes;
@@ -977,7 +978,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     };
     if (ownership) {
       await writeStageAttempt({ executionId, ownership, writes: [{ Update: input }] });
-      return { ...existing, state: 'RUNNING', stageCallbackId };
+      return getStage(executionId, stageInstanceId, { consistentRead: true });
     }
     const { Attributes } = await ddb.send(new UpdateCommand(input));
     return Attributes;
@@ -1387,7 +1388,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
         input.ExpressionAttributeValues[':ownedStage'] = ownership.stageInstanceId;
         input.ExpressionAttributeValues[':ownedCallback'] = ownership.stageCallbackId;
         await writeStageAttempt({ executionId, ownership, writes: [{ Update: input }] });
-        return { humanTaskId, status: 'superseded' };
+        return getHumanTask(executionId, humanTaskId, { consistentRead: true });
       }
       const { Attributes } = await ddb.send(new UpdateCommand(input));
       return Attributes;
