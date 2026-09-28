@@ -49,7 +49,7 @@ import {
   planSegments,
   stageInstanceId as planStageInstanceId,
 } from '../shared/v2-execution-plan.js';
-import { humanTaskMatchesOwner, isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
+import { isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
 import {
   evaluateGatePreconditions,
   mergeFindings,
@@ -76,7 +76,7 @@ import {
 } from './section.js';
 import { runQuorumEdit } from './quorum-edit.js';
 import { buildIntentAttribution } from './pr-attribution.js';
-import { bindGateCallback, unparkGate } from './gate-callback.js';
+import { bindGateCallback, ownsAnsweredGate, unparkGate } from './gate-callback.js';
 import { OVERRIDE_REASON_MAX } from '../shared/gate-answer.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
@@ -955,49 +955,35 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         );
         let answeredEarly = false;
         if (!callbackBound) {
-          // The answer can win the CAS immediately before this bind. In that
-          // case setGateCallbackId returns null because the gate is no longer
-          // pending, but no callback is needed: resume directly with the
-          // persisted answer. Any still-pending, differently owned, or already
-          // bound gate remains an invariant violation.
+          // bindGateCallback returns an answered gate owned by this stage, so a
+          // current bind is null only on a real conflict. Deployed versions
+          // checkpointed null for an answer that won the pending-only bind and
+          // then recorded this step; replaying those runs must find the same
+          // step name at the same position.
           const gateAfterBindFailure = await ctxArg.step(
             `gate-after-bind-failure-${humanTaskId}`,
             () => store.getHumanTask(executionId, humanTaskId, { consistentRead: true }),
           );
           if (gateAfterBindFailure?.status === 'superseded') {
-            ctx.logger?.info?.('run retired before gate callback bind', {
-              intentId,
-              humanTaskId,
-            });
+            logger.info('run retired before gate callback bind', { humanTaskId });
             return {
               state: 'TERMINAL',
               value: { ok: false, reason: 'retired', intentId, humanTaskId },
             };
           }
-          const ownsExpectedStage = humanTaskMatchesOwner({
-            task: gateAfterBindFailure,
+          answeredEarly = ownsAnsweredGate(gateAfterBindFailure, {
+            callbackId,
+            callbackOwner: expectedCallbackOwner,
             stageInstanceId: expectedStageInstanceId,
             unitSlug,
             sectionIndex,
           });
-          const callbackIdCompatible =
-            gateAfterBindFailure?.callbackId == null ||
-            gateAfterBindFailure.callbackId === callbackId;
-          const callbackOwnerCompatible =
-            gateAfterBindFailure?.callbackOwner == null ||
-            gateAfterBindFailure.callbackOwner === expectedCallbackOwner;
-          answeredEarly =
-            isHumanTaskAnswerStatus(gateAfterBindFailure?.status) &&
-            Boolean(gateAfterBindFailure.answeredAt || gateAfterBindFailure.answer) &&
-            ownsExpectedStage &&
-            callbackIdCompatible &&
-            callbackOwnerCompatible;
           if (!answeredEarly) {
             return {
               state: 'TERMINAL',
               value: await fail(
                 'gate_callback_conflict',
-                `gate ${humanTaskId} bind failed without an unbound answer owned by this stage`,
+                `gate ${humanTaskId} is already bound to a different stage callback`,
               ),
             };
           }

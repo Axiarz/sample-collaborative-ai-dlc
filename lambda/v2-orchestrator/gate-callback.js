@@ -1,3 +1,5 @@
+import { humanTaskMatchesOwner, isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
+
 // Called inside a durable step. A failed pending-only bind can mean the human
 // answered first, not that another callback owns the gate. Never replace an
 // existing owner to recover that race.
@@ -9,17 +11,22 @@ export const bindGateCallback = async (store, input) => {
     consistentRead: true,
   });
   if (gate?.status === 'superseded') return gate;
-  if (!gate || !['answered', 'approved', 'rejected'].includes(gate.status)) return null;
-  if (
-    (gate.callbackId != null && gate.callbackId !== input.callbackId) ||
-    (gate.callbackOwner != null && gate.callbackOwner !== input.callbackOwner) ||
-    (input.stageInstanceId !== undefined &&
-      (gate.stageInstanceId ?? null) !== input.stageInstanceId)
-  ) {
-    return null;
-  }
-  return gate;
+  return ownsAnsweredGate(gate, input) ? gate : null;
 };
+
+// An answered gate this callback may resume: no other callback or owner has
+// claimed it, and (for stage gates) it belongs to the expected stage.
+export const ownsAnsweredGate = (gate, input) =>
+  isHumanTaskAnswerStatus(gate?.status) &&
+  (gate.callbackId == null || gate.callbackId === input.callbackId) &&
+  (gate.callbackOwner == null || gate.callbackOwner === input.callbackOwner) &&
+  (input.stageInstanceId === undefined ||
+    humanTaskMatchesOwner({
+      task: { ...gate, stageInstanceId: gate.stageInstanceId ?? null },
+      stageInstanceId: input.stageInstanceId,
+      unitSlug: input.unitSlug,
+      sectionIndex: input.sectionIndex,
+    }));
 
 // Shared by engine and stage gates. The mutation and its recovery check must
 // agree on ownership: a committed write with a lost checkpoint is success.
