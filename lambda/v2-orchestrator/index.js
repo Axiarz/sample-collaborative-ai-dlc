@@ -65,7 +65,7 @@ import {
 } from '../shared/stage-loopback.js';
 import { broadcastToIntentChannel } from '../shared/ws-fanout.js';
 import { resolveRuntimeTarget } from '../shared/runtime-target.js';
-import { stopSession as stopSharedSession } from '../shared/runtime-session.js';
+import { sdkTarget, stopSession as stopSharedSession } from '../shared/runtime-session.js';
 import {
   awaitEngineGate,
   parseChoice,
@@ -138,7 +138,7 @@ const defaultInvokeRuntime = async (
 ) => {
   const res = await agentcore.send(
     new InvokeAgentRuntimeCommand({
-      ...target,
+      ...sdkTarget(target),
       runtimeSessionId: sessionId,
       contentType: 'application/json',
       accept: 'application/json',
