@@ -242,6 +242,10 @@ module "agentcore_docker_build_amd64" {
   source  = "terraform-aws-modules/lambda/aws//modules/docker-build"
   version = "~> 8.0"
 
+  # Same as the arm64 build: published core revisions pin this image by
+  # digest (amd64Image) and x86_64 environments build FROM it, so a rebuild
+  # must not delete the previous image from the repository.
+  keep_remotely   = true
   create_ecr_repo = false
   ecr_repo        = aws_ecr_repository.agentcore.name
   ecr_address     = format("%v.dkr.ecr.%v.%v", data.aws_caller_identity.current.account_id, data.aws_region.current.region, local.dns_suffix)
