@@ -385,11 +385,15 @@ const createParsedSink = ({ createParser, label, toolName, emit, onSession, onUs
       const name = toolName(toolEvent.name);
       // send_output already persists its canonical output through MCP.
       if (name === 'send_output') return;
+      const output = toolEvent.output ? String(toolEvent.output) : '';
+      const error = toolEvent.error ? String(toolEvent.error?.message ?? toolEvent.error) : '';
       const rawLines = [
         `Running tool ${name}\n`,
         `${JSON.stringify(toolEvent.input ?? {})}\n`,
-        ...(toolEvent.output ? [`${String(toolEvent.output)}\n`] : []),
-        ...(toolEvent.error ? [`${String(toolEvent.error?.message ?? toolEvent.error)}\n`] : []),
+        ...(output ? [`${output}\n`] : []),
+        // Parsers fall back to the tool output as the error text when the CLI
+        // reports no separate cause; show that diagnostic once, not twice.
+        ...(error && error.trim() !== output.trim() ? [`${error}\n`] : []),
       ];
       const tool = {
         name,

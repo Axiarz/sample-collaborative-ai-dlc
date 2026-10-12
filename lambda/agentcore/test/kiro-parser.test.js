@@ -291,6 +291,43 @@ describe('Kiro output sink', () => {
     });
   });
 
+  it('shows a failed tool diagnostic once in the expanded details', async () => {
+    // The parser falls back to the tool output as the error text; the sink must
+    // not append the same diagnostic a second time.
+    const occurrences = (text, needle) => text.split(needle).length - 1;
+    const { emitted } = await render();
+    const shell = emitted.find(({ display }) => display.title === 'Shell failed');
+    expect(occurrences(shell.display.details, 'No such file or directory')).toBe(1);
+
+    const failures = [];
+    const sink = createCliOutputSink({ cli: 'kiro', emit: (event) => failures.push(event) });
+    sink.write(
+      // A failed MCP call: status "completed", isError in the result envelope.
+      toolCall('mcp', {
+        title: 'Running: @aidlc/get_upstream',
+        rawInput: { id: 'missing' },
+        _meta: { kiro: { toolName: 'get_upstream', mcpServerName: 'aidlc' } },
+      }) +
+        toolDone('mcp', {
+          kind: 'other',
+          rawOutput: {
+            items: [
+              { Json: { content: [{ type: 'text', text: 'upstream missing' }], isError: true } },
+            ],
+          },
+        }) +
+        // A failure with no output keeps its fallback cause.
+        toolCall('read', { title: 'Reading gone.txt', kind: 'read' }) +
+        toolDone('read', { status: 'failed', rawOutput: { items: [] } }),
+    );
+    sink.flush();
+    const [mcp, read] = failures.map(({ display }) => display);
+    expect(mcp).toMatchObject({ level: 'error', title: 'Get Upstream failed' });
+    expect(occurrences(mcp.details, 'upstream missing')).toBe(1);
+    expect(read).toMatchObject({ level: 'error', title: 'Fs Read failed' });
+    expect(read.details).toMatch(/\nfailed$/);
+  });
+
   it('forwards the session id and credits to the runtime', async () => {
     const { onSession, onUsage, state } = await render();
     expect(onSession).toHaveBeenCalledWith('kiro-session-fixture');
