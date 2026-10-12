@@ -33,6 +33,7 @@ import { repoCheckoutPath } from '../shared/repo-validation.js';
 import {
   knownChangedFileProvenance,
   mapKnownChangedFiles,
+  mergeChangedFileProvenance,
   unknownChangedFileProvenance,
 } from '../shared/changed-file-provenance.js';
 import {
@@ -322,8 +323,23 @@ export const commitAll = async ({
       ['diff-tree', '--root', '--format=', '--name-only', '-r', '-z', 'HEAD'],
       { cwd: dir },
     );
-    const committedFiles =
-      committedDiff.exitCode === 0 ? committedDiff.stdout.split('\0').filter(Boolean) : [];
+    if (committedDiff.exitCode !== 0) {
+      return {
+        committed: true,
+        sha: head.stdout.trim() || null,
+        files: null,
+        provenance: mergeChangedFileProvenance([
+          { provenance },
+          {
+            provenance: unknownChangedFileProvenance(
+              'git_committed_files_failed',
+              committedDiff.stderr?.trim(),
+            ),
+          },
+        ]),
+      };
+    }
+    const committedFiles = committedDiff.stdout.split('\0').filter(Boolean);
     return {
       committed: true,
       sha: head.stdout.trim() || null,
@@ -692,7 +708,9 @@ export const pushBranch = async ({
 export const toWorkspaceRelative = (files = [], { url, multi }) => {
   if (!multi) return [...files];
   const projectPrefix = `${repoCheckoutPath(url)}/`;
-  return files.map((file) => (file.startsWith(projectPrefix) ? file : `${projectPrefix}${file}`));
+  // Both callers consume repository-relative Git output. A path can itself
+  // start with the checkout prefix; its spelling does not change its origin.
+  return files.map((file) => `${projectPrefix}${file}`);
 };
 
 // Keep lane operations on the same validated layout as checkout and recovery.

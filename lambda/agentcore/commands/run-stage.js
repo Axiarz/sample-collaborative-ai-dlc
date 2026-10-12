@@ -3726,6 +3726,8 @@ export const runStage = async (
         repos,
         workspaceDir,
         branch,
+        baseBranch,
+        baseBranches,
         gitProvider,
         repoProviders,
         projectId,
@@ -4223,16 +4225,25 @@ export const runStage = async (
 
   let completedGitResult = gitResult;
   let completedGitError = null;
-  let attemptProvenance = changedFileProvenanceFromGitResults(gitResult.results);
+  let attemptProvenance = mergeChangedFileProvenance(
+    [leadDraftGit, gitResult]
+      .filter(Boolean)
+      .map((attemptGit) => ({
+        provenance: changedFileProvenanceFromGitResults(attemptGit.results),
+      })),
+  );
   let changedFileProvenance = attemptProvenance;
   let changedFiles = changedFileProvenance.state === 'known' ? changedFileProvenance.files : null;
   let recoveredCommitRefs = null;
-  // Parked legs and repair turns belong to this same stage attempt. Recover
-  // their full delta before each sensor plane and before returning feedback.
+  // Lead drafts, parked legs and repair turns belong to this same stage attempt.
+  // Recover their full delta before each sensor plane and returning feedback.
   // A failed recovery remains unknown instead of exposing a partial file list.
   const refreshCompletedGitResult = async () => {
     const refsKey = JSON.stringify(stageCodeCommitRefs);
-    if ((carriedCodeCommitRefs.length > 0 || repairCommitted) && refsKey !== recoveredCommitRefs) {
+    if (
+      (carriedCodeCommitRefs.length > 0 || leadDraftGit?.committed || repairCommitted) &&
+      refsKey !== recoveredCommitRefs
+    ) {
       recoveredCommitRefs = refsKey;
       try {
         completedGitResult = await gitResultForCommitRefs({
@@ -4245,12 +4256,14 @@ export const runStage = async (
         completedGitError = error;
       }
     }
-    changedFileProvenance = completedGitError
-      ? unknownChangedFileProvenance('git_commit_refs_failed', completedGitError.message)
-      : mergeChangedFileProvenance([
-          { provenance: attemptProvenance },
-          { provenance: changedFileProvenanceFromGitResults(completedGitResult.results) },
-        ]);
+    changedFileProvenance = mergeChangedFileProvenance([
+      { provenance: attemptProvenance },
+      {
+        provenance: completedGitError
+          ? unknownChangedFileProvenance('git_commit_refs_failed', completedGitError.message)
+          : changedFileProvenanceFromGitResults(completedGitResult.results),
+      },
+    ]);
     changedFiles = changedFileProvenance.state === 'known' ? changedFileProvenance.files : null;
   };
 

@@ -69,15 +69,20 @@ Every stage carries three independent safety nets:
 3. **Human validation** — an approval gate, required by default on every non-init stage. The run parks at zero compute until a human answers.
 
 Sensors receive explicit changed-file provenance. Known changes are normalized to
-workspace-relative paths once, including both endpoints of a rename; project-scoped
-checks inspect every matching file in affected projects. Unknown provenance retains
-its reason and widens inspection rather than becoming an empty change list. Harness
+workspace-relative paths once at the Git boundary, including both endpoints of a
+rename. Git paths are repository-relative even when they start with the checkout
+directory's name. Project-scoped checks inspect every matching file in affected
+projects. Failed committed-file enumeration is unknown; a pre-commit directory
+listing cannot establish the exact changed files. Unknown provenance retains its
+reason and widens inspection rather than becoming an empty change list. Harness
 failures and invalid successful JSON output are inconclusive and hold an applicable
 blocking sensor. Diagnostics are bounded and redacted before they are recorded.
 
-Release-pinned write sensors inspect the stage attempt's changes, including parked
-legs and checkpoint repairs. Gate sensors run after reviewer repairs and inspect
-all existing matching deliverables, even when the attempt's change list is empty.
+Release-pinned write sensors inspect the stage attempt's changes, including ensemble
+lead drafts, parked legs and checkpoint repairs. A clean final commit result does
+not discard earlier changes or unknown provenance. Gate sensors run after reviewer
+repairs and inspect all existing matching deliverables, even when the attempt's
+change list is empty.
 An incomplete workspace scan cannot prove that a blocking sensor is inapplicable.
 
 ## Parallel construction

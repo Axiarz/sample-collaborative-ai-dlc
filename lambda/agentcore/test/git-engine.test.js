@@ -2,6 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
+import { createSensorRunner } from '../sensor-runner.js';
+import { collectCodeTraceabilityBatches } from '../code-traceability.js';
+import { repoCheckoutPath } from '../../shared/repo-validation.js';
 import {
   runGit,
   cleanRemoteUrl,
@@ -112,12 +116,12 @@ describe('parsePorcelainZ', () => {
 });
 
 describe('toWorkspaceRelative', () => {
-  it('uses the CodeCommit checkout layout and preserves already normalized paths', () => {
+  it('uses the CodeCommit checkout layout even when a repo-relative path repeats it', () => {
     const url = 'arn:aws:codecommit:eu-west-1:123456789012:app';
     const prefix = 'codecommit/aws/eu-west-1/123456789012/app';
     expect(toWorkspaceRelative(['src/a.ts', `${prefix}/src/b.ts`], { url, multi: true })).toEqual([
       `${prefix}/src/a.ts`,
-      `${prefix}/src/b.ts`,
+      `${prefix}/${prefix}/src/b.ts`,
     ]);
   });
 
@@ -133,7 +137,7 @@ describe('toWorkspaceRelative', () => {
     ]);
   });
 
-  it('normalizes mixed repo- and workspace-relative inputs exactly once and deterministically', () => {
+  it('converts repo-relative inputs deterministically without guessing their coordinate system', () => {
     const options = { url: 'acme/shop', multi: true };
     const input = [
       'src/new.ts',
@@ -143,9 +147,9 @@ describe('toWorkspaceRelative', () => {
     ];
     const expected = [
       'acme/shop/src/new.ts',
-      'acme/shop/src/existing.ts',
+      'acme/shop/acme/shop/src/existing.ts',
       'acme/shop/test/new.test.ts',
-      'acme/shop/test/existing.test.ts',
+      'acme/shop/acme/shop/test/existing.test.ts',
     ];
 
     const first = toWorkspaceRelative(input, options);
@@ -153,7 +157,6 @@ describe('toWorkspaceRelative', () => {
 
     expect(first).toEqual(expected);
     expect(second).toEqual(expected);
-    expect(toWorkspaceRelative(first, options)).toEqual(expected);
     expect(input).toEqual([
       'src/new.ts',
       'acme/shop/src/existing.ts',
@@ -161,6 +164,172 @@ describe('toWorkspaceRelative', () => {
       'acme/shop/test/existing.test.ts',
     ]);
   });
+});
+
+describe('Git provenance reaches exact sensors and traceability', () => {
+  const inspect = async (workspaceDir, provenance, matches) => {
+    const inspectedFiles = [];
+    const runner = createSensorRunner({
+      workspaceDir,
+      changedFileProvenance: provenance,
+      loadBlockScript: async () => 'SENSOR_SCRIPT',
+      spawnFn: (_command, args) => {
+        inspectedFiles.push(args[args.indexOf('--file-path') + 1]);
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = () => {};
+        setImmediate(() => child.emit('close', 127));
+        return child;
+      },
+    });
+    const [verdict] = await runner.runStageSensors({
+      stageId: 'code-generation',
+      planes: ['write'],
+      sensors: [
+        {
+          sensorId: 'linter',
+          runtime: 'bun',
+          command: 'bun lint.ts',
+          severity: 'blocking',
+          fireOn: 'write',
+          scope: 'file',
+          verdictMode: 'stdout-json',
+          matches,
+        },
+      ],
+    });
+    return { inspectedFiles, verdict };
+  };
+
+  it.each([
+    ['GitHub multi-repo', 'acme/api', true],
+    ['CodeCommit multi-repo', 'arn:aws:codecommit:eu-west-1:123456789012:api', true],
+    ['single repo', 'acme/api', false],
+  ])(
+    'preserves checkout-prefix collisions through both Git callers (%s)',
+    async (_label, repo, multi) => {
+      const { remote, work } = await initRemoteAndClone();
+      const workspaceDir = multi ? path.join(root, 'workspace') : work;
+      const prefix = repoCheckoutPath(repo);
+      const repoDir = multi ? path.join(workspaceDir, prefix) : workspaceDir;
+      const repos = multi ? [repo, 'acme/other'] : [repo];
+      if (multi) {
+        for (const url of repos) {
+          const dir = path.join(workspaceDir, repoCheckoutPath(url));
+          await mkdir(path.dirname(dir), { recursive: true });
+          expect((await git(['clone', remote, dir], root)).exitCode).toBe(0);
+        }
+      }
+      const repoFile = `${prefix}/nested.ts`;
+      const workspaceFile = multi ? `${prefix}/${repoFile}` : repoFile;
+      await mkdir(path.dirname(path.join(repoDir, repoFile)), { recursive: true });
+      await writeFile(path.join(repoDir, repoFile), 'export const nested = true;\n');
+      const committed = await commitAndPushAll({
+        repos,
+        workspaceDir,
+        branch: 'main',
+        message: 'nested source',
+        urlsFor: () => ({ auth: remote, clean: remote }),
+        resolveGitCommitter: async () => null,
+      });
+      expect(committed.ok).toBe(true);
+      const recovered = await gitResultForCommitRefs({
+        commitRefs: [{ repo, sha: committed.results[0].sha }],
+        repos,
+        workspaceDir,
+      });
+      for (const result of [committed, recovered]) {
+        expect
+          .soft(result.results[0].provenance)
+          .toEqual({ state: 'known', files: [workspaceFile] });
+        const { inspectedFiles, verdict } = await inspect(
+          workspaceDir,
+          result.results[0].provenance,
+          workspaceFile,
+        );
+        expect.soft(inspectedFiles).toEqual([workspaceFile]);
+        expect.soft(verdict).toMatchObject({
+          result: 'INCONCLUSIVE',
+          held: true,
+          detail: { applicability: 'APPLICABLE' },
+        });
+        const batches = await collectCodeTraceabilityBatches({
+          gitResult: result,
+          repos,
+          workspaceDir,
+          stageId: 'code-generation',
+          stageInstanceId: 's1',
+        });
+        expect.soft(batches).toEqual([
+          expect.objectContaining({
+            repository: repo,
+            files: [expect.objectContaining({ filePath: repoFile })],
+          }),
+        ]);
+      }
+    },
+  );
+
+  it.each([
+    [1, false],
+    [42, false],
+    [null, false],
+    [1, true],
+  ])(
+    'keeps a committed untracked directory unknown when diff-tree exits %s (status failed: %s)',
+    async (exitCode, statusFailed) => {
+      const { remote, work } = await initRemoteAndClone();
+      await mkdir(path.join(work, 'src'));
+      await writeFile(path.join(work, 'src/a.ts'), 'export const value = 1;\n');
+      expect((await git(['status', '--porcelain', '-z'], work)).stdout).toBe('?? src/\0');
+      const result = await commitAndPushAll({
+        repos: ['acme/api'],
+        workspaceDir: work,
+        branch: 'main',
+        message: 'untracked directory',
+        urlsFor: () => ({ auth: remote, clean: remote }),
+        resolveGitCommitter: async () => null,
+        git: (args, options) => {
+          if (statusFailed && args[0] === 'status' && args.includes('-z')) {
+            return Promise.resolve({ exitCode: 1, stdout: '', stderr: 'status unavailable' });
+          }
+          return args[0] === 'diff-tree'
+            ? Promise.resolve({ exitCode, stdout: '', stderr: 'committed-file enumeration failed' })
+            : runGit(args, options);
+        },
+      });
+      expect(result).toMatchObject({ ok: true, committed: true });
+      expect((await git(['show', 'HEAD:src/a.ts'], work)).stdout).toContain('value = 1');
+      const reason = statusFailed
+        ? 'git_status_failed; git_committed_files_failed'
+        : 'git_committed_files_failed';
+      expect.soft(result.results[0]).toMatchObject({
+        files: null,
+        provenance: {
+          state: 'unknown',
+          reason,
+          detail: statusFailed
+            ? 'status unavailable; committed-file enumeration failed'
+            : 'committed-file enumeration failed',
+        },
+      });
+      const { inspectedFiles, verdict } = await inspect(
+        work,
+        result.results[0].provenance,
+        'src/a.ts',
+      );
+      expect.soft(inspectedFiles).toEqual(['src/a.ts']);
+      expect.soft(verdict).toMatchObject({
+        result: 'INCONCLUSIVE',
+        held: true,
+        detail: {
+          applicability: 'UNKNOWN',
+          provenance: { state: 'unknown', reason },
+        },
+      });
+    },
+  );
 });
 
 describe('commitAll', () => {
