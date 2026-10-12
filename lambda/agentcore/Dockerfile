@@ -24,9 +24,9 @@ RUN apt-get update \
 # the default build and amd64 when building the x86_64 core image for the
 # Instances compute type.
 ARG TARGETARCH
-ARG KIRO_CLI_VERSION=2.27.1
-ARG KIRO_CLI_SHA256_ARM64=937ff1ae3df373717b66cc09aec79c3b7f0b8e53968d746e3a4545722e1e4587
-ARG KIRO_CLI_SHA256_AMD64=7c7a9f5e3284c82cc6f0fb1a301597368538adb83d916927e664c957a9f953ef
+ARG KIRO_CLI_VERSION=2.29.1
+ARG KIRO_CLI_SHA256_ARM64=4c563e3931565bd7cdf5d86c324b7316b02aa7967031d54f5fbcae24a64e0a56
+ARG KIRO_CLI_SHA256_AMD64=b7f256aa1f3b5c2668d9aec8b79ec5c4914f8dfff8b53e64a97887194aee638e
 RUN if [ "$TARGETARCH" = "amd64" ]; then arch=x86_64 sha="$KIRO_CLI_SHA256_AMD64"; else arch=aarch64 sha="$KIRO_CLI_SHA256_ARM64"; fi \
     && curl -fsSLo /tmp/kiro-cli.zip \
         "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-${arch}-linux-musl.zip" \
@@ -38,13 +38,13 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then arch=x86_64 sha="$KIRO_CLI_SHA256_AMD64
     && ln -sf /opt/kiro/bin/kiro-cli /usr/local/bin/kiro-cli \
     && kiro-cli --version | grep -F "${KIRO_CLI_VERSION}" \
     && rm -rf /root/.local /tmp/kiro-cli /tmp/kiro-cli.zip
-ARG CLAUDE_CODE_VERSION=2.1.291
+ARG CLAUDE_CODE_VERSION=2.1.296
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force
-ARG OPENCODE_VERSION=1.18.34
-ARG OPENCODE_SHA256_ARM64=bbdb3f00c2c51e42e315525233151309724226a8776da8e9145e3b0fa3d5310f
-ARG OPENCODE_SHA256_AMD64=0f22479647226d1d2dd99595d20082ee7bda3870b62dc6a90b41efc1a71d7e9a
+ARG OPENCODE_VERSION=1.19.0
+ARG OPENCODE_SHA256_ARM64=e9841d43d3e1a8f36ed2691592d3b8b4fb097e606c8b559a277a1b845840e26b
+ARG OPENCODE_SHA256_AMD64=7bb9e61ad6feacf2e89c10a6a2c1840e3de4220bb50ba1fc7110f31806076aec
 RUN if [ "$TARGETARCH" = "amd64" ]; then arch=x64 sha="$OPENCODE_SHA256_AMD64"; else arch=arm64 sha="$OPENCODE_SHA256_ARM64"; fi \
     && mkdir -p /opt/opencode/bin \
     && curl -fsSLo /tmp/opencode.tar.gz \
@@ -57,7 +57,7 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then arch=x64 sha="$OPENCODE_SHA256_AMD64"; 
 # Codex — pinned for reproducibility (npm resolves the platform binary).
 # The per-stage CODEX_HOME (config.toml) is materialized at run time; the
 # version assert catches a broken/mismatched install at build time.
-ARG CODEX_VERSION=0.160.1
+ARG CODEX_VERSION=0.162.1
 RUN npm install -g @openai/codex@${CODEX_VERSION} \
     && codex --version | grep -F "${CODEX_VERSION}" \
     && npm cache clean --force
