@@ -41,7 +41,14 @@ export const MCP_SERVER_NAME = 'aidlc';
 const cliPersistenceEnvironment = (cli, env) => {
   if (cli === 'claude' && env.CLAUDE_CONFIG_DIR)
     return { CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR };
-  if (cli === 'kiro' && env.XDG_DATA_HOME) return { XDG_DATA_HOME: env.XDG_DATA_HOME };
+  // Kiro's v2 sessions live under KIRO_HOME (default ~/.kiro), which
+  // cli/kiro-store.js syncs; the child must resolve the same directory.
+  if (cli === 'kiro') {
+    return {
+      ...(env.XDG_DATA_HOME ? { XDG_DATA_HOME: env.XDG_DATA_HOME } : {}),
+      ...(env.KIRO_HOME ? { KIRO_HOME: env.KIRO_HOME } : {}),
+    };
+  }
   if (cli === 'opencode')
     return { XDG_DATA_HOME: env.OPENCODE_XDG_DATA_HOME || '/home/node/.opencode-data' };
   return {};

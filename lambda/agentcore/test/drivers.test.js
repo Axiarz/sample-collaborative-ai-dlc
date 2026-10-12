@@ -187,6 +187,13 @@ describe('kiro driver', () => {
     expect(kiroDriver.envForAuth({ KIRO_API_KEY: 'k' })).toEqual({ KIRO_API_KEY: 'k' });
     expect(kiroDriver.envForAuth({})).toEqual({});
   });
+  it('passes the Kiro store locations the store sync uses to the child', () => {
+    // The child env is an allowlist, so the session tree kiro-store syncs
+    // ($KIRO_HOME/sessions) must be named explicitly when relocated.
+    expect(
+      kiroDriver.envForAuth({ XDG_DATA_HOME: '/x', KIRO_HOME: '/k', V2_KIRO_STORE_DIR: '/m' }),
+    ).toEqual({ XDG_DATA_HOME: '/x', KIRO_HOME: '/k' });
+  });
 
   it('builds a resume invocation on the same engine with --agent + --resume-id', () => {
     const inv = kiroDriver.buildResumeInvocation({
