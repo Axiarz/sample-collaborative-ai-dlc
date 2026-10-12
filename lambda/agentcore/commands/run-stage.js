@@ -1,3 +1,4 @@
+import { withCredentialSession } from '../credential-session.js';
 // run-stage — execute ONE workflow stage inside the AgentCore session.
 //
 // The AgentCore Runtime routes the same session to the same microVM, so the git
@@ -117,7 +118,7 @@ import {
   UNIT_FOR_EACH,
 } from '../../shared/v2-execution-plan.js';
 import { humanTaskMatchesOwner, isHumanTaskAnswerStatus } from '../../shared/v2-process-keys.js';
-import { credentialProviderForCli } from '../../shared/agent-credentials.js';
+import { credentialProviderForCli } from '../../shared/agent-auth-contracts.js';
 import {
   mergeChangedFileProvenance,
   unknownChangedFileProvenance,
@@ -561,6 +562,11 @@ const runReviewer = async ({
   // `.catch` that records `v2.review.failed`. A non-zero CLI exit does not: the
   // reviewer may have submitted its verdict before exiting, so it is read below.
   if (!dispatch.ok && dispatch.detail instanceof Error) throw dispatch.detail;
+  // A lost credential fails the review (v2.review.failed); it is not a missing verdict.
+  if (dispatch.detail?.credentialError)
+    throw Object.assign(new Error('Invocation credential is no longer available'), {
+      code: dispatch.detail.credentialError,
+    });
   const verdict = await latestReviewerVerdict({
     store,
     executionId,
@@ -1452,7 +1458,8 @@ const captureKiroSession = async ({ env, driver, workspaceDir, spawnFn }) => {
 // one extra kiro-cli spawn per container, not per stage. `/usage` only calls
 // Kiro's usage API; it does not itself spend credits. Null (and cached null on
 // hard failure only) when the rate can't be read — the credits metric is then
-// recorded unpriced rather than priced at a guess.
+// recorded unpriced rather than priced at a guess. A lost credential leaves the
+// cache empty so the next stage retries.
 let cachedKiroCreditRate; // undefined = not fetched; null/number = fetched
 export const resetKiroCreditRateCache = () => {
   cachedKiroCreditRate = undefined;
@@ -1460,7 +1467,7 @@ export const resetKiroCreditRateCache = () => {
 const captureKiroCreditRate = async ({ env, driver, workspaceDir, spawnFn }) => {
   if (cachedKiroCreditRate !== undefined) return cachedKiroCreditRate;
   const usage = buildKiroUsage();
-  const { stdout, stderr } = await captureChild({
+  const { stdout, stderr, credentialError } = await captureChild({
     command: usage.command,
     args: usage.args,
     env: driver.envForAuth(env),
@@ -1468,8 +1475,10 @@ const captureKiroCreditRate = async ({ env, driver, workspaceDir, spawnFn }) => 
     captureStderr: true,
     spawnFn,
   });
-  cachedKiroCreditRate = parseKiroCreditRate(`${stderr ?? ''}\n${stdout ?? ''}`);
-  return cachedKiroCreditRate;
+  const rate = parseKiroCreditRate(`${stderr ?? ''}\n${stdout ?? ''}`);
+  if (rate == null && credentialError) return null;
+  cachedKiroCreditRate = rate;
+  return rate;
 };
 
 // Recognise Kiro's BENIGN empty-final-completion crash. kiro-cli's ACP layer
@@ -1583,7 +1592,7 @@ const mergeCodeCommitRefs = (priorRefs, gitResult) => {
   return refs;
 };
 
-export const runStage = async (
+const runStageImplementation = async (
   {
     projectId,
     intentId,
@@ -3527,7 +3536,18 @@ export const runStage = async (
       msg: spawnError?.message,
     });
     if (spawnError?.stack) logger.error(spawnError.stack);
-    return fail(stageInstanceId, 'cli_error', spawnError.message);
+    return fail(
+      stageInstanceId,
+      spawnError.code?.startsWith('credential_') ? 'credential_unavailable' : 'cli_error',
+      spawnError.message,
+    );
+  }
+  if (result?.credentialError) {
+    return fail(
+      stageInstanceId,
+      'credential_unavailable',
+      'The invocation credential expired or could not be renewed. Repair the pinned connection before resuming.',
+    );
   }
 
   const exitCode = result?.exitCode ?? 0;
@@ -4226,11 +4246,9 @@ export const runStage = async (
   let completedGitResult = gitResult;
   let completedGitError = null;
   let attemptProvenance = mergeChangedFileProvenance(
-    [leadDraftGit, gitResult]
-      .filter(Boolean)
-      .map((attemptGit) => ({
-        provenance: changedFileProvenanceFromGitResults(attemptGit.results),
-      })),
+    [leadDraftGit, gitResult].filter(Boolean).map((attemptGit) => ({
+      provenance: changedFileProvenanceFromGitResults(attemptGit.results),
+    })),
   );
   let changedFileProvenance = attemptProvenance;
   let changedFiles = changedFileProvenance.state === 'known' ? changedFileProvenance.files : null;
@@ -4955,3 +4973,6 @@ export const __test = {
   renderChangedInputs,
   CHANGE_CONTROL_OPTIONS,
 };
+
+export const runStage = (payload, deps = {}) =>
+  withCredentialSession(() => runStageImplementation(payload, deps), { env: deps.env });
