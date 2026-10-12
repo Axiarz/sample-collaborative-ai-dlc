@@ -199,6 +199,10 @@ export const runOneShotPrompt = async ({
         metrics: null,
       };
     }
+    // Kiro reports its failure as a late JSONL runError; the metadata and
+    // messages before it can fill the bounded sample, so sample the parsed
+    // error and keep the raw prefix only when no structured error exists.
+    const failure = cli === 'kiro' ? parseKiroJsonl(stdout).errors.join('\n') : '';
     return {
       ok: false,
       reason: 'cli_failed',
@@ -207,7 +211,7 @@ export const runOneShotPrompt = async ({
       model: model ?? null,
       exitCode,
       metrics: null,
-      sample: sampleOf(stdout),
+      sample: sampleOf(failure || stdout),
     };
   }
 
