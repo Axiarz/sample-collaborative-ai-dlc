@@ -129,6 +129,16 @@ locals {
   agentcore_subnet_azs = slice(local.agentcore_az_names, 0, min(2, length(local.agentcore_az_names)))
 }
 
+module "dynamodb_kms_runtime_access" {
+  source = "../../security/dynamodb-kms-runtime-access"
+
+  kms_key_arn = var.kms_key_arn
+  dns_suffix  = local.dns_suffix
+  role_names = {
+    agentcore = aws_iam_role.agentcore.name
+  }
+}
+
 # ---------------------------------------------------------------------------
 # ECR + ARM64 image build (AgentCore Runtime requires arm64)
 # ---------------------------------------------------------------------------
@@ -196,6 +206,7 @@ module "agentcore_docker_build" {
   source  = "terraform-aws-modules/lambda/aws//modules/docker-build"
   version = "~> 8.0"
 
+  keep_remotely   = true
   create_ecr_repo = false
   ecr_repo        = aws_ecr_repository.agentcore.name
   ecr_address     = format("%v.dkr.ecr.%v.%v", data.aws_caller_identity.current.account_id, data.aws_region.current.region, local.dns_suffix)
@@ -228,12 +239,13 @@ data "aws_ecr_image" "agentcore" {
 # ---------------------------------------------------------------------------
 
 resource "aws_dynamodb_table" "v2_executions" {
-  name           = "${var.project_name}-v2-executions-${var.environment}"
-  billing_mode   = local.billing_mode
-  hash_key       = "pk"
-  range_key      = "sk"
-  read_capacity  = local.read_capacity
-  write_capacity = local.write_capacity
+  name                        = "${var.project_name}-v2-executions-${var.environment}"
+  billing_mode                = local.billing_mode
+  hash_key                    = "pk"
+  range_key                   = "sk"
+  read_capacity               = local.read_capacity
+  write_capacity              = local.write_capacity
+  deletion_protection_enabled = var.deletion_protection
 
   attribute {
     name = "pk"
@@ -311,6 +323,15 @@ resource "aws_dynamodb_table" "v2_executions" {
       attribute_name = "GSI3SK"
       key_type       = "RANGE"
     }
+  }
+
+  server_side_encryption {
+    enabled     = var.kms_key_arn != ""
+    kms_key_arn = var.kms_key_arn != "" ? var.kms_key_arn : null
+  }
+
+  point_in_time_recovery {
+    enabled = true
   }
 
   tags = var.tags
@@ -670,6 +691,7 @@ locals {
     WEBSOCKET_ENDPOINT            = var.websocket_endpoint
     AIDLC_REPO_REF                = var.aidlc_repo_ref
     BEDROCK_MODEL                 = var.bedrock_model
+    BEDROCK_REGION                = var.bedrock_region
     AWS_REGION                    = var.aws_region
     CREDENTIAL_BROKER_FUNCTION    = "${var.project_name}-credential-broker-${var.environment}"
     SOURCE_CONTROL_FUNCTION       = "${var.project_name}-source-control-${var.environment}"

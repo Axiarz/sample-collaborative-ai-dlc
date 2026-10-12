@@ -1,0 +1,591 @@
+// The gate-precondition evaluator — the ONE function that decides whether a
+// stage may complete or a human gate may open, and what the human must be told
+// if it may not.
+//
+// It is PURE: every input is data the caller already read (receipts, timeline
+// events, sensor verdicts, the reviewer's verdict, ensemble evidence), and the
+// output is a verdict plus findings. That is deliberate. The same evaluation runs
+// twice — once in the stage runner, to decide proceed / bounded repair / carry
+// findings, and once in the orchestrator immediately before the gate opens,
+// re-reading the receipts rather than trusting the stage result — and both call
+// sites must reach the identical conclusion from the identical rules.
+//
+// THREE-OUTCOME CONTRACT (the anti-stuck invariant): a finding is either
+// advisory (the run proceeds, the human is told), blocking-and-overridable (the
+// gate offers `override-and-approve`, which records who overrode what), or
+// blocking-and-not-overridable (only `request-changes`, which re-runs the
+// stage). No combination can leave a run with nothing to do.
+//
+// Everything here is inert without a resolved release policy: `policy == null`
+// is the 2.3.3/unpinned path and returns `{ ok: true, findings: [] }`, which is
+// what keeps the gate prompt byte-identical for those runs.
+
+import { isQuestionChannelOutput } from './aidlc-capabilities.js';
+import { eventTypeOf } from './v2-process-keys.js';
+
+// The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
+// this module implements. Checked against the registry by a test, so a
+// capability cannot be declared handled without the code that handles it.
+export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze(['review.advisory-findings@v1']);
+
+// Checked in upstream's own composition order (required outputs → summary
+// lineage → contribution evidence → reviewer → sensors), so a human reading the
+// findings list sees the most fundamental problem first.
+const FINDING_CODES = Object.freeze([
+  'required_artifact_missing',
+  'summary_confirmation_missing',
+  'summary_confirmation_stale',
+  'plan_approval_missing',
+  'ensemble_evidence_unavailable',
+  'persona_contribution_missing',
+  'pipeline_link_incomplete',
+  'ensemble_integration_missing',
+  'stage_budget_exhausted',
+  'review_advisory_findings',
+  'review_dissent_maintained',
+  'sensor_gate_blocking',
+  'sensor_gate_advisory',
+  'change_control_input_changed',
+]);
+
+const finding = ({
+  code,
+  severity,
+  title,
+  detail = null,
+  overridable = false,
+  // The receipt kind an override of THIS finding writes — a sensor override is
+  // not a stage approval, and the audit trail has to say which one happened.
+  receiptKind = null,
+  remediation = null,
+  // Verbatim human-authored or agent-authored text this finding is ABOUT (today:
+  // a maintained dissent's position). Rendered as a quote rather than folded into
+  // `title`, because a summarized objection is a different objection. Omitted
+  // entirely when absent, so every other finding's shape is unchanged.
+  quote = null,
+}) => {
+  if (!FINDING_CODES.includes(code)) {
+    throw new Error(`gate-preconditions: unknown finding code "${code}"`);
+  }
+  // A blocking finding that is neither overridable nor re-runnable would be a
+  // dead end, and an advisory one can never be overridden because it never
+  // blocks. Enforced here so a new check cannot introduce a stuck state.
+  if (severity !== 'blocking' && overridable) {
+    throw new Error(`gate-preconditions: advisory finding "${code}" cannot be overridable`);
+  }
+  if (overridable && !receiptKind) {
+    throw new Error(`gate-preconditions: overridable finding "${code}" names no receipt kind`);
+  }
+  return {
+    code,
+    severity,
+    title,
+    detail,
+    overridable,
+    receiptKind,
+    remediation,
+    ...(quote ? { quote: String(quote) } : {}),
+  };
+};
+
+const sameAttempt = (row, attempt) => Number(row?.attempt) === Number(attempt);
+
+const receiptsOfKind = (receipts, kind, attempt) =>
+  (receipts ?? []).filter((row) => row?.kind === kind && sameAttempt(row, attempt));
+
+// Ensemble receipts that are evidence. A gapped pipeline link also holds a receipt
+// (`choice: 'gap'`) so a resume advances past it; it is not a completed link.
+// Scoped to the validation revision for the same reason the checkpoint receipts
+// are: "Request changes" re-runs the stage within one attempt, and a contribution
+// recorded about the REJECTED draft is not evidence for the revised one. Revision
+// 0 writes no `round`, so its rows resolve exactly as they did before revisions
+// were tracked.
+const evidenceReceipts = (receipts, kind, attempt, validationRound) =>
+  receiptsOfKind(receipts, kind, attempt).filter(
+    (row) => row?.choice !== 'gap' && Number(row?.round ?? 0) === Number(validationRound ?? 0),
+  );
+
+// The checkpoint receipts (summary confirmation, plan approval) are also scoped
+// to the validation revision. "Request changes" at the validation gate re-runs
+// the stage within the same attempt, and a decision the human took about the
+// previous revision must not authorize the new one. Revision 0 writes no
+// ordinal, so its keys are the attempt-scoped keys used before revisions were
+// tracked.
+const checkpointReceipts = (receipts, kind, attempt, validationRound) =>
+  receiptsOfKind(receipts, kind, attempt).filter(
+    (row) => Number(row?.ordinal ?? 0) === Number(validationRound ?? 0),
+  );
+
+// The event each checkpoint writes when the human answers "Request changes". It is
+// the DURABLE record that an authorization was withdrawn: the MCP process also
+// drops it from memory, but that memory dies with the container while this does not.
+const CHECKPOINT_WITHDRAWAL_EVENTS = Object.freeze({
+  'summary-confirmation': 'v2.summary.changes_requested',
+  'plan-approval': 'v2.plan.changes_requested',
+});
+
+const withdrawnAfter = (events, kind, receipt) => {
+  const withdrawal = CHECKPOINT_WITHDRAWAL_EVENTS[kind];
+  if (!withdrawal) return false;
+  const decidedAt = String(receipt?.decidedAt ?? '');
+  return (events ?? []).some(
+    (event) =>
+      eventTypeOf(event) === withdrawal &&
+      String(event.timestamp ?? '').localeCompare(decidedAt) > 0,
+  );
+};
+
+// The receipt that AUTHORIZES this revision, or null. A checkpoint can be raised
+// several times within one revision ("raise a different summary"), and each round
+// records its own receipt — so only the LATEST round speaks for the stage, and a
+// "Request changes" answered after it withdraws the authorization here exactly as
+// it does in the MCP process. Rows written before rounds were tracked carry no
+// `round`, so they resolve to the single approval they always were.
+const currentCheckpointReceipt = (receipts, kind, attempt, validationRound, events) => {
+  const latest = checkpointReceipts(receipts, kind, attempt, validationRound).reduce(
+    (best, row) => (!best || Number(row?.round ?? 0) >= Number(best?.round ?? 0) ? row : best),
+    null,
+  );
+  if (!latest) return null;
+  return withdrawnAfter(events, kind, latest) ? null : latest;
+};
+
+// A `<stage>-questions` output is satisfied by the platform question channel
+// (HUMAN# rows + timeline), not by a graph artifact — see
+// `isQuestionChannelOutput`. Excluded here so it is neither reported missing nor
+// demanded as a re-save after the confirmation checkpoint.
+const requiredOutputs = (stage) =>
+  (stage?.outputArtifacts ?? [])
+    .filter((output) => !output?.optional)
+    .map((output) => output?.artifact ?? output)
+    .filter((artifact) => Boolean(artifact) && !isQuestionChannelOutput(artifact));
+
+// `if-present` is upstream's "only when a conditional question flow actually
+// ran". The platform-native reading of that is data, not extra state: did this
+// stage attempt actually ask a question?
+const askedAQuestion = (events, attempt) =>
+  (events ?? []).some(
+    (event) =>
+      eventTypeOf(event) === 'v2.question.asked' &&
+      // `appendEvent` persists the attempt under `detail`; events written before
+      // it did carry none and still count, as they always have.
+      (event.detail?.attempt == null || sameAttempt(event.detail, attempt)),
+  );
+
+const summaryConfirmationRequired = (policy, events, attempt) => {
+  if (policy?.summaryConfirmation === 'required') return true;
+  return policy?.summaryConfirmation === 'if-present' && askedAQuestion(events, attempt);
+};
+
+// Upstream's lineage rule, at the only seam this platform has: the newest
+// recorded write of each required output must carry the CURRENT authorization.
+// A write with no recorded stamp is treated exactly like an unauthorized one —
+// absence of evidence is non-compliance, not a pass.
+const lineageGaps = ({ events, artifacts, authorizationId, decidedAt }) =>
+  artifacts.filter((artifact) => {
+    const newestByArtifact = new Map();
+    for (const event of events ?? []) {
+      if (
+        eventTypeOf(event) !== 'v2.artifact.stamped' ||
+        event?.detail?.artifactType !== artifact
+      ) {
+        continue;
+      }
+      const artifactId = event.detail?.artifactId;
+      const key = artifactId == null || artifactId === '' ? `type:${artifact}` : `id:${artifactId}`;
+      const previous = newestByArtifact.get(key);
+      if (
+        !previous ||
+        String(event.timestamp ?? '').localeCompare(String(previous.timestamp ?? '')) >= 0
+      ) {
+        newestByArtifact.set(key, event);
+      }
+    }
+    if (newestByArtifact.size === 0) return true;
+    return [...newestByArtifact.values()].some(
+      (stamp) =>
+        stamp.detail?.authorizationId !== authorizationId ||
+        String(stamp.timestamp ?? '') <= String(decidedAt ?? ''),
+    );
+  });
+
+// The gate-plane sensor verdicts, rendered as findings. Exported on its own
+// because the STAGE RUNNER produces them (it is the only component that runs the
+// gate plane) while the ORCHESTRATOR re-derives them from the same rules — so a
+// verdict the human already overrode on a previous revision must not come back
+// as a fresh finding from either side. A PASS says nothing; `notApplicable`
+// (INCONCLUSIVE with the flag) says the sensor had no deliverable to inspect,
+// which is also nothing to decide.
+// A release-integrity failure (the pinned sensor script is missing, or failed its
+// digest check) is not an ordinary verdict: the declared check never executed, so
+// the sensor's authored severity says nothing about it. The fail-closed release
+// rule therefore outranks severity — it is always a BLOCKING, NON-OVERRIDABLE
+// finding, and no `sensor-override` receipt and no `notApplicable` flag can clear
+// it. `request-changes` re-runs the stage, which re-resolves the release, so the
+// run is still never stuck.
+const isReleaseIntegrityFailure = (verdict) => verdict?.detail?.releaseIntegrityFailure === true;
+
+const sensorGateFindings = ({ sensorVerdicts = [], receipts = [], attempt = 0 } = {}) => {
+  const overridden = new Set(
+    receiptsOfKind(receipts, 'sensor-override', attempt).flatMap(
+      (row) => row.detail?.sensorIds ?? [],
+    ),
+  );
+  const findings = [];
+  for (const verdict of sensorVerdicts ?? []) {
+    if (verdict?.result === 'PASS') continue;
+    const integrityFailure = isReleaseIntegrityFailure(verdict);
+    if (!integrityFailure && overridden.has(verdict?.sensorId)) continue;
+    if (!integrityFailure && verdict?.detail?.notApplicable === true) continue;
+    const blocking = integrityFailure || verdict?.severity === 'blocking';
+    const overridable = blocking && !integrityFailure;
+    const onArtifact = verdict.detail?.artifact ? ` on ${verdict.detail.artifact}` : '';
+    findings.push(
+      finding({
+        code: blocking ? 'sensor_gate_blocking' : 'sensor_gate_advisory',
+        severity: blocking ? 'blocking' : 'advisory',
+        title: integrityFailure
+          ? `Sensor ${verdict.sensorId} (gate) could not be verified — release integrity failure${onArtifact}`
+          : `Sensor ${verdict.sensorId} (gate) → ${verdict.result}${onArtifact}`,
+        detail: {
+          sensorId: verdict.sensorId,
+          result: verdict.result,
+          reason: verdict.detail?.reason ?? null,
+          ...(integrityFailure ? { releaseIntegrityFailure: true } : {}),
+        },
+        overridable,
+        ...(overridable ? { receiptKind: 'sensor-override' } : {}),
+        remediation: integrityFailure
+          ? 'The pinned check could not be verified, so it never ran. Request changes: the stage re-runs once the release content is intact.'
+          : blocking
+            ? 'Override to accept the verdict on the record, or request changes so the agent fixes it.'
+            : 'Advisory verdict; decide with it in view.',
+      }),
+    );
+  }
+  return findings;
+};
+
+const evaluateGatePreconditions = ({
+  stage = null,
+  policy = null,
+  attempt = 0,
+  // Which validation revision of this attempt is being judged (0 for the first
+  // run, +1 per "Request changes" at the stage's validation gate).
+  validationRound = 0,
+  receipts = [],
+  events = [],
+  sensorVerdicts = [],
+  reviewVerdict = null,
+  ensembleEvidence = null,
+  // The required outputs the runner actually observed. `null` means "not
+  // observed" (the orchestrator re-read, which sees receipts and events but not
+  // the workspace), and an unobserved set is never reported as missing.
+  producedArtifacts = null,
+  // Approved inputs whose content changed since their producing stage was
+  // approved (change control). Empty/null when the check did not run.
+  changedInputs = [],
+} = {}) => {
+  if (!policy) return { ok: true, findings: [] };
+
+  const findings = [];
+  const required = requiredOutputs(stage);
+
+  if (Array.isArray(producedArtifacts)) {
+    for (const artifact of required.filter((a) => !producedArtifacts.includes(a))) {
+      findings.push(
+        finding({
+          code: 'required_artifact_missing',
+          severity: 'blocking',
+          title: `Required output "${artifact}" was not produced`,
+          detail: { artifact },
+          // Overridable (three-outcome rule): a declared output the platform
+          // cannot map, or one the human judges unnecessary, must never leave a
+          // gate that only offers `request-changes` forever. Approving over it
+          // is recorded as a stage-approval receipt naming the artifact, so the
+          // gap is on the audit trail rather than silently accepted.
+          overridable: true,
+          receiptKind: 'stage-approval',
+          remediation: `Request changes so the agent creates ${artifact}, or override to approve without it on the record.`,
+        }),
+      );
+    }
+  }
+
+  if (summaryConfirmationRequired(policy, events, attempt)) {
+    const receipt = currentCheckpointReceipt(
+      receipts,
+      'summary-confirmation',
+      attempt,
+      validationRound,
+      events,
+    );
+    if (!receipt) {
+      findings.push(
+        finding({
+          code: 'summary_confirmation_missing',
+          receiptKind: 'stage-approval',
+          severity: 'blocking',
+          title: 'The consolidated confirmation checkpoint was never answered',
+          detail: { stageInstanceId: stage?.stageInstanceId ?? null, attempt },
+          overridable: true,
+          remediation:
+            'Approve to waive the checkpoint for this stage, or request changes so the agent raises it and re-saves its outputs.',
+        }),
+      );
+    } else {
+      const gaps = lineageGaps({
+        events,
+        artifacts: required,
+        authorizationId: receipt.sk,
+        decidedAt: receipt.decidedAt,
+      });
+      if (gaps.length > 0) {
+        findings.push(
+          finding({
+            code: 'summary_confirmation_stale',
+            receiptKind: 'stage-approval',
+            severity: 'blocking',
+            title: 'Outputs were not re-saved after the confirmation was given',
+            detail: { artifacts: gaps, authorizationId: receipt.sk },
+            overridable: true,
+            remediation: `Approve to accept them as they are, or request changes so the agent re-saves: ${gaps.join(', ')}.`,
+          }),
+        );
+      }
+    }
+  }
+
+  if (policy.planApproval === 'required') {
+    if (!currentCheckpointReceipt(receipts, 'plan-approval', attempt, validationRound, events)) {
+      findings.push(
+        finding({
+          code: 'plan_approval_missing',
+          receiptKind: 'stage-approval',
+          severity: 'blocking',
+          title: 'The implementation plan was never approved',
+          detail: { stageInstanceId: stage?.stageInstanceId ?? null, attempt },
+          overridable: true,
+          remediation:
+            'Approve to accept the work without a recorded plan approval, or request changes so the agent presents its plan first.',
+        }),
+      );
+    }
+  }
+
+  // The ensemble's evidence channel could not be read (the receipt history for
+  // this attempt). Nothing was dispatched, and nothing can be said about whether
+  // the declared personas ran — so this is not an absence the human can weigh, it
+  // is an unknown. It therefore follows the same fail-closed rule as a pinned
+  // sensor whose integrity check never ran: BLOCKING and NOT overridable, because
+  // a waiver would be a waiver of something nobody can describe. `request-changes`
+  // re-runs the stage, which re-reads the receipts, so the run is never stuck.
+  if (ensembleEvidence?.evidenceUnavailable) {
+    findings.push(
+      finding({
+        code: 'ensemble_evidence_unavailable',
+        severity: 'blocking',
+        title: 'The persona evidence for this stage could not be read',
+        detail: { reason: String(ensembleEvidence.evidenceUnavailable) },
+        remediation:
+          'The collaborator evidence was never readable, so no persona session ran. Request changes: the stage re-runs and re-reads it.',
+      }),
+    );
+  }
+
+  const declaredSupports = ensembleEvidence?.supports ?? [];
+  if (declaredSupports.length > 0) {
+    const contributed = new Set(
+      evidenceReceipts(receipts, 'persona-contribution', attempt, validationRound).map(
+        (row) => row.detail?.agentRef ?? row.unitSlug,
+      ),
+    );
+    for (const agentRef of declaredSupports.filter((ref) => !contributed.has(ref))) {
+      findings.push(
+        finding({
+          code: 'persona_contribution_missing',
+          severity: 'advisory',
+          title: `Support persona ${agentRef} produced no contribution`,
+          detail: { agentRef },
+          remediation: `Review the stage output knowing ${agentRef}'s perspective is absent.`,
+        }),
+      );
+    }
+  }
+
+  const declaredLinks = ensembleEvidence?.links ?? [];
+  if (declaredLinks.length > 0) {
+    const completed = evidenceReceipts(receipts, 'pipeline-link', attempt, validationRound).length;
+    if (completed < declaredLinks.length) {
+      findings.push(
+        finding({
+          code: 'pipeline_link_incomplete',
+          severity: 'advisory',
+          title: `Only ${completed} of ${declaredLinks.length} pipeline links completed`,
+          detail: { completed, declared: declaredLinks.length, links: declaredLinks },
+          remediation: 'Review the stage output knowing the pipeline did not run end to end.',
+        }),
+      );
+    }
+  }
+
+  const budgetCut = ensembleEvidence?.budgetExhausted ?? [];
+  // The integration is where the contributions become the stage output, so an
+  // integrator that crashed or left the outputs untouched means the stage output
+  // is the lead's unintegrated draft. `runHubAndSpoke` records that as a gap and a
+  // timeline event; without this the gate offered a plain `approve` with no
+  // warning at all. Advisory, like every other gap — unless the BUDGET cut the
+  // integration, which the finding below reports as a block instead, so the two
+  // never speak about the same cause at once.
+  const integrationCutByBudget = budgetCut.some((row) => row?.role === 'integrator');
+  const integratorGaps = (ensembleEvidence?.gaps ?? []).filter((row) => row?.role === 'integrator');
+  if (integratorGaps.length > 0 && !integrationCutByBudget) {
+    findings.push(
+      finding({
+        code: 'ensemble_integration_missing',
+        severity: 'advisory',
+        title: `The integration produced no evidence (${integratorGaps[0].agentRef ?? 'lead'})`,
+        detail: {
+          agentRef: integratorGaps[0].agentRef ?? null,
+          reason: integratorGaps[0].reason ?? null,
+        },
+        remediation:
+          "Review the stage output knowing it is the lead's unintegrated draft, or request changes so the integration runs again.",
+      }),
+    );
+  }
+
+  // The stage's aggregate wall-clock budget cut persona sessions before they ran
+  // (or while they ran). Advisory while at least one collaborator's evidence
+  // exists AND the integration still ran: the stage output is there, the human
+  // decides knowing which perspectives are absent. It BLOCKS — overridably, so
+  // approving it is a recorded waiver rather than a silent one — when the cut left
+  // NO collaborator evidence at all (no support contribution, no pipeline link
+  // past the lead), or when it cut the INTEGRATION, because contributions that
+  // were never integrated did not reach the stage output either.
+  if (budgetCut.length > 0) {
+    const collaboratorEvidence = [
+      ...(declaredSupports.length > 0
+        ? [evidenceReceipts(receipts, 'persona-contribution', attempt, validationRound).length]
+        : []),
+      ...(declaredLinks.length > 0
+        ? [
+            Math.max(
+              0,
+              evidenceReceipts(receipts, 'pipeline-link', attempt, validationRound).length - 1,
+            ),
+          ]
+        : []),
+    ];
+    const fullyCut =
+      collaboratorEvidence.length > 0 && collaboratorEvidence.every((count) => count === 0);
+    const blocking = fullyCut || integrationCutByBudget;
+    findings.push(
+      finding({
+        code: 'stage_budget_exhausted',
+        severity: blocking ? 'blocking' : 'advisory',
+        title: fullyCut
+          ? `The stage wall-clock budget ran out before any collaborator ran; ${budgetCut.length} persona session(s) were cut`
+          : integrationCutByBudget
+            ? `The stage wall-clock budget ran out before the integration ran; ${budgetCut.length} persona session(s) were cut`
+            : `The stage wall-clock budget ran out; ${budgetCut.length} persona session(s) did not run to completion`,
+        detail: {
+          sessions: budgetCut,
+          ...(fullyCut ? { collaboratorEvidence: 0 } : {}),
+          ...(integrationCutByBudget ? { integrationCut: true } : {}),
+        },
+        overridable: blocking,
+        ...(blocking ? { receiptKind: 'stage-approval' } : {}),
+        remediation: fullyCut
+          ? 'Override to approve the single-session output on the record, or request changes to run the stage again with a fresh budget.'
+          : integrationCutByBudget
+            ? "Override to approve the lead's unintegrated draft on the record, or request changes to run the stage again with a fresh budget."
+            : 'Review the stage output knowing these sessions were cut, or request changes to run the stage again with a fresh budget.',
+      }),
+    );
+  }
+
+  // Any reviewer verdict that is not READY is decision support at the gate. An
+  // ADVISORY reviewer ran once by design; an ADVERSARIAL one reaches the gate only
+  // when its repair loop ended without READY, so the human decides with the
+  // reviewer's unresolved objection in view instead of approving into silence. A
+  // DTO with no `advisory` flag at all is read as advisory.
+  if (reviewVerdict && reviewVerdict.verdict !== 'READY') {
+    const kind = reviewVerdict.advisory === false ? 'Adversarial' : 'Advisory';
+    findings.push(
+      finding({
+        code: 'review_advisory_findings',
+        severity: 'advisory',
+        title: `${kind} review (${reviewVerdict.reviewerAgent ?? 'reviewer'}): ${reviewVerdict.verdict ?? 'NOT-READY'}`,
+        detail: { findings: reviewVerdict.findings ?? null },
+        remediation: `The ${kind.toLowerCase()} reviewer does not block; decide with its findings in view.`,
+      }),
+    );
+  }
+
+  for (const dissent of ensembleEvidence?.dissent ?? []) {
+    findings.push(
+      finding({
+        code: 'review_dissent_maintained',
+        severity: 'advisory',
+        title: `Maintained dissent (${dissent.agentRef ?? 'collaborator'})`,
+        // Quoted verbatim: a summarized objection is a different objection. The
+        // text rides `quote` as well as `detail` so every renderer (gate prompt,
+        // review panel) shows the words the collaborator actually wrote.
+        detail: { agentRef: dissent.agentRef ?? null, position: dissent.position ?? null },
+        quote: dissent.quote ?? dissent.position ?? null,
+        remediation: 'Decide whether the objection changes your approval.',
+      }),
+    );
+  }
+
+  findings.push(...sensorGateFindings({ sensorVerdicts, receipts, attempt }));
+
+  for (const changed of changedInputs ?? []) {
+    findings.push(
+      finding({
+        code: 'change_control_input_changed',
+        severity: 'advisory',
+        title: `Approved input ${changed.artifactId} changed since it was approved`,
+        detail: changed,
+        remediation: 'Confirm the stage still holds against the changed input.',
+      }),
+    );
+  }
+
+  return { ok: findings.every((item) => item.severity !== 'blocking'), findings };
+};
+
+// The gate's third option exists only when a human can actually resolve a block
+// by taking responsibility for it. A non-overridable block offers
+// `request-changes` alone, which re-runs the stage — so the run is never stuck
+// and the option list never lies about what is possible.
+const overridableFindings = (findings = []) =>
+  findings.filter((item) => item.severity === 'blocking' && item.overridable);
+
+// The runner and the orchestrator see overlapping evidence — the runner observed
+// the workspace, the orchestrator re-read the receipts — so the same condition
+// can be reported twice. Identity is (code, detail): the same code about a
+// DIFFERENT artifact or sensor is a different finding and must survive.
+const mergeFindings = (...lists) => {
+  const byIdentity = new Map();
+  for (const item of lists.flat().filter(Boolean)) {
+    byIdentity.set(`${item.code}\u0000${JSON.stringify(item.detail ?? null)}`, item);
+  }
+  return [...byIdentity.values()];
+};
+
+export {
+  FINDING_CODES,
+  evaluateGatePreconditions,
+  mergeFindings,
+  overridableFindings,
+  sensorGateFindings,
+};
+export default {
+  FINDING_CODES,
+  evaluateGatePreconditions,
+  mergeFindings,
+  overridableFindings,
+  sensorGateFindings,
+};

@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { simpleDiffStringWithCursor } from 'lib0/diff';
-import type { GateAnswer, IntentDetail, IntentGate, IntentGraphNode } from '@/services/intents';
+import type {
+  GateAnswer,
+  IntentDetail,
+  IntentGate,
+  IntentGraphNode,
+  IntentSensorRun,
+} from '@/services/intents';
 import { useIntent } from '@/contexts/IntentContext';
 import { useIntentGraph } from '@/hooks/useIntentGraph';
 import { useYjsDocument } from '@/hooks/useYjsDocument';
@@ -26,11 +32,22 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { cn } from '@/lib/utils';
+import { formatTimelineTimestamp } from '@/lib/timeAgo';
 import { generateColor } from '@/utils/colors';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ChevronRight, FileText, Layers, SearchAlert, SearchCheck, Sparkles } from 'lucide-react';
+import {
+  Ban,
+  ChevronRight,
+  FileText,
+  Layers,
+  SearchAlert,
+  SearchCheck,
+  Sparkles,
+  TriangleAlert,
+} from 'lucide-react';
 
 // Identified-items grouping for the review gate. Mirrors the workbench's
 // DerivedItemsSection ordering: canonical types first, unknowns alphabetical
@@ -72,6 +89,35 @@ function groupReviewItemsByType(items: IntentGraphNode[]): [string, IntentGraphN
     if (ib !== -1) return 1;
     return a.localeCompare(b);
   });
+}
+
+// Reviewer-run presentation helpers. Pure and exported so ordering and verdict
+// extraction are unit-testable without rendering the (Yjs-bound) panel.
+
+// Most-recent-first, stable. A run whose timestamp is missing or unparseable
+// (Date.parse → NaN) is treated as older than any parseable run and sinks to
+// the bottom; equal times (or two unparseable runs) keep their input order via
+// an index tie-break. Returns a new array; never mutates the input; never
+// throws. (FR1.1, FR1.2, NFR3 / R-01)
+export function orderReviewerRuns(runs: IntentSensorRun[]): IntentSensorRun[] {
+  return runs
+    .map((run, index) => ({ run, index, parsed: Date.parse(run.timestamp) }))
+    .toSorted((a, b) => {
+      const aNaN = Number.isNaN(a.parsed);
+      const bNaN = Number.isNaN(b.parsed);
+      if (aNaN && bNaN) return a.index - b.index;
+      if (aNaN) return 1;
+      if (bNaN) return -1;
+      if (a.parsed !== b.parsed) return b.parsed - a.parsed;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.run);
+}
+
+// The reviewer verdict: the structured detail.verdict when present
+// (stringified), else the run result — matching the existing fallback.
+export function reviewerRunVerdict(run: IntentSensorRun): string {
+  return run.detail?.verdict != null ? String(run.detail.verdict) : run.result;
 }
 
 function ReviewStat({
@@ -191,6 +237,11 @@ export interface StageReviewPanelProps {
   onBack: () => void;
 }
 
+// Bounds the free text a gate answer carries. The override reason matches the
+// engine's own cap; the learnings cap keeps one guardrail readable.
+const OVERRIDE_REASON_MAX_LENGTH = 300;
+const LEARNINGS_MAX_LENGTH = 4000;
+
 export function StageReviewPanel({
   gate,
   detail,
@@ -208,6 +259,14 @@ export function StageReviewPanel({
   // re-validated server-side.
   const [skipTo, setSkipTo] = useState('');
   const skipTargets = gate.skipTargets ?? [];
+  // The learnings ritual rides this gate rather than adding a second turn: the
+  // field appears ONLY when the engine says the scope runs it, and an empty answer
+  // is a valid, recorded "nothing to add".
+  const [learnings, setLearnings] = useState('');
+  const learningsRitual = gate.learningsRitual === true;
+  // Why the human accepts the blocking findings: persisted on the override
+  // receipt and the v2.gate.override event, so the waiver says why, not just who.
+  const [overrideReason, setOverrideReason] = useState('');
   const graph = useIntentGraph(projectId, intentId);
   const stage = detail.stages.find((s) => s.stageInstanceId === gate.stageInstanceId) ?? null;
   const artifacts = detail.artifacts.filter(
@@ -215,13 +274,17 @@ export function StageReviewPanel({
   );
   const sensors = detail.sensorRuns.filter((s) => s.stageInstanceId === gate.stageInstanceId);
   const reviewerRuns = sensors.filter((s) => s.sensorId.startsWith('reviewer:'));
-  const reviewerFailCount = reviewerRuns.filter(
-    (run) => run.result !== 'PASS' && run.detail?.verdict !== 'READY',
-  ).length;
+  const orderedReviewerRuns = orderReviewerRuns(reviewerRuns);
+  const latestReviewerRun = orderedReviewerRuns[0] ?? null;
+  const latestReviewerVerdict = latestReviewerRun ? reviewerRunVerdict(latestReviewerRun) : null;
+  const latestReviewerNeedsAttention =
+    latestReviewerRun !== null &&
+    latestReviewerRun.result !== 'PASS' &&
+    latestReviewerRun.detail?.verdict !== 'READY';
   // Open "At a glance" always, and "Reviewer Agent findings" too when the
-  // reviewer agent flagged issues — surface the decision-relevant evidence.
+  // latest reviewer run flagged issues — surface the decision-relevant evidence.
   const [openSections, setOpenSections] = useState<string[]>(() =>
-    reviewerFailCount > 0 ? ['summary', 'reviewer-findings'] : ['summary'],
+    latestReviewerNeedsAttention ? ['summary', 'reviewer-findings'] : ['summary'],
   );
   const revealSection = (value: string) => {
     setOpenSections((prev) => (prev.includes(value) ? prev : [...prev, value]));
@@ -248,19 +311,50 @@ export function StageReviewPanel({
       userName,
       enabled: pending,
     });
-  const submit = async (decision: 'approve' | 'request-changes') => {
+  // The gate offers `override-and-approve` only when it carries a blocking
+  // finding a human may accept responsibility for, and withholds plain `approve`
+  // when a block cannot be overridden at all — so the buttons are driven by the
+  // engine's option list rather than assumed.
+  const gateOptions = Array.isArray(gate.options)
+    ? gate.options.filter((option): option is string => typeof option === 'string')
+    : [];
+  const canOverride = gateOptions.includes('override-and-approve');
+  // The build-and-test loop-back: offered only when the engine named the
+  // code-generation stage it goes back to. Like request-changes it records as
+  // rejected, with the reviewer's feedback, so the re-run is told why.
+  const loopBackTarget = gateOptions.includes('loop-back') ? (gate.loopBackTarget ?? null) : null;
+  // The agent's own words, and the engine's verdict on them. Shown whenever the
+  // agent recommended a loop-back: when the option is offered the reason is what
+  // the reviewer is deciding on, and when it is withheld the note is the only
+  // explanation they get — the recommendation is cleared off the stage row as soon
+  // as this gate opens.
+  const loopBackReason = gate.loopBackReason ?? null;
+  const loopBackWithheld = Boolean(
+    gate.loopBackStatus && gate.loopBackStatus !== 'offered' && !loopBackTarget,
+  );
+  const loopBackNote = gate.loopBackNote ?? null;
+  const gateFindings = gate.findings ?? [];
+  const blockingFindingCount = gateFindings.filter((item) => item.severity === 'blocking').length;
+  const canApprove = gateOptions.length === 0 || gateOptions.includes('approve');
+  const submit = async (
+    decision: 'approve' | 'request-changes' | 'override-and-approve' | 'loop-back',
+  ) => {
+    const sendsBack = decision === 'request-changes' || decision === 'loop-back';
     setSubmitting(true);
     try {
       const currentFeedback = getFeedback();
       await onAnswer(gate, {
-        status: decision === 'approve' ? 'approved' : 'rejected',
-        answer:
-          decision === 'approve'
-            ? {
-                decision,
-                ...(skipTo ? { skipTo } : {}),
-              }
-            : { decision, feedback: currentFeedback },
+        status: sendsBack ? 'rejected' : 'approved',
+        answer: sendsBack
+          ? { decision, feedback: currentFeedback }
+          : {
+              decision,
+              ...(decision === 'override-and-approve' && overrideReason.trim()
+                ? { reason: overrideReason.trim() }
+                : {}),
+              ...(skipTo ? { skipTo } : {}),
+              ...(learningsRitual && learnings.trim() ? { learnings: learnings.trim() } : {}),
+            },
       });
       onBack();
     } finally {
@@ -293,9 +387,9 @@ export function StageReviewPanel({
             }
           />
           <ReviewStat
-            label="Reviewer findings"
-            value={reviewerFailCount || 'None'}
-            tone={reviewerFailCount ? 'warn' : 'ok'}
+            label="Reviewer verdict"
+            value={latestReviewerVerdict ?? 'None'}
+            tone={latestReviewerNeedsAttention ? 'warn' : 'ok'}
             onClick={reviewerRuns.length > 0 ? () => revealSection('reviewer-findings') : undefined}
           />
           <ReviewStat
@@ -374,47 +468,84 @@ export function StageReviewPanel({
             >
               <AccordionTrigger className="py-3 hover:no-underline">
                 <div className="flex items-center gap-2">
-                  {reviewerFailCount ? (
+                  {latestReviewerNeedsAttention ? (
                     <SearchAlert className="h-4 w-4 text-destructive" />
                   ) : (
                     <SearchCheck className="h-4 w-4 text-muted-foreground" />
                   )}
                   <span>Reviewer Agent findings</span>
                   <Badge
-                    variant={reviewerFailCount ? 'destructive' : 'secondary'}
-                    className="h-5 px-1.5 text-[10px]"
+                    variant={latestReviewerNeedsAttention ? 'outline' : 'secondary'}
+                    className={cn(
+                      'h-5 px-1.5 text-[10px]',
+                      latestReviewerNeedsAttention && 'text-destructive',
+                    )}
                   >
-                    {reviewerFailCount
-                      ? `${reviewerFailCount} issue${reviewerFailCount === 1 ? '' : 's'}`
-                      : 'No issues'}
+                    {latestReviewerVerdict}
                   </Badge>
                 </div>
               </AccordionTrigger>
               <AccordionContent className="space-y-3">
                 <div className="space-y-2 text-sm">
-                  {reviewerRuns.map((run) => (
-                    <div key={run.sensorRunId} className="rounded-md border p-2">
-                      {typeof run.detail?.findings === 'string' && run.detail.findings ? (
-                        // The findings markdown already carries the reviewer name
-                        // and verdict (## Verdict, **Reviewer:**), so render it as
-                        // the single source of truth — no duplicate badge/id row.
-                        <div className="prose prose-sm max-w-none dark:prose-invert">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                            {run.detail.findings}
-                          </ReactMarkdown>
-                        </div>
-                      ) : (
-                        // No prose body — show the verdict + reviewer id so the
-                        // run isn't blank.
-                        <div className="flex items-center gap-2">
-                          <Badge variant={run.result === 'PASS' ? 'default' : 'destructive'}>
-                            {String(run.detail?.verdict ?? run.result)}
+                  {orderedReviewerRuns.map((run, index) => {
+                    // Most-recent iteration open, older ones collapsed
+                    const parsedTime = Date.parse(run.timestamp);
+                    const timeLabel = Number.isFinite(parsedTime)
+                      ? formatTimelineTimestamp(run.timestamp)
+                      : null;
+                    return (
+                      <Collapsible
+                        key={run.sensorRunId}
+                        defaultOpen={index === 0}
+                        className="rounded-md border p-2"
+                        data-testid={`reviewer-run-${run.sensorRunId}`}
+                      >
+                        <CollapsibleTrigger
+                          className="group flex w-full flex-wrap items-center gap-2 text-left"
+                          data-testid={`reviewer-run-trigger-${run.sensorRunId}`}
+                        >
+                          {timeLabel && (
+                            <span className="text-xs text-muted-foreground">{timeLabel}</span>
+                          )}
+                          <Badge
+                            variant={run.result === 'PASS' ? 'default' : 'outline'}
+                            className={run.result === 'PASS' ? undefined : 'text-destructive'}
+                          >
+                            {reviewerRunVerdict(run)}
                           </Badge>
-                          <span className="text-xs text-muted-foreground">{run.sensorId}</span>
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                          <ChevronRight
+                            aria-hidden
+                            className="ml-auto h-4 w-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-90"
+                          />
+                        </CollapsibleTrigger>
+                        <CollapsibleContent className="pt-2">
+                          {typeof run.detail?.findings === 'string' && run.detail.findings ? (
+                            // The findings markdown already carries the reviewer
+                            // name and verdict (## Verdict, **Reviewer:**), so
+                            // render it as the single source of truth — no
+                            // duplicate badge/id row.
+                            <div className="prose prose-sm max-w-none dark:prose-invert">
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                {run.detail.findings}
+                              </ReactMarkdown>
+                            </div>
+                          ) : (
+                            // No prose body — show the verdict + reviewer id so
+                            // the run isn't blank.
+                            <div className="flex items-center gap-2">
+                              <Badge
+                                variant={run.result === 'PASS' ? 'default' : 'outline'}
+                                className={run.result === 'PASS' ? undefined : 'text-destructive'}
+                              >
+                                {String(run.detail?.verdict ?? run.result)}
+                              </Badge>
+                              <span className="text-xs text-muted-foreground">{run.sensorId}</span>
+                            </div>
+                          )}
+                        </CollapsibleContent>
+                      </Collapsible>
+                    );
+                  })}
                 </div>
               </AccordionContent>
             </AccordionItem>
@@ -561,6 +692,77 @@ export function StageReviewPanel({
               </Select>
             </div>
           )}
+          {pending && learningsRitual && (
+            <div className="space-y-2">
+              <Label htmlFor="review-learnings">Anything to add for next time? (optional)</Label>
+              <textarea
+                id="review-learnings"
+                value={learnings}
+                onChange={(e) => setLearnings(e.target.value)}
+                maxLength={LEARNINGS_MAX_LENGTH}
+                rows={2}
+                placeholder="A convention, constraint or gotcha that should steer future work in this project."
+                className="flex min-h-[44px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={submitting}
+              />
+              <p className="flex justify-between gap-2 text-xs text-muted-foreground">
+                <span>
+                  Recorded as a project guardrail when you approve. Leaving it empty records that
+                  there was nothing to add.
+                </span>
+                <span aria-live="polite" data-testid="review-learnings-count">
+                  {learnings.length}/{LEARNINGS_MAX_LENGTH}
+                </span>
+              </p>
+            </div>
+          )}
+          {pending && canOverride && (
+            <div className="space-y-2">
+              <Label htmlFor="override-reason">
+                Why are you accepting the blocking finding(s)? (required to override)
+              </Label>
+              <textarea
+                id="override-reason"
+                value={overrideReason}
+                onChange={(e) => setOverrideReason(e.target.value)}
+                maxLength={OVERRIDE_REASON_MAX_LENGTH}
+                rows={2}
+                placeholder="Recorded with your name on the approval, e.g. 'The claim is sourced in the linked ADR.'"
+                className="flex min-h-[44px] w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={submitting}
+              />
+              <p className="text-right text-xs text-muted-foreground" aria-live="polite">
+                {overrideReason.length}/{OVERRIDE_REASON_MAX_LENGTH}
+              </p>
+            </div>
+          )}
+          {gateFindings.length > 0 && (
+            <div className="space-y-2 rounded-md border border-agent-waiting/40 bg-agent-waiting/5 px-3 py-2">
+              <p className="text-xs font-medium">Findings for your decision</p>
+              <ul className="space-y-1.5">
+                {gateFindings.map((item) => (
+                  <li key={`${item.code}-${item.title}`} className="flex gap-2 text-xs">
+                    {item.severity === 'blocking' ? (
+                      <Ban className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+                    ) : (
+                      <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-agent-waiting" />
+                    )}
+                    <span className="min-w-0">
+                      <span className="font-medium">{item.title}</span>
+                      {item.remediation && (
+                        <span className="text-muted-foreground"> — {item.remediation}</span>
+                      )}
+                      {item.quote && (
+                        <blockquote className="mt-1 whitespace-pre-wrap border-l-2 border-muted-foreground/40 pl-2 italic text-muted-foreground">
+                          {item.quote}
+                        </blockquote>
+                      )}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="flex flex-wrap items-center gap-2 pt-1">
             <Button variant="outline" className="mr-auto" onClick={onBack}>
               Back to intent
@@ -574,18 +776,74 @@ export function StageReviewPanel({
                 >
                   Request changes
                 </Button>
-                <Button disabled={submitting} onClick={() => submit('approve')}>
-                  {skipTo
-                    ? `Approve & skip to ${skipTo}`
-                    : gate.nextStageId !== undefined
-                      ? gate.nextStageId
-                        ? `Approve — continue to ${gate.nextStageId}`
-                        : 'Approve — complete workflow'
-                      : 'Approve stage'}
-                </Button>
+                {loopBackTarget && (
+                  <Button
+                    variant="outline"
+                    disabled={submitting || !synced}
+                    onClick={() => {
+                      if (
+                        !window.confirm(
+                          `Send this work back to ${loopBackTarget}? ${loopBackTarget} and this stage re-run from scratch with your feedback, and their earlier plan approvals and reviews will be invalidated.`,
+                        )
+                      ) {
+                        return;
+                      }
+                      void submit('loop-back');
+                    }}
+                  >
+                    Send back to {loopBackTarget}
+                  </Button>
+                )}
+                {canOverride && (
+                  <Button
+                    variant="outline"
+                    disabled={submitting || !overrideReason.trim()}
+                    onClick={() => {
+                      // An override records the human's name against the blocking
+                      // findings it waives. Naming the count in the confirmation is
+                      // the difference between "I clicked the other button" and a
+                      // decision the audit trail can stand on.
+                      if (
+                        !window.confirm(
+                          `Accept ${blockingFindingCount} blocking finding(s) and approve? Your name and the finding codes are recorded with this approval.`,
+                        )
+                      ) {
+                        return;
+                      }
+                      void submit('override-and-approve');
+                    }}
+                  >
+                    Accept {blockingFindingCount} blocking finding(s) &amp; approve
+                  </Button>
+                )}
+                {canApprove && (
+                  <Button disabled={submitting} onClick={() => submit('approve')}>
+                    {skipTo
+                      ? `Approve & skip to ${skipTo}`
+                      : gate.nextStageId !== undefined
+                        ? gate.nextStageId
+                          ? `Approve — continue to ${gate.nextStageId}`
+                          : 'Approve — complete workflow'
+                        : 'Approve stage'}
+                  </Button>
+                )}
               </>
             )}
           </div>
+          {pending && loopBackTarget && (
+            <p className="text-xs text-amber-600 dark:text-amber-500">
+              The agent recommends revising the generated code
+              {loopBackReason ? `: ${loopBackReason}` : ''}. Sending this back re-runs{' '}
+              {loopBackTarget} and this stage from scratch, with your feedback, and their earlier
+              plan approvals and reviews stop counting.
+            </p>
+          )}
+          {pending && loopBackWithheld && (
+            <p className="text-xs text-amber-600 dark:text-amber-500">
+              The agent recommends revising the generated code
+              {loopBackReason ? `: ${loopBackReason}` : ''}.{loopBackNote ? ` ${loopBackNote}` : ''}
+            </p>
+          )}
           {pending && skipTo && (
             <p className="text-xs text-amber-600 dark:text-amber-500">
               Every CONDITIONAL stage between this one and {skipTo} will be marked skipped;

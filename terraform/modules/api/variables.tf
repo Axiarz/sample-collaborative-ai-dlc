@@ -33,6 +33,18 @@ variable "cognito_user_pool_arn" {
   type        = string
 }
 
+variable "web_acl_arn" {
+  description = "ARN of a regional AWS WAFv2 web ACL. Empty leaves the API stage without AWS WAF."
+  type        = string
+  default     = ""
+}
+
+variable "waf_enabled" {
+  description = "Whether to associate the API stage with AWS WAF"
+  type        = bool
+  default     = false
+}
+
 variable "projects_lambda_invoke_arn" {
   description = "Invoke ARN of the projects Lambda"
   type        = string
@@ -192,6 +204,11 @@ variable "agentcore_runtime_arn" {
   default     = ""
 }
 
+variable "bedrock_region" {
+  description = "AWS region the agents Lambda lists Bedrock inference profiles from for the model picker"
+  type        = string
+}
+
 variable "environment_registry_table_name" {
   description = "Managed environment registry table used to resolve project runtime targets"
   type        = string
@@ -244,6 +261,18 @@ variable "source_control_lambda_invoke_arn" {
 
 variable "bitbucket_lambda_name" {
   description = "Name of the bitbucket Lambda function"
+  type        = string
+  default     = ""
+}
+
+variable "codecommit_lambda_invoke_arn" {
+  description = "Invoke ARN of the codecommit Lambda"
+  type        = string
+  default     = ""
+}
+
+variable "codecommit_lambda_name" {
+  description = "Name of the codecommit Lambda function"
   type        = string
   default     = ""
 }

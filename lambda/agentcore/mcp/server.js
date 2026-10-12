@@ -19,6 +19,11 @@
 
 import { GraphWriteError } from './graph-writer.js';
 
+// The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
+// this module implements. Checked against the registry by a test, so a
+// capability cannot be declared handled without the code that handles it.
+export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze(['policy.learnings.off@v1']);
+
 export const ok = (data) => ({ content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] });
 export const fail = (msg) => ({ content: [{ type: 'text', text: msg }], isError: true });
 
@@ -49,6 +54,21 @@ const notifyArtifact = async (bridge, { id, title, action }) => {
     });
   } catch {
     /* best-effort — the poll backstop still covers the UI */
+  }
+};
+
+// The write stamp that makes output lineage checkable: which artifact was written
+// and under which recorded authorization (null when none was held). Skipped
+// entirely when the bridge has no resolved release policy, so an unpinned run
+// does no extra work per write. Best-effort for the same reason as
+// notifyArtifact — the artifact is already written and a retried create would
+// collide with it.
+const stampArtifact = async (bridge, { id, artifactType }) => {
+  if (!bridge?.stampsArtifacts?.()) return;
+  try {
+    await bridge.stampArtifact({ artifactId: id, artifactType: artifactType ?? null });
+  } catch {
+    /* the absence of a stamp is itself evidence; never fail the write */
   }
 };
 
@@ -150,12 +170,14 @@ export const buildToolHandlers = ({ writer, graph, bridge }) => {
           }),
         );
         await notifyArtifact(bridge, { id: res.id, title, action: 'created' });
+        await stampArtifact(bridge, { id: res.id, artifactType: res.artifactType });
         return res;
       }),
     update_artifact: ({ id, props }) =>
       guard(async () => {
         const res = await withWriter((w) => w.updateArtifact({ id, props: props ?? {} }));
         await notifyArtifact(bridge, { id: res.id, title: props?.title, action: 'updated' });
+        await stampArtifact(bridge, { id: res.id, artifactType: res.artifactType });
         return res;
       }),
     link_artifacts: ({ fromId, toId, edge }) =>
@@ -181,12 +203,17 @@ export const buildToolHandlers = ({ writer, graph, bridge }) => {
 
     // ── Collaboration / process ──
     ask_question: ({ questions }) => guard(() => bridge.askQuestion({ questions })),
+    confirm_summary: ({ summary, decisions }) =>
+      guard(() => bridge.confirmSummary({ summary, decisions: decisions ?? [] })),
+    request_plan_approval: ({ plan, testInstructions }) =>
+      guard(() => bridge.requestPlanApproval({ plan, testInstructions })),
     send_output: ({ content, kind }) =>
       guard(() => bridge.sendOutput({ content, kind: kind ?? 'text' })),
     record_project_type: ({ projectType }) =>
       guard(() => bridge.recordProjectType({ projectType })),
     collect_metric: ({ metrics }) => guard(() => bridge.collectMetric({ metrics })),
-    emit_stage_note: ({ summary, type }) => guard(() => bridge.emitStageNote({ summary, type })),
+    emit_stage_note: ({ summary, type, loopBackRecommended }) =>
+      guard(() => bridge.emitStageNote({ summary, type, loopBackRecommended })),
     submit_review: ({ reviewer, verdict, findings, round }) =>
       guard(() =>
         bridge.submitReview({ reviewer, verdict, findings: findings ?? '', round: round ?? 0 }),
@@ -227,25 +254,69 @@ export const AUTHOR_TOOLS = [
 export const REVIEWER_TOOLS = [...READ_TOOLS, 'collect_metric', 'submit_review'];
 export const WORKSPACE_DETECTION_TOOLS = ['record_project_type'];
 
-const toolsForRole = (role, stageId = null) => {
+// Tools the resolved release policy ADDS or WITHDRAWS,
+// §6.1, §7.3). Tool availability — not prompt prose — is the enforcement seam:
+//   - a checkpoint tool that does not exist when the policy is off cannot be
+//     called by accident, and one the platform owns cannot be faked;
+//   - `learnings: off` WITHDRAWS the two learning writers, which is strictly
+//     stronger than asking the agent not to call them and is what upstream does
+//     (no protocol module ⇒ no commands).
+// A null policy (2.3.3 / unpinned) changes nothing, which is what keeps the
+// registered tool list byte-identical for those runs.
+const LEARNING_TOOLS = ['record_team_knowledge', 'record_learning_rule'];
+export const CHECKPOINT_TOOLS = ['confirm_summary', 'request_plan_approval'];
+
+const policyTools = (policy, { checkpointOwner = true } = {}) => {
+  if (!policy) return { add: [], remove: [] };
+  const add = [];
+  // A session that does not OWN the checkpoint never gets the tools, whatever the
+  // policy says: exactly one session per stage attempt may raise the human's
+  // confirmation, and a dispatched persona re-raising it would ask the human to
+  // authorize the same stage twice. Its writes are still stamped — the bridge
+  // rehydrates the lead's recorded authorization.
+  if (
+    checkpointOwner &&
+    (policy.summaryConfirmation === 'required' || policy.summaryConfirmation === 'if-present')
+  ) {
+    add.push('confirm_summary');
+  }
+  if (checkpointOwner && policy.planApproval === 'required') add.push('request_plan_approval');
+  return { add, remove: policy.learnings === 'off' ? LEARNING_TOOLS : [] };
+};
+
+export const assertMcpRole = (role) => {
+  if (!['author', 'reviewer', 'reader'].includes(role)) throw new Error('Invalid MCP role');
+};
+
+export const toolsForRole = (role, stageId = null, policy = null, options = {}) => {
+  assertMcpRole(role);
   if (role === 'reader') return READ_TOOLS;
   if (role === 'reviewer') return REVIEWER_TOOLS;
-  return stageId === 'workspace-detection'
-    ? [...AUTHOR_TOOLS, ...WORKSPACE_DETECTION_TOOLS]
-    : AUTHOR_TOOLS;
+  const base =
+    stageId === 'workspace-detection'
+      ? [...AUTHOR_TOOLS, ...WORKSPACE_DETECTION_TOOLS]
+      : AUTHOR_TOOLS;
+  const { add, remove } = policyTools(policy, options);
+  // A session with no path for the answer to come back into it (a dispatched
+  // support or pipeline link) never gets ask_question: its park would leave an
+  // orphaned gate and a resume that re-dispatches it blind to the answer, which
+  // re-asks. Independent of the policy — it is a property of the session, not of
+  // the release.
+  const withheld = options.canAsk === false ? [...remove, 'ask_question'] : remove;
+  return [...base.filter((name) => !withheld.includes(name)), ...add];
 };
 
 // The handler subset for a given role. `reader` → read-only; `reviewer` adds
 // review verdict/metrics; `author` → all.
-export const handlersForRole = (allHandlers, role, stageId = null) => {
-  const names = toolsForRole(role, stageId);
+export const handlersForRole = (allHandlers, role, stageId = null, policy = null, options = {}) => {
+  const names = toolsForRole(role, stageId, policy, options);
   return Object.fromEntries(names.map((n) => [n, allHandlers[n]]));
 };
 
 // Tool descriptions + zod arg shapes are attached in startMcpServer (where the
 // SDK + zod are present). Kept here as a single source so the catalog is
 // assertable and registration stays a thin loop.
-export const toolSchemas = (z) => ({
+export const toolSchemas = (z, policy = null) => ({
   get_artifact: {
     description:
       'Fetch one business artifact by id. Use mode "toc" or "summary" to avoid loading full markdown unless needed.',
@@ -379,6 +450,29 @@ export const toolSchemas = (z) => ({
       ),
     },
   },
+  confirm_summary: {
+    description:
+      'Raise the ONE consolidated confirmation checkpoint for this stage. Render every decision ' +
+      'you are about to commit as bullets in `summary`. The human answers exactly ' +
+      '"Looks correct" or "Request changes". You MUST call this and receive "Looks correct" ' +
+      'BEFORE you create or update any stage output artifact. On "Request changes" you receive ' +
+      'the requested change, revise, and call this again. Returns EITHER the decision inline OR ' +
+      '{ parked: true } — when parked, STOP IMMEDIATELY: end your turn with no further tool ' +
+      'calls; you will be resumed with the decision.',
+    shape: { summary: z.string(), decisions: z.array(z.string()).optional() },
+  },
+  request_plan_approval: {
+    description:
+      'Present your implementation plan and how to test it, and wait for approval BEFORE you ' +
+      'write any code. The human answers exactly "Approve plan" or "Request changes". The ' +
+      'normal platform completion path checks for the recorded approval before it proceeds; ' +
+      'this workflow check does not constrain direct writes made with the container credentials. ' +
+      'On "Request ' +
+      'changes" you receive the requested change, revise the plan, and call this again. Returns ' +
+      'EITHER the decision inline OR { parked: true } — when parked, STOP IMMEDIATELY: end your ' +
+      'turn with no further tool calls; you will be resumed with the decision.',
+    shape: { plan: z.string(), testInstructions: z.string() },
+  },
   send_output: {
     description:
       'Stream a unit of human-facing output (markdown) to the UI. Persisted so it survives a page reload.',
@@ -405,8 +499,24 @@ export const toolSchemas = (z) => ({
     },
   },
   emit_stage_note: {
-    description: 'Append a short process/progress note to the execution audit trail.',
-    shape: { summary: z.string(), type: z.string().optional() },
+    description: [
+      'Append a short process/progress note to the execution audit trail.',
+      // The field is offered ONLY when the pinned release has a construction
+      // loop-back to reproduce, so an unpinned or 2.3.3-era agent sees exactly
+      // the tool it saw before this stream existed.
+      ...(policy?.loopBack === 'human-offered'
+        ? [
+            'Set loopBackRecommended to a one-line reason when build/test results show the generated code itself must be revised and you must NOT revise it yourself. It records a recommendation for the human reviewer — it does not re-run anything, and the human decides at the stage gate.',
+          ]
+        : []),
+    ].join(' '),
+    shape: {
+      summary: z.string(),
+      type: z.string().optional(),
+      ...(policy?.loopBack === 'human-offered'
+        ? { loopBackRecommended: z.string().optional() }
+        : {}),
+    },
   },
 });
 
@@ -437,9 +547,19 @@ const traceHandler = (name, fn, { enabled }) => {
 // Register the role-appropriate tools on an McpServer. Pure of transport so it
 // is unit-testable with a fake server that records registrations. Each handler
 // is wrapped in a stderr trace (see traceHandler) unless env disables it.
-export const registerTools = ({ server, handlers, role, stageId = null, z, env = process.env }) => {
-  const schemas = toolSchemas(z);
-  const names = toolsForRole(role, stageId);
+export const registerTools = ({
+  server,
+  handlers,
+  role,
+  stageId = null,
+  policy = null,
+  checkpointOwner = true,
+  canAsk = true,
+  z,
+  env = process.env,
+}) => {
+  const names = toolsForRole(role, stageId, policy, { checkpointOwner, canAsk });
+  const schemas = toolSchemas(z, policy);
   const enabled = env.V2_MCP_TRACE !== 'off';
   for (const name of names) {
     const { description, shape } = schemas[name];

@@ -9,17 +9,20 @@ import {
   withPlatformSensors,
   __test,
 } from '../commands/run-stage.js';
+import { createProcessBridge } from '../mcp/process-bridge.js';
 import {
   commitAndPushAll as realCommitAndPushAll,
   gitResultForCommitRefs as realGitResultForCommitRefs,
   runGit,
 } from '../git-engine.js';
+import { repoCheckoutPath } from '../../shared/repo-validation.js';
 import { collectCodeTraceabilityBatches } from '../code-traceability.js';
 import { renderRulesDoc } from '../stage-materializer.js';
 import {
   buildExecutionPlan,
   stageInstanceId as planStageInstanceId,
 } from '../../shared/v2-execution-plan.js';
+import { evaluateGatePreconditions } from '../../shared/gate-preconditions.js';
 
 // A flat-frontmatter STAGE block + a minimal library/workflow that resolves to a
 // single in-scope stage.
@@ -137,16 +140,16 @@ const spyStore = (seed = {}) => {
       calls.push(['recordMetric', args]);
       return { metricId: 'm-test' };
     },
-    async getHumanTask(_e, id) {
-      calls.push(['getHumanTask', id]);
+    async getHumanTask(_e, id, options) {
+      calls.push(['getHumanTask', id, options]);
       return seed.humanTask ?? null;
     },
-    async getStage(_e, id) {
-      calls.push(['getStage', id]);
+    async getStage(_e, id, options) {
+      calls.push(['getStage', id, options]);
       return seed.stage ?? null;
     },
-    async getExecution(_e) {
-      calls.push(['getExecution']);
+    async getExecution(_e, options) {
+      calls.push(['getExecution', options]);
       return seed.execution ?? null;
     },
     async getUnitPlan(_e) {
@@ -1042,7 +1045,109 @@ describe('runStage — failure paths (always records terminal state)', () => {
   });
 });
 
+describe('runStage — release-pinned conductor', () => {
+  const okSpawn = () => ({
+    on: (event, callback) => event === 'close' && setImmediate(() => callback(0)),
+    stdin: { end() {} },
+  });
+  const methodologyRelease = { releaseId: 'aidlc:abc', sourceSha: 'abc', closureDigest: 'd' };
+
+  it('injects the release conductor even though AIDLC_REPO_REF names another snapshot', async () => {
+    const seen = [];
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      env: { BEDROCK_MODEL: 'us.anthropic.claude-sonnet-4-6', AIDLC_REPO_REF: 'other-ref' },
+      loadConductor: async (ref, options) => {
+        seen.push({ ref, options });
+        return options?.methodologyRelease ? '# release conductor' : '# runtime-prefix conductor';
+      },
+      materializeStage: async ({ stage, conductor }) => {
+        seen.push({ conductor });
+        return { prompt: `PROMPT ${stage.stageId}`, mcpConfigPath: '/ws/.aidlc/mcp.json' };
+      },
+    });
+
+    const res = await runStage({ ...baseArgs, methodologyRelease }, deps);
+
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(seen[0]).toEqual({ ref: null, options: { methodologyRelease } });
+    expect(seen.at(-1).conductor).toBe('# release conductor');
+  });
+
+  it('fails the stage instead of running with an empty conductor when the release object is tampered with', async () => {
+    const tampered = Object.assign(new Error('runtime object does not match its recorded digest'), {
+      code: 'release_closure_mismatch',
+    });
+    let spawned = false;
+    const deps = baseDeps({
+      spawnFn: () => (spawned = true),
+      loadConductor: async () => {
+        throw tampered;
+      },
+    });
+
+    const res = await runStage({ ...baseArgs, methodologyRelease }, deps);
+
+    expect(res).toMatchObject({
+      ok: false,
+      reason: 'conductor_unavailable',
+      detail: tampered.message,
+    });
+    expect(spawned).toBe(false);
+    expect(
+      deps.store.calls.some((call) => call[0] === 'updateStageState' && call[1].state === 'FAILED'),
+    ).toBe(true);
+  });
+
+  it('keeps swallowing a conductor failure for an unpinned intent', async () => {
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadConductor: async () => {
+        throw new Error('aidlc-runtime snapshot is gone');
+      },
+    });
+
+    const res = await runStage(baseArgs, deps);
+
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+  });
+});
+
 describe('runStage — MCP secret resolution + child-env injection', () => {
+  it.each([
+    ['global', undefined],
+    ['project', undefined],
+    ['global', 'q-1'],
+    ['project', 'q-1'],
+  ])(
+    'rejects stored %s HTTP config (resume: %s) before secrets or spawn',
+    async (tier, resumeFrom) => {
+      const resolveMcpSecrets = vi.fn();
+      const spawnFn = vi.fn();
+      const deps = baseDeps({ resolveMcpSecrets, spawnFn });
+      const res = await runStage(
+        {
+          ...baseArgs,
+          resumeFrom,
+          mcpServersByTier: {
+            [tier]: {
+              remote: { type: 'http', url: 'http://example.com/mcp' },
+            },
+          },
+        },
+        deps,
+      );
+      expect(res).toMatchObject({ ok: false, reason: 'mcp_config_error' });
+      expect(res.detail).toContain(`${tier} MCP configuration at remote.url`);
+      expect(res.detail).toContain('https://');
+      expect(resolveMcpSecrets).not.toHaveBeenCalled();
+      expect(spawnFn).not.toHaveBeenCalled();
+      expect(
+        deps.store.calls.some((c) => c[0] === 'updateStageState' && c[1].state === 'FAILED'),
+      ).toBe(true);
+    },
+  );
+
   // Capture the env the CLI child is spawned with (3rd arg of spawnFn) + exit 0.
   const capturingSpawn = () => {
     const cap = { env: null };
@@ -1175,6 +1280,22 @@ describe('runStage — deterministic sensors', () => {
     return lib;
   };
 
+  const libWithScriptSensor = (severity) => {
+    const lib = library();
+    lib.stagesById['requirements-analysis'].sensors = ['type-check'];
+    lib.sensorsById = {
+      'type-check': {
+        id: 'type-check',
+        command: 'bun <runtime-managed>/tools/aidlc-sensor-type-check.ts',
+        runtime: 'bun',
+        severity,
+        matches: '**/*.ts',
+        scriptRef: { s3Key: 'blocks/scripts/sha256/type-check' },
+      },
+    };
+    return lib;
+  };
+
   // A graph whose lookupArtifacts traversal returns one row with the given
   // content. A chainable proxy absorbs any gremlin step and yields the row at
   // toList()/next() — robust to the exact traversal shape.
@@ -1196,136 +1317,156 @@ describe('runStage — deterministic sensors', () => {
     return proxy;
   };
 
-  it('feeds a cross-repository move from commitAndPushAll into project sensor selection', async () => {
-    const root = await mkdtemp(nodePath.join(tmpdir(), 'run-stage-rename-selection-'));
-    const workspaceDir = nodePath.join(root, 'work');
-    const git = (args, cwd) => runGit(args, { cwd });
-    const repos = ['acme/source', 'acme/destination'];
-    const remotes = Object.fromEntries(
-      repos.map((repo) => [repo, nodePath.join(root, `${repo.split('/').at(-1)}.git`)]),
-    );
+  it.each([
+    { provider: 'github', release: false },
+    { provider: 'github', release: true },
+    { provider: 'codecommit', release: true },
+  ])(
+    'feeds a $provider cross-repository move into project sensors (release=$release)',
+    async ({ provider, release }) => {
+      const root = await mkdtemp(nodePath.join(tmpdir(), 'run-stage-rename-selection-'));
+      const workspaceDir = nodePath.join(root, 'work');
+      const git = (args, cwd) => runGit(args, { cwd });
+      const repos =
+        provider === 'codecommit'
+          ? [
+              'arn:aws:codecommit:eu-west-1:123456789012:source',
+              'arn:aws:codecommit:eu-west-1:123456789012:destination',
+            ]
+          : ['acme/source', 'acme/destination'];
+      const [sourcePrefix, destinationPrefix] = repos.map(repoCheckoutPath);
+      const remotes = Object.fromEntries(
+        repos.map((repo) => [
+          repo,
+          nodePath.join(root, `${repoCheckoutPath(repo).split('/').at(-1)}.git`),
+        ]),
+      );
 
-    try {
-      for (const repo of repos) {
-        const project = repo.split('/').at(-1);
-        const projectDir = nodePath.join(workspaceDir, repo);
-        await git(['init', '--bare', '-b', 'main', remotes[repo]], root);
-        await mkdir(nodePath.join(projectDir, 'src'), { recursive: true });
-        await git(['init', '-b', 'main', projectDir], root);
-        await writeFile(nodePath.join(projectDir, 'tsconfig.json'), '{"compilerOptions":{}}\n');
-        await writeFile(
-          nodePath.join(projectDir, 'src', `${project}-consumer.ts`),
-          `export const ${project}Consumer = true;\n`,
-        );
-        if (project === 'source') {
+      try {
+        for (const repo of repos) {
+          const project = repoCheckoutPath(repo).split('/').at(-1);
+          const projectDir = nodePath.join(workspaceDir, repoCheckoutPath(repo));
+          await git(['init', '--bare', '-b', 'main', remotes[repo]], root);
+          await mkdir(nodePath.join(projectDir, 'src'), { recursive: true });
+          await git(['init', '-b', 'main', projectDir], root);
+          await writeFile(nodePath.join(projectDir, 'tsconfig.json'), '{"compilerOptions":{}}\n');
           await writeFile(
-            nodePath.join(projectDir, 'src', 'provider.ts'),
-            'export const provider = true;\n',
+            nodePath.join(projectDir, 'src', `${project}-consumer.ts`),
+            `export const ${project}Consumer = true;\n`,
           );
-        }
-        await git(['add', '-A'], projectDir);
-        await git(
-          ['-c', 'user.name=test', '-c', 'user.email=t@t', 'commit', '-m', 'seed project'],
-          projectDir,
-        );
-        await git(['remote', 'add', 'origin', remotes[repo]], projectDir);
-        await git(['push', '-u', 'origin', 'main'], projectDir);
-      }
-
-      const sourcePath = 'acme/source/src/provider.ts';
-      const destinationPath = 'acme/destination/src/provider.ts';
-      await rm(nodePath.join(workspaceDir, sourcePath));
-      await writeFile(
-        nodePath.join(workspaceDir, destinationPath),
-        'export const provider = true;\n',
-      );
-
-      const lib = library();
-      lib.stagesById['requirements-analysis'].sensors = ['type-check'];
-      lib.sensorsById = {
-        'type-check': {
-          id: 'type-check',
-          command: 'bun x.ts',
-          runtime: 'bun',
-          severity: 'blocking',
-          matches: '**/*.ts',
-          verdictMode: 'stdout-json',
-          scope: 'project',
-          projectConfig: 'tsconfig.json',
-          scriptRef: { s3Key: 'blocks/scripts/sha256/type-check' },
-        },
-      };
-
-      const inspectedFiles = [];
-      const spawnFn = (command, args) => {
-        const child = new EventEmitter();
-        child.stdin = { end() {} };
-        child.stdout = new EventEmitter();
-        child.stderr = new EventEmitter();
-        child.kill = () => {};
-        setImmediate(() => {
-          if (command === 'bun') {
-            inspectedFiles.push(args[args.indexOf('--file-path') + 1]);
-            child.stdout.emit('data', Buffer.from('{"pass":true}'));
+          if (project === 'source') {
+            await writeFile(
+              nodePath.join(projectDir, 'src', 'provider.ts'),
+              'export const provider = true;\n',
+            );
           }
-          child.emit('close', 0);
-        });
-        return child;
-      };
-      const store = spyStore();
-      const result = await runStage(
-        {
-          ...baseArgs,
-          workspaceDir,
-          repos,
-          branch: 'main',
-          baseBranch: 'main',
-          gitProvider: 'github',
-        },
-        baseDeps({
-          store,
-          spawnFn,
-          env: { BEDROCK_MODEL: 'us.anthropic.claude-sonnet-4-6', PATH: '/usr/bin:/bin' },
-          loadLibrary: async () => ({ workflow: workflow(), library: lib }),
-          loadBlockScript: async () => 'SENSOR_SCRIPT_BODY',
-          ensureWorkspaceSource: async () => ({ restored: false, repos: [] }),
-          redirectHeavyDirs: async () => ({ links: [] }),
-          commitAndPushAll: (args) =>
-            realCommitAndPushAll({
-              ...args,
-              urlsFor: (repo) => ({
-                auth: remotes[repo],
-                clean: `https://github.com/${repo}.git`,
-              }),
-            }),
-        }),
-      );
+          await git(['add', '-A'], projectDir);
+          await git(
+            ['-c', 'user.name=test', '-c', 'user.email=t@t', 'commit', '-m', 'seed project'],
+            projectDir,
+          );
+          await git(['remote', 'add', 'origin', remotes[repo]], projectDir);
+          await git(['push', '-u', 'origin', 'main'], projectDir);
+        }
 
-      expect(result).toMatchObject({ ok: true, state: 'SUCCEEDED' });
-      const persisted = store.calls.find(
-        ([name, row]) => name === 'recordSensorRun' && row.sensorId === 'type-check',
-      )?.[1];
-      expect(persisted).toMatchObject({
-        result: 'PASS',
-        detail: {
-          scope: 'project',
-          applicability: 'APPLICABLE',
-          provenance: { state: 'known' },
-        },
-      });
-      expect(persisted.detail.provenance.files).toEqual([destinationPath, sourcePath]);
-      expect(inspectedFiles).toEqual([
-        'acme/destination/src/destination-consumer.ts',
-        destinationPath,
-        'acme/source/src/source-consumer.ts',
-      ]);
-      expect(
-        inspectedFiles.every((file) => !file.match(/^acme\/(?:source|destination)\/acme\//)),
-      ).toBe(true);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
+        const sourcePath = `${sourcePrefix}/src/provider.ts`;
+        const destinationPath = `${destinationPrefix}/src/provider.ts`;
+        await rm(nodePath.join(workspaceDir, sourcePath));
+        await writeFile(
+          nodePath.join(workspaceDir, destinationPath),
+          'export const provider = true;\n',
+        );
+
+        const lib = { ...library(), fromRelease: release };
+        lib.stagesById['requirements-analysis'].sensors = ['type-check'];
+        lib.sensorsById = {
+          'type-check': {
+            id: 'type-check',
+            ...(release ? { fireOn: 'write' } : {}),
+            command: 'bun x.ts',
+            runtime: 'bun',
+            severity: 'blocking',
+            matches: '**/*.ts',
+            verdictMode: 'stdout-json',
+            scope: 'project',
+            projectConfig: 'tsconfig.json',
+            scriptRef: { s3Key: 'blocks/scripts/sha256/type-check' },
+          },
+        };
+
+        const inspectedFiles = [];
+        const spawnFn = (command, args) => {
+          const child = new EventEmitter();
+          child.stdin = { end() {} };
+          child.stdout = new EventEmitter();
+          child.stderr = new EventEmitter();
+          child.kill = () => {};
+          setImmediate(() => {
+            if (command === 'bun') {
+              inspectedFiles.push(args[args.indexOf('--file-path') + 1]);
+              child.stdout.emit('data', Buffer.from('{"pass":true}'));
+            }
+            child.emit('close', 0);
+          });
+          return child;
+        };
+        const store = spyStore();
+        const result = await runStage(
+          {
+            ...baseArgs,
+            workspaceDir,
+            repos,
+            branch: 'main',
+            baseBranch: 'main',
+            gitProvider: provider,
+            ...(release ? { methodologyRelease: { releaseId: 'release-a' } } : {}),
+          },
+          baseDeps({
+            store,
+            spawnFn,
+            env: { BEDROCK_MODEL: 'us.anthropic.claude-sonnet-4-6', PATH: '/usr/bin:/bin' },
+            loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+            loadBlockScript: async () => 'SENSOR_SCRIPT_BODY',
+            ensureWorkspaceSource: async () => ({ restored: false, repos: [] }),
+            redirectHeavyDirs: async () => ({ links: [] }),
+            commitAndPushAll: (args) =>
+              realCommitAndPushAll({
+                ...args,
+                urlsFor: (repo) => ({
+                  auth: remotes[repo],
+                  clean: `https://github.com/${repo}.git`,
+                }),
+              }),
+          }),
+        );
+
+        expect(result).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+        const persisted = store.calls.find(
+          ([name, row]) => name === 'recordSensorRun' && row.sensorId === 'type-check',
+        )?.[1];
+        expect(persisted).toMatchObject({
+          result: 'PASS',
+          detail: {
+            scope: 'project',
+            applicability: 'APPLICABLE',
+            provenance: { state: 'known' },
+          },
+        });
+        expect(persisted.detail.provenance.files).toEqual([destinationPath, sourcePath]);
+        expect(inspectedFiles).toEqual([
+          `${destinationPrefix}/src/destination-consumer.ts`,
+          destinationPath,
+          `${sourcePrefix}/src/source-consumer.ts`,
+        ]);
+        expect(
+          inspectedFiles.every((file) => !file.match(/^acme\/(?:source|destination)\/acme\//)),
+        ).toBe(true);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 
   it('persists and broadcasts only redacted harness diagnostics', async () => {
     const workspaceDir = await mkdtemp(nodePath.join(tmpdir(), 'run-stage-sensor-redaction-'));
@@ -1689,6 +1830,69 @@ describe('runStage — deterministic sensors', () => {
     expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
   });
 
+  it('fails a release-pinned stage when an advisory sensor script fails verification', async () => {
+    const workspaceDir = await mkdtemp(nodePath.join(tmpdir(), 'run-stage-release-sensor-'));
+    await writeFile(nodePath.join(workspaceDir, 'a.ts'), 'export const value = 1;');
+    const releaseError = Object.assign(new Error('release script digest mismatch'), {
+      name: 'ReleaseResolverError',
+      code: 'release_closure_mismatch',
+    });
+    const loadBlockScript = vi.fn(async () => {
+      throw releaseError;
+    });
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({
+        workflow: workflow(),
+        library: libWithScriptSensor('advisory'),
+      }),
+      loadBlockScript,
+    });
+    try {
+      const res = await runStage(
+        { ...baseArgs, workspaceDir, methodologyRelease: { releaseId: 'release-a' } },
+        deps,
+      );
+
+      expect(res).toMatchObject({ ok: false, reason: 'sensor_blocked' });
+      expect(loadBlockScript).toHaveBeenCalledWith(
+        expect.objectContaining({ sensorId: 'type-check' }),
+        { methodologyRelease: { releaseId: 'release-a' } },
+      );
+      expect(deps.store.calls.some((c) => c[0] === 'recordSensorRun' && c[1].held === true)).toBe(
+        true,
+      );
+      expect(
+        deps.store.calls.some((c) => c[0] === 'updateStageState' && c[1].state === 'FAILED'),
+      ).toBe(true);
+    } finally {
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps an advisory stage successful when its legacy sensor script is absent', async () => {
+    const workspaceDir = await mkdtemp(nodePath.join(tmpdir(), 'run-stage-legacy-sensor-'));
+    await writeFile(nodePath.join(workspaceDir, 'a.ts'), 'export const value = 1;');
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({
+        workflow: workflow(),
+        library: libWithScriptSensor('advisory'),
+      }),
+      loadBlockScript: async () => '',
+    });
+    try {
+      const res = await runStage({ ...baseArgs, workspaceDir }, deps);
+
+      expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+      expect(deps.store.calls.some((c) => c[0] === 'recordSensorRun' && c[1].held === false)).toBe(
+        true,
+      );
+    } finally {
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
   // Regression: the session process is long-lived and reused across every stage.
   // Each openGraph() opens a WebSocket (a socket fd); if run-stage doesn't close
   // it, fds accumulate stage-over-stage until the process hits EMFILE ("too many
@@ -1802,6 +2006,52 @@ describe('runStage — LLM reviewer axis', () => {
     expect(res).toMatchObject({ ok: false, reason: 'reviewer_not_ready' });
   });
 
+  it('reads the reviewer verdict even when the reviewer CLI exits non-zero', async () => {
+    let spawned = 0;
+    const spawnFn = vi.fn(() => {
+      // The lead exits 0; the reviewer records NOT-READY, then exits 1.
+      const code = spawned++ === 0 ? 0 : 1;
+      return {
+        on: (ev, cb) => ev === 'close' && setImmediate(() => cb(code)),
+        stdin: { end() {} },
+      };
+    });
+    const store = storeWithVerdict('NOT-READY', 'missing acceptance criteria');
+    const deps = baseDeps({
+      store,
+      spawnFn,
+      loadLibrary: async () => ({
+        workflow: workflow(),
+        library: libWithReviewer({ humanValidation: 'none' }),
+      }),
+    });
+    const res = await runStage(baseArgs, deps);
+    expect(res).toMatchObject({ ok: false, reason: 'reviewer_not_ready' });
+    const types = store.calls.filter(([n]) => n === 'appendEvent').map(([, e]) => e.type);
+    expect(types).not.toContain('v2.review.failed');
+  });
+
+  it('records a reviewer dispatch error with its message', async () => {
+    const store = storeWithVerdict('READY');
+    const deps = baseDeps({
+      store,
+      spawnFn: okSpawn,
+      materializeMcpConfig: async ({ scope }) => {
+        if (scope.role === 'reviewer') throw new Error('mcp config unwritable');
+        return '/tmp/mcp.json';
+      },
+      loadLibrary: async () => ({
+        workflow: workflow(),
+        library: libWithReviewer({ humanValidation: 'none' }),
+      }),
+    });
+    await runStage(baseArgs, deps);
+    const failed = store.calls
+      .filter(([n, e]) => n === 'appendEvent' && e.type === 'v2.review.failed')
+      .map(([, e]) => e.summary);
+    expect(failed).toEqual(['Reviewer aidlc-reviewer-agent failed: mcp config unwritable']);
+  });
+
   it('lets a NOT-READY reviewer verdict proceed when human validation follows', async () => {
     const deps = baseDeps({
       store: storeWithVerdict('NOT-READY', 'human should decide'),
@@ -1813,6 +2063,83 @@ describe('runStage — LLM reviewer axis', () => {
     });
     const res = await runStage(baseArgs, deps);
     expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    // Unpinned: the stage result, and so the durable history, is unchanged.
+    expect(res.reviewAdvisory).toBeUndefined();
+  });
+
+  // Release mode with a scope policy: the plan stage carries a resolved policy.
+  const gatedReleaseLibrary = () => {
+    const lib = libWithReviewer({ humanValidation: 'required' });
+    lib.fromRelease = true;
+    lib.scopesById = { feature: { id: 'feature', reviewCap: 'adversarial' } };
+    return lib;
+  };
+
+  it('hands a terminal NOT-READY to the gate of a gated release-mode stage', async () => {
+    const deps = baseDeps({
+      store: storeWithVerdict('NOT-READY', 'human should decide'),
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: gatedReleaseLibrary() }),
+    });
+    const res = await runStage(baseArgs, deps);
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(res.reviewAdvisory).toMatchObject({
+      reviewerAgent: 'aidlc-reviewer-agent',
+      advisory: false,
+      verdict: 'NOT-READY',
+      findings: 'human should decide',
+    });
+  });
+
+  // The runner records an INCONCLUSIVE row when the reviewer wrote nothing.
+  const storeRecordingRows = () => {
+    const store = spyStore();
+    store.recordSensorRun = async (row) => ({ sensorRunId: 'review-none', ...row });
+    return store;
+  };
+
+  it.each([
+    ['wrote no verdict', storeRecordingRows, {}, 'Reviewer did not submit a verdict'],
+    [
+      'failed before writing a verdict',
+      () => storeWithVerdict('READY'),
+      {
+        materializeMcpConfig: async ({ scope }) => {
+          if (scope.role === 'reviewer') throw new Error('mcp config unwritable');
+          return '/tmp/mcp.json';
+        },
+      },
+      'aidlc-reviewer-agent recorded no verdict',
+    ],
+  ])(
+    'hands an INCONCLUSIVE verdict to the gate when the reviewer %s',
+    async (_, store, extra, findings) => {
+      const deps = baseDeps({
+        store: store(),
+        spawnFn: okSpawn,
+        ...extra,
+        loadLibrary: async () => ({ workflow: workflow(), library: gatedReleaseLibrary() }),
+      });
+      const res = await runStage(baseArgs, deps);
+      expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+      expect(res.reviewAdvisory).toEqual({
+        reviewerAgent: 'aidlc-reviewer-agent',
+        advisory: false,
+        verdict: 'INCONCLUSIVE',
+        findings,
+      });
+    },
+  );
+
+  it('carries no reviewer verdict DTO when the adversarial reviewer is READY', async () => {
+    const deps = baseDeps({
+      store: storeWithVerdict('READY'),
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: gatedReleaseLibrary() }),
+    });
+    const res = await runStage(baseArgs, deps);
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(res.reviewAdvisory).toBeUndefined();
   });
 
   it('retries a NOT-READY reviewer verdict up to reviewerMaxIterations before failing', async () => {
@@ -1855,9 +2182,109 @@ describe('runStage — LLM reviewer axis', () => {
     expect(spawnFn).toHaveBeenCalledTimes(3);
   });
 
+  // `fromRelease` is the provenance flag the release policy is gated on:
+  // `review_class` / `review_cap` only act when the library came from
+  // a verified release closure, so an advisory-policy test must be in release
+  // mode. `block-loader.js` stamps this on every release-resolved library.
+  const advisoryLibrary = ({ humanValidation = 'none', reviewerMaxIterations = 3 } = {}) => {
+    const lib = libWithReviewer({ humanValidation, reviewerMaxIterations });
+    lib.stagesById['requirements-analysis'].reviewClass = 'advisory';
+    lib.fromRelease = true;
+    return lib;
+  };
+
+  it('does not fail an advisory-review stage on a NOT-READY verdict', async () => {
+    const store = storeWithVerdict('NOT-READY', 'thin acceptance criteria');
+    const deps = baseDeps({
+      store,
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: advisoryLibrary() }),
+    });
+
+    const res = await runStage(baseArgs, deps);
+
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(res.reviewAdvisory).toMatchObject({
+      reviewerAgent: 'aidlc-reviewer-agent',
+      verdict: 'NOT-READY',
+      findings: 'thin acceptance criteria',
+    });
+  });
+
+  it('runs an advisory reviewer exactly once regardless of the iteration budget', async () => {
+    const store = storeWithVerdictSequence(['NOT-READY', 'NOT-READY', 'NOT-READY']);
+    const spawnFn = vi.fn(okSpawn);
+    const deps = baseDeps({
+      store,
+      spawnFn,
+      loadLibrary: async () => ({
+        workflow: workflow(),
+        library: advisoryLibrary({ reviewerMaxIterations: 3 }),
+      }),
+    });
+
+    const res = await runStage(baseArgs, deps);
+
+    expect(res.ok).toBe(true);
+    expect(store.listSensorRuns).toHaveBeenCalledTimes(1);
+    // One builder invocation plus exactly ONE clean-room reviewer invocation.
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('persists advisory findings so the human sees them at the gate', async () => {
+    const store = storeWithVerdict('NOT-READY', 'unmapped NFR: latency budget');
+    const broadcast = vi.fn(async () => {});
+    const deps = baseDeps({
+      store,
+      broadcast,
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({
+        workflow: workflow(),
+        library: advisoryLibrary({ humanValidation: 'required' }),
+      }),
+    });
+
+    await runStage(baseArgs, deps);
+
+    const event = store.calls.find(
+      ([name, args]) => name === 'appendEvent' && args.type === 'v2.review.advisory',
+    );
+    expect(event?.[1].summary).toContain('unmapped NFR: latency budget');
+    expect(broadcast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        noteType: 'v2.review.advisory',
+        kind: 'review',
+        summary: 'unmapped NFR: latency budget',
+      }),
+    );
+  });
+
+  it('runs no reviewer at all when the scope caps review to none', async () => {
+    const lib = libWithReviewer({ humanValidation: 'none' });
+    lib.scopesById = { feature: { id: 'feature', version: 1, reviewCap: 'none' } };
+    lib.fromRelease = true;
+    const store = storeWithVerdict('NOT-READY');
+    const spawnFn = vi.fn(okSpawn);
+    const deps = baseDeps({
+      store,
+      spawnFn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+    });
+
+    const res = await runStage(baseArgs, deps);
+
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(res.reviewAdvisory).toBeUndefined();
+    // Only the builder invocation — no clean-room reviewer ran.
+    expect(spawnFn).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps Codex reviewer sessions ephemeral and persists only the author rollout', async () => {
     const persistCodexRollout = vi.fn(async () => ({ ok: true, status: 'persisted' }));
     const cleanupCodexHome = vi.fn(async () => true);
+    const materializeCodexHome = vi.fn(
+      async ({ scope }) => `/home/node/.codex-runs/${scope.role}-${scope.reviewerAgent ?? 'stage'}`,
+    );
     let invocation = 0;
     const spawnFn = vi.fn(() => {
       invocation += 1;
@@ -1890,8 +2317,7 @@ describe('runStage — LLM reviewer axis', () => {
         spawnFn,
         persistCodexRollout,
         cleanupCodexHome,
-        materializeCodexHome: async ({ scope }) =>
-          `/home/node/.codex-runs/${scope.role}-${scope.reviewerAgent ?? 'stage'}`,
+        materializeCodexHome,
         loadLibrary: async () => ({
           workflow: workflow(),
           library: libWithReviewer({ humanValidation: 'none' }),
@@ -1906,6 +2332,12 @@ describe('runStage — LLM reviewer axis', () => {
       expect.objectContaining({ threadId: 'author-thread' }),
     );
     expect(cleanupCodexHome).toHaveBeenCalledTimes(2);
+    const scopes = materializeCodexHome.mock.calls.map(([args]) => args.scope);
+    expect(scopes.map((scope) => scope.role)).toEqual(['author', 'reviewer']);
+    for (const scope of scopes) {
+      expect(scope.stageId).toBe(baseArgs.stageId);
+      expect(scope.stageInstanceId).toBeTruthy();
+    }
   });
 });
 
@@ -2047,6 +2479,47 @@ describe('runStage — fresh run persists the CLI session + parks on a pending g
     expect(
       deps.store.calls.some((c) => c[0] === 'appendEvent' && c[1].type === 'v2.stage.parked'),
     ).toBe(true);
+  });
+
+  it('parks and resumes when the gate is answered after grace but before CLI exit', async () => {
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      ids: () => 'forced-uuid',
+      store: spyStore(
+        pendingGateSeed('q-late-answer', {
+          status: 'answered',
+          answer: { answers: [{ selectedOptions: [0] }] },
+        }),
+      ),
+    });
+
+    const res = await runStage(baseArgs, deps);
+
+    expect(res).toMatchObject({
+      ok: true,
+      state: 'WAITING_FOR_HUMAN',
+      humanTaskId: 'q-late-answer',
+    });
+    const states = deps.store.calls
+      .filter((call) => call[0] === 'updateStageState')
+      .map((call) => call[1].state);
+    expect(states).toContain('WAITING_FOR_HUMAN');
+    expect(states).not.toContain('SUCCEEDED');
+    expect(
+      deps.store.calls.some(
+        (call) => call[0] === 'appendEvent' && call[1].type === 'v2.stage.succeeded',
+      ),
+    ).toBe(false);
+    expect(deps.store.calls).toContainEqual([
+      'getStage',
+      BASE_STAGE_INSTANCE_ID,
+      { consistentRead: true },
+    ]);
+    expect(deps.store.calls).toContainEqual([
+      'getHumanTask',
+      'q-late-answer',
+      { consistentRead: true },
+    ]);
   });
 
   it('re-stamps parkedAt with the gate ASK time so the exit-time write never shortens the wait', async () => {
@@ -2364,6 +2837,241 @@ describe('runStage — resume mode', () => {
     });
     const res = await runStage({ ...baseArgs, resumeFrom: 'q-1' }, deps);
     expect(res).toMatchObject({ ok: false, reason: 'resume_no_session' });
+  });
+
+  it('re-runs a loop-back target fresh with the reason and the feedback in the prompt', async () => {
+    // The build-and-test gate sent the work back here: this stage's row was reset
+    // (no session), and the answer belongs to the build-and-test gate.
+    let argsSeen = null;
+    let promptSeen = null;
+    const deps = baseDeps({
+      availableClis: ['claude'],
+      spawnFn: (_command, args) => {
+        argsSeen = args.join(' ');
+        return { ...okSpawn(), stdin: { end: (prompt) => (promptSeen = prompt) } };
+      },
+      ids: () => 'fresh-uuid',
+      // The re-run archives both rewound stages before it writes anything, so the
+      // real path always has a graph here.
+      openGraph: async () => ({}),
+      archiveArtifactsForStages: async () => [],
+      store: spyStore({
+        humanTask: {
+          humanTaskId: 'eg-validation-si-bt-0-run-1',
+          kind: 'validation',
+          status: 'rejected',
+          answer: { decision: 'loop-back', feedback: 'check the null refund path' },
+          // Written by the engine when the gate offered the jump, naming the stage
+          // the walk rewound to. It is what authorizes the fresh re-entry below.
+          loopBackTarget: 'requirements-analysis',
+          loopBackReason: 'payment integration tests fail',
+        },
+        stage: { state: 'PENDING', attempt: 1, cli: null, cliSessionId: null },
+      }),
+    });
+    const res = await runStage({ ...baseArgs, resumeFrom: 'eg-validation-si-bt-0-run-1' }, deps);
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(promptSeen).toContain('payment integration tests fail');
+    expect(promptSeen).toContain('check the null refund path');
+    expect(argsSeen).not.toContain('--resume');
+    expect(deps.store.calls.find((c) => c[0] === 'putStage')[1]).toMatchObject({
+      state: 'RUNNING',
+      attempt: 1,
+    });
+  });
+
+  // A loop-back resets two stage rows but the GRAPH still holds pass 0 as current,
+  // so `create_artifact` would overwrite the head in place: no immutable version,
+  // no supersession, and pass 0's build-test-results — the evidence the human acted
+  // on — gone. Rewind archives before it touches a row; the orchestrator cannot
+  // (no Neptune access), so the target's re-run owes the same archive. The archive
+  // helper's own behaviour (version per head, superseded_at/superseded_by on the
+  // head and its HAS_SECTION/HAS_ITEM items, replay-safety, rehabilitation by the
+  // next write) is proven in graph-writer.test.js; what only THIS runner can show
+  // is that the loop-back reaches it at all, for both stages, before any write.
+  describe('loop-back artifact archive', () => {
+    const GATE_ID = 'eg-validation-si-bt-0-run-1';
+    const RECOMMENDER_INSTANCE_ID = 'si-bt';
+    const loopBackGate = {
+      humanTaskId: GATE_ID,
+      stageInstanceId: RECOMMENDER_INSTANCE_ID,
+      kind: 'validation',
+      status: 'rejected',
+      answer: { decision: 'loop-back', feedback: 'check the null refund path' },
+      loopBackTarget: 'requirements-analysis',
+      loopBackReason: 'payment integration tests fail',
+      answeredByName: 'Ada',
+    };
+    const archiveHarness = ({ archive, stage = {} } = {}) => {
+      const order = [];
+      const archiveArtifactsForStages = vi.fn(async (args) => {
+        order.push('archive');
+        return archive ? archive(args) : [];
+      });
+      const markLoopBackArchived = vi.fn(async () => ({}));
+      const store = spyStore({
+        humanTask: loopBackGate,
+        stage: { state: 'PENDING', attempt: 1, cli: null, cliSessionId: null, ...stage },
+      });
+      store.markLoopBackArchived = markLoopBackArchived;
+      const deps = baseDeps({
+        availableClis: ['claude'],
+        ids: () => 'fresh-uuid',
+        openGraph: async () => ({}),
+        archiveArtifactsForStages,
+        store,
+        spawnFn: () => {
+          order.push('spawn');
+          return okSpawn();
+        },
+      });
+      return { deps, archiveArtifactsForStages, markLoopBackArchived, order };
+    };
+
+    it('archives both rewound stages under the gate id before the agent runs', async () => {
+      const { deps, archiveArtifactsForStages, markLoopBackArchived, order } = archiveHarness();
+
+      const res = await runStage({ ...baseArgs, resumeFrom: GATE_ID }, deps);
+
+      expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+      expect(archiveArtifactsForStages).toHaveBeenCalledTimes(1);
+      expect(archiveArtifactsForStages.mock.calls[0][0]).toMatchObject({
+        intentId: 'i1',
+        // The target this stage is, and the recommender the gate belongs to.
+        stageInstanceIds: [BASE_STAGE_INSTANCE_ID, RECOMMENDER_INSTANCE_ID],
+        restartId: `loopback-${GATE_ID}`,
+        actor: 'Ada',
+      });
+      expect(archiveArtifactsForStages.mock.calls[0][0].reason).toContain(
+        'payment integration tests fail',
+      );
+      // Nothing the agent writes may land on an unarchived head.
+      expect(order[0]).toBe('archive');
+      expect(order).toContain('spawn');
+      expect(markLoopBackArchived).toHaveBeenCalledWith({
+        executionId: 'e1',
+        stageInstanceId: BASE_STAGE_INSTANCE_ID,
+        loopBackId: GATE_ID,
+      });
+    });
+
+    it.each([
+      ['the archive fails', { archive: () => Promise.reject(new Error('Neptune unavailable')) }],
+    ])('fails the stage closed and never spawns when %s', async (_case, over) => {
+      const { deps, markLoopBackArchived, order } = archiveHarness(over);
+
+      const res = await runStage({ ...baseArgs, resumeFrom: GATE_ID }, deps);
+
+      expect(res).toMatchObject({ ok: false, reason: 'loopback_archive_failed' });
+      expect(order).not.toContain('spawn');
+      expect(markLoopBackArchived).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when there is no graph to archive through', async () => {
+      const { deps, order } = archiveHarness();
+      deps.openGraph = null;
+
+      const res = await runStage({ ...baseArgs, resumeFrom: GATE_ID }, deps);
+
+      expect(res).toMatchObject({ ok: false, reason: 'loopback_archive_failed' });
+      expect(order).not.toContain('spawn');
+    });
+
+    // The marker is stamped only after a COMPLETE archive, so a replay of a
+    // finished archive skips it and the pass-1 heads this attempt is about to write
+    // are not archived as if they were pass 0's.
+    it('does not archive again when this decision already archived', async () => {
+      const { deps, archiveArtifactsForStages } = archiveHarness({
+        stage: { loopBackArchiveId: GATE_ID },
+      });
+
+      const res = await runStage({ ...baseArgs, resumeFrom: GATE_ID }, deps);
+
+      expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+      expect(archiveArtifactsForStages).not.toHaveBeenCalled();
+    });
+
+    it('archives again when the marker belongs to an earlier decision', async () => {
+      const { deps, archiveArtifactsForStages } = archiveHarness({
+        stage: { loopBackArchiveId: 'eg-validation-si-bt-0-run-0' },
+      });
+
+      await runStage({ ...baseArgs, resumeFrom: GATE_ID }, deps);
+
+      expect(archiveArtifactsForStages).toHaveBeenCalledTimes(1);
+    });
+
+    // An ordinary resume is not a rewind: archiving there would version a head the
+    // run is still building.
+    it('archives nothing on a resume that is not a loop-back', async () => {
+      const { deps, archiveArtifactsForStages } = archiveHarness();
+      deps.store = spyStore({
+        humanTask: {
+          humanTaskId: 'eg-question-si-ra-0-run-1',
+          kind: 'question',
+          status: 'answered',
+          answer: { perQuestion: [{ answer: 'yes' }] },
+        },
+        stage: { state: 'RUNNING', attempt: 0, cli: 'claude', cliSessionId: 'session-1' },
+      });
+
+      await runStage({ ...baseArgs, resumeFrom: 'eg-question-si-ra-0-run-1' }, deps);
+
+      expect(archiveArtifactsForStages).not.toHaveBeenCalled();
+    });
+  });
+
+  // The bypass is the engine's offer, not the human's words. `parseChoice` reads
+  // `freeText`, so a question gate answered "loop-back" used to look like a
+  // loop-back here and skip the fail-closed session guard, re-entering a stage as a
+  // fresh run with "Build-and-test sent this work back to you" in its prompt.
+  it('does not treat a loop-back answer on a gate without a target as a loop-back', async () => {
+    for (const [label, humanTask] of [
+      [
+        'question gate answered in free text',
+        {
+          humanTaskId: 'eg-question-si-ra-0-run-1',
+          kind: 'question',
+          status: 'answered',
+          answer: { freeText: 'loop-back' },
+        },
+      ],
+      [
+        'validation gate that never offered it',
+        {
+          humanTaskId: 'eg-validation-si-ra-0-run-1',
+          kind: 'validation',
+          status: 'rejected',
+          answer: { decision: 'loop-back' },
+        },
+      ],
+      [
+        'gate whose target names another stage',
+        {
+          humanTaskId: 'eg-validation-si-bt-0-run-1',
+          kind: 'validation',
+          status: 'rejected',
+          answer: { decision: 'loop-back' },
+          loopBackTarget: 'code-generation',
+        },
+      ],
+    ]) {
+      let promptSeen = null;
+      const deps = baseDeps({
+        availableClis: ['claude'],
+        spawnFn: () => ({
+          ...okSpawn(),
+          stdin: { end: (prompt) => (promptSeen = prompt) },
+        }),
+        store: spyStore({
+          humanTask,
+          stage: { state: 'PENDING', attempt: 1, cli: null, cliSessionId: null },
+        }),
+      });
+      const res = await runStage({ ...baseArgs, resumeFrom: humanTask.humanTaskId }, deps);
+      expect(res, label).toMatchObject({ ok: false, reason: 'resume_no_session' });
+      expect(promptSeen, label).toBeNull();
+    }
   });
 
   it('explains a removed pinned credential when resuming a parked stage', async () => {
@@ -3663,7 +4371,15 @@ describe('runStage — engine git hook (docs/v2-parallel.md WP2)', () => {
       commitAndPushAll: async () => ({
         ok: true,
         committed: false,
-        results: [{ repo: 'owner/repo', committed: false, reason: 'clean', pushed: 'up_to_date' }],
+        results: [
+          {
+            repo: 'owner/repo',
+            committed: false,
+            reason: 'clean',
+            pushed: 'up_to_date',
+            provenance: { state: 'known', files: [] },
+          },
+        ],
       }),
     });
     await runStage(gitArgs, deps);
@@ -4079,7 +4795,15 @@ describe('runStage — unit lanes (docs/v2-parallel.md WP4)', () => {
       commitAndPushAll: async () => ({
         ok: true,
         committed: false,
-        results: [{ repo: 'owner/repo', committed: false, reason: 'clean', pushed: 'up_to_date' }],
+        results: [
+          {
+            repo: 'owner/repo',
+            committed: false,
+            reason: 'clean',
+            pushed: 'up_to_date',
+            provenance: { state: 'known', files: [] },
+          },
+        ],
       }),
       gitResultForCommitRefs,
       ingestStageCodeTraceability,
@@ -4158,7 +4882,15 @@ describe('runStage — unit lanes (docs/v2-parallel.md WP4)', () => {
       commitAndPushAll: async () => ({
         ok: true,
         committed: false,
-        results: [{ repo: 'owner/repo', committed: false, reason: 'clean', pushed: 'up_to_date' }],
+        results: [
+          {
+            repo: 'owner/repo',
+            committed: false,
+            reason: 'clean',
+            pushed: 'up_to_date',
+            provenance: { state: 'known', files: [] },
+          },
+        ],
       }),
       gitResultForCommitRefs,
       ingestStageCodeTraceability,
@@ -4506,5 +5238,1313 @@ describe('runStage — intent delivery', () => {
     const res = await runStage(baseArgs, deps);
     expect(res.ok).toBe(true);
     expect(seen).toEqual({ scope: 'feature' });
+  });
+});
+
+// Release-mode runStage behavior.
+describe('runStage — release-mode fidelity', () => {
+  const okSpawn = () => ({
+    on: (event, callback) => event === 'close' && setImmediate(() => callback(0)),
+    stdin: { end() {} },
+  });
+
+  const RELEASE_PIN = {
+    releaseId: 'aidlc:abc',
+    sourceSha: 'a'.repeat(40),
+    closureDigest: 'd'.repeat(64),
+    importerRevision: 1,
+    catalogKey: 'aidlc-releases/v1/catalog.json',
+    manifestKey: 'aidlc-releases/v1/manifest.json',
+  };
+
+  // `pipeline` / `mob` execute with support personas loaded from the same library
+  // as the stage.
+  const ensembleLibrary = (mode) => {
+    const lib = library();
+    lib.stagesById['requirements-analysis'].mode = mode;
+    lib.stagesById['requirements-analysis'].supportAgents = ['aidlc-architect-agent'];
+    lib.agentsById['aidlc-architect-agent'] = {
+      id: 'aidlc-architect-agent',
+      displayName: 'Architect',
+      bodyRef: { s3Key: 'blocks/bodies/sha256/architect' },
+    };
+    return lib;
+  };
+
+  it.each(['pipeline', 'mob'])(
+    'runs a %s stage instead of failing not_implemented',
+    async (mode) => {
+      let seen = null;
+      const deps = baseDeps({
+        spawnFn: okSpawn,
+        loadLibrary: async () => ({
+          workflow: workflow(),
+          library: { ...ensembleLibrary(mode), fromRelease: true },
+        }),
+        materializeStage: async (args) => {
+          seen = args;
+          return { prompt: 'P', mcpConfigPath: '/ws/.aidlc/mcp.json' };
+        },
+      });
+
+      const res = await runStage({ ...baseArgs, methodologyRelease: RELEASE_PIN }, deps);
+
+      expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+      expect(seen.stage.mode).toBe(mode);
+      // The supports run as their own sessions; the lead prompt never carries them.
+      expect(seen).not.toHaveProperty('supportAgents');
+    },
+  );
+
+  // Persona sessions exist only for a pinned release: an unpinned plan fails these
+  // modes fast, as it did before they could run.
+  it.each(['pipeline', 'mob'])('still fails a %s stage for an unpinned intent', async (mode) => {
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: ensembleLibrary(mode) }),
+    });
+
+    await expect(runStage(baseArgs, deps)).resolves.toMatchObject({
+      ok: false,
+      reason: 'not_implemented',
+    });
+  });
+
+  it('loads no support persona for a legacy mode', async () => {
+    let seen = null;
+    const lib = ensembleLibrary('inline');
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+      materializeStage: async (args) => {
+        seen = args;
+        return { prompt: 'P', mcpConfigPath: '/ws/.aidlc/mcp.json' };
+      },
+    });
+
+    await runStage(baseArgs, deps);
+
+    expect(seen).not.toHaveProperty('supportAgents');
+  });
+
+  it('still refuses agent-team, which needs real concurrent sessions', async () => {
+    const lib = library();
+    lib.stagesById['requirements-analysis'].mode = 'agent-team';
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+    });
+
+    await expect(runStage(baseArgs, deps)).resolves.toMatchObject({
+      ok: false,
+      reason: 'not_implemented',
+    });
+  });
+
+  // In release mode a body that fails its integrity check must fail the
+  // STAGE, not silently produce a prompt with no instructions.
+  it('fails the stage when a release-mode body fails its integrity check', async () => {
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadBlockBody: async () => {
+        const error = new Error('body object does not match its recorded digest');
+        error.code = 'release_closure_mismatch';
+        throw error;
+      },
+    });
+
+    const res = await runStage({ ...baseArgs, methodologyRelease: RELEASE_PIN }, deps);
+
+    expect(res).toMatchObject({ ok: false, reason: 'methodology_body_unavailable' });
+    expect(res.detail).toContain('does not match its recorded digest');
+  });
+
+  it('passes the release pin to the body reader so the digest check can run', async () => {
+    const loadBlockBody = vi.fn(async () => 'body');
+    const deps = baseDeps({ spawnFn: okSpawn, loadBlockBody });
+
+    await runStage({ ...baseArgs, methodologyRelease: RELEASE_PIN }, deps);
+
+    expect(loadBlockBody).toHaveBeenCalledWith(expect.anything(), {
+      methodologyRelease: RELEASE_PIN,
+    });
+  });
+
+  it('keeps the legacy path lenient when a body is unreadable', async () => {
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadBlockBody: async () => {
+        throw new Error('s3 down');
+      },
+    });
+
+    await expect(runStage(baseArgs, deps)).resolves.toMatchObject({ ok: true });
+  });
+
+  // A scope policy that removes verification must leave an audit trail.
+  it('emits v2.policy.applied naming the reviewer and sensors the policy removed', async () => {
+    const lib = library();
+    lib.fromRelease = true;
+    lib.stagesById['requirements-analysis'].reviewer = 'aidlc-reviewer-agent';
+    lib.stagesById['requirements-analysis'].sensors = ['linter'];
+    lib.sensorsById.linter = { id: 'linter', version: 1, command: 'bun x', matches: '**/*.ts' };
+    lib.agentsById['aidlc-reviewer-agent'] = { id: 'aidlc-reviewer-agent' };
+    lib.scopesById = {
+      feature: { id: 'feature', version: 1, reviewCap: 'none', sensorsPolicy: 'off' },
+    };
+    const store = spyStore();
+    const deps = baseDeps({
+      store,
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+    });
+
+    await runStage(baseArgs, deps);
+
+    const event = store.calls.find(
+      ([name, args]) => name === 'appendEvent' && args.type === 'v2.policy.applied',
+    );
+    expect(event).toBeDefined();
+    expect(event[1].summary).toContain('aidlc-reviewer-agent');
+    expect(event[1].summary).toContain('linter');
+  });
+
+  it('emits no policy event for a legacy library, even with the same SCOPE row', async () => {
+    const lib = library();
+    lib.scopesById = { feature: { id: 'feature', version: 1, reviewCap: 'none' } };
+    const store = spyStore();
+    const deps = baseDeps({
+      store,
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+    });
+
+    await runStage(baseArgs, deps);
+
+    expect(
+      store.calls.some(
+        ([name, args]) => name === 'appendEvent' && args.type === 'v2.policy.applied',
+      ),
+    ).toBe(false);
+  });
+
+  // The write-plane candidate list must be trustworthy or absent. A repo that
+  // reported no `files` array means the list is PARTIAL, and a partial list
+  // silently narrows a sensor sweep into "no files match". The path PROJECTION
+  // itself is unit-tested in aidlc-release-adapters.test.js; here we pin the
+  // trust decision and that the projected space reaches the sensor.
+  describe('write-plane changed-file list', () => {
+    const sensorLibrary = (matches) => {
+      const lib = { ...library(), fromRelease: true };
+      lib.stagesById['requirements-analysis'].sensors = ['linter'];
+      lib.sensorsById.linter = {
+        id: 'linter',
+        version: 1,
+        command: 'bun run linter',
+        matches,
+        severity: 'advisory',
+        fireOn: 'write',
+      };
+      return lib;
+    };
+
+    const sensorDetail = async ({ gitResult, repos, matches }) => {
+      const workspaceDir = await mkdtemp(nodePath.join(tmpdir(), 'write-plane-stage-'));
+      try {
+        for (const file of ['acme/api/src/a.ts', 'acme/web/src/b.ts']) {
+          await mkdir(nodePath.dirname(nodePath.join(workspaceDir, file)), { recursive: true });
+          await writeFile(nodePath.join(workspaceDir, file), 'export {};');
+        }
+        const store = spyStore();
+        const deps = baseDeps({
+          store,
+          spawnFn: okSpawn,
+          loadLibrary: async () => ({ workflow: workflow(), library: sensorLibrary(matches) }),
+          commitAndPushAll: async () => gitResult,
+          loadBlockScript: async () => 'export default 1;',
+          ensureWorkspaceSource: async () => ({ restored: false, repos: [], failed: [] }),
+          redirectHeavyDirs: async () => ({ links: [] }),
+        });
+        const res = await runStage(
+          { ...baseArgs, workspaceDir, repos, methodologyRelease: { releaseId: 'release-a' } },
+          deps,
+        );
+        expect(res.reason ?? null).toBeNull();
+        const run = store.calls.find(
+          ([name, args]) => name === 'recordSensorRun' && args.sensorId === 'linter',
+        );
+        return run?.[1]?.detail ?? null;
+      } finally {
+        await rm(workspaceDir, { recursive: true, force: true });
+      }
+    };
+
+    const multiGit = {
+      ok: true,
+      committed: true,
+      results: [
+        {
+          repo: 'acme/api',
+          committed: true,
+          files: ['acme/api/src/a.ts'],
+          provenance: { state: 'known', files: ['acme/api/src/a.ts'] },
+        },
+        {
+          repo: 'acme/web',
+          committed: true,
+          files: ['acme/web/src/b.ts'],
+          provenance: { state: 'known', files: ['acme/web/src/b.ts'] },
+        },
+      ],
+    };
+
+    it('uses the write plane with the full list when every repo reported files', async () => {
+      expect(
+        await sensorDetail({
+          gitResult: multiGit,
+          repos: ['acme/api', 'acme/web'],
+          matches: '**/*.md',
+        }),
+      ).toMatchObject({
+        reason: 'no files match',
+        provenance: { state: 'known', files: ['acme/api/src/a.ts', 'acme/web/src/b.ts'] },
+      });
+    });
+
+    it('hands the sensor workspace-relative paths, not repo-relative ones', async () => {
+      // `acme/web/**` can only match once the repo-relative `src/b.ts` has been
+      // projected into the workspace space.
+      const projected = await sensorDetail({
+        gitResult: multiGit,
+        repos: ['acme/api', 'acme/web'],
+        matches: 'acme/web/**',
+      });
+      expect(projected?.reason).toBeUndefined();
+      expect(projected.files.map((file) => file.file)).toEqual(['acme/web/src/b.ts']);
+
+      // The unprojected path space matches nothing under the repo prefix.
+      const unprojected = await sensorDetail({
+        gitResult: multiGit,
+        repos: ['acme/api', 'acme/web'],
+        matches: 'src/**',
+      });
+      expect(unprojected).toMatchObject({
+        reason: 'no files match',
+        provenance: { state: 'known', files: ['acme/api/src/a.ts', 'acme/web/src/b.ts'] },
+      });
+    });
+
+    it('falls back to the workspace-wide sweep when a repo reported no files array', async () => {
+      const detail = await sensorDetail({
+        gitResult: {
+          ok: true,
+          committed: true,
+          results: [
+            {
+              repo: 'acme/api',
+              committed: true,
+              files: ['acme/api/src/a.ts'],
+              provenance: { state: 'known', files: ['acme/api/src/a.ts'] },
+            },
+            { repo: 'acme/web' },
+          ],
+        },
+        repos: ['acme/api', 'acme/web'],
+        matches: '**/*.md',
+      });
+      expect(detail).toMatchObject({ reason: 'no files match' });
+      expect(detail.provenance).toMatchObject({
+        state: 'unknown',
+        reason: 'acme/web: missing_repository_provenance',
+      });
+    });
+
+    it('falls back to the workspace-wide sweep when the git engine reported nothing', async () => {
+      const detail = await sensorDetail({
+        gitResult: { ok: true, committed: false, results: [] },
+        repos: [],
+        matches: '**/*.md',
+      });
+      expect(detail.provenance).toMatchObject({
+        state: 'unknown',
+        reason: 'no_repository_results',
+      });
+    });
+  });
+
+  // Advisory reviewer findings land on the timeline, not verbatim at the approval
+  // gate, so the prompt must not promise otherwise.
+  describe('advisory reviewer prompt truthfulness', () => {
+    const advisoryStage = {
+      stageId: 'requirements-analysis',
+      phase: 'inception',
+      inputArtifacts: [{ artifact: 'intent-statement' }],
+      outputArtifacts: [{ artifact: 'requirements-analysis' }],
+      reviewer: { reviewerAgent: 'aidlc-reviewer-agent', maxIterations: 1, advisory: true },
+    };
+
+    it('does not claim the findings are shown verbatim at the gate', () => {
+      const prompt = __test.buildReviewerPrompt({
+        stage: advisoryStage,
+        reviewerAgent: 'aidlc-reviewer-agent',
+        reviewerPersona: '# Reviewer',
+        knowledge: '',
+        round: 1,
+      });
+
+      expect(prompt).not.toMatch(/shown verbatim to the human reviewer at the approval/i);
+      expect(prompt).toContain('recorded on this stage');
+      expect(prompt).toMatch(/durable review\s+note/);
+      expect(prompt).toMatch(/NOT\s+inlined into the approval prompt/);
+    });
+
+    it('says nothing about advisory handling on an adversarial review', () => {
+      const prompt = __test.buildReviewerPrompt({
+        stage: { ...advisoryStage, reviewer: { reviewerAgent: 'r', maxIterations: 3 } },
+        reviewerAgent: 'r',
+        reviewerPersona: '# Reviewer',
+        knowledge: '',
+        round: 1,
+      });
+
+      expect(prompt).not.toContain('ADVISORY review');
+    });
+
+    it('neutralizes engine tokens in the reviewer persona and knowledge', () => {
+      const prompt = __test.buildReviewerPrompt({
+        stage: advisoryStage,
+        reviewerAgent: 'r',
+        reviewerPersona: 'Run {{INVOKE}} engine gen stage-table',
+        knowledge: 'See {{HARNESS_DIR}}/tools',
+        round: 1,
+      });
+
+      expect(prompt).not.toContain('{{INVOKE}}');
+      expect(prompt).not.toContain('{{HARNESS_DIR}}');
+      expect(prompt).toContain('<runtime-managed-engine>');
+      expect(prompt).toContain('<runtime-managed>');
+    });
+  });
+});
+
+// ── Release-mode knowledge and trustworthy file lists ───────────────────────
+describe('runStage — release-mode knowledge and changedFiles', () => {
+  const okSpawn = () => ({
+    on: (event, callback) => event === 'close' && setImmediate(() => callback(0)),
+    stdin: { end() {} },
+  });
+
+  const RELEASE_PIN = {
+    releaseId: 'aidlc:abc',
+    sourceSha: 'a'.repeat(40),
+    closureDigest: 'd'.repeat(64),
+    importerRevision: 1,
+    catalogKey: 'aidlc-releases/v1/catalog.json',
+    manifestKey: 'aidlc-releases/v1/manifest.json',
+  };
+
+  // A KNOWLEDGE body is methodology. In release mode a digest mismatch on
+  // it must fail the stage exactly like a stage or agent body — swallowing it to
+  // '' runs the agent on silently reduced steering.
+  describe('KNOWLEDGE bodies fail closed in release mode', () => {
+    const knowledgeLibrary = () => {
+      const lib = library();
+      lib.knowledgeById = {
+        'product-knowledge': {
+          id: 'product-knowledge',
+          agentRef: 'aidlc-product-agent',
+          bodyRef: { s3Key: 'blocks/bodies/sha256/knowledge' },
+        },
+      };
+      return lib;
+    };
+
+    const tamperedKnowledgeDeps = (extra = {}) =>
+      baseDeps({
+        spawnFn: okSpawn,
+        loadLibrary: async () => ({ workflow: workflow(), library: knowledgeLibrary() }),
+        loadBlockBody: async (block) => {
+          if (block.id === 'product-knowledge') {
+            const error = new Error('knowledge object does not match its recorded digest');
+            error.code = 'release_closure_mismatch';
+            throw error;
+          }
+          return `body:${block.bodyRef?.s3Key ?? block.id}`;
+        },
+        ...extra,
+      });
+
+    it('fails the stage when a release-mode KNOWLEDGE body fails its digest check', async () => {
+      const res = await runStage(
+        { ...baseArgs, methodologyRelease: RELEASE_PIN },
+        tamperedKnowledgeDeps(),
+      );
+
+      expect(res).toMatchObject({ ok: false, reason: 'methodology_body_unavailable' });
+      expect(res.detail).toContain('does not match its recorded digest');
+    });
+
+    it('never spawns the CLI once release-mode knowledge is untrustworthy', async () => {
+      const spawnFn = vi.fn(okSpawn);
+
+      await runStage(
+        { ...baseArgs, methodologyRelease: RELEASE_PIN },
+        tamperedKnowledgeDeps({ spawnFn }),
+      );
+
+      expect(spawnFn).not.toHaveBeenCalled();
+    });
+
+    it('keeps the LEGACY path lenient: the same failure degrades to no knowledge', async () => {
+      let seen = null;
+      const res = await runStage(
+        baseArgs,
+        tamperedKnowledgeDeps({
+          materializeStage: async (args) => {
+            seen = args;
+            return { prompt: 'P', mcpConfigPath: '/ws/.aidlc/mcp.json' };
+          },
+        }),
+      );
+
+      expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+      expect(seen.knowledge).not.toContain('knowledge');
+    });
+
+    it('still injects a readable release-mode KNOWLEDGE body', async () => {
+      let seen = null;
+      const deps = baseDeps({
+        spawnFn: okSpawn,
+        loadLibrary: async () => ({ workflow: workflow(), library: knowledgeLibrary() }),
+        materializeStage: async (args) => {
+          seen = args;
+          return { prompt: 'P', mcpConfigPath: '/ws/.aidlc/mcp.json' };
+        },
+      });
+
+      const res = await runStage({ ...baseArgs, methodologyRelease: RELEASE_PIN }, deps);
+
+      expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+      expect(seen.knowledge).toContain('blocks/bodies/sha256/knowledge');
+    });
+  });
+
+  // The returned `changedFiles` must carry the SAME trust guarantee as the
+  // `fire_on: write` sensor feed. `[]` would read as "this stage changed nothing"
+  // when the truth is "the git engine could not say".
+  describe('returned changedFiles is null unless the git report is complete', () => {
+    const resultFor = async ({ gitResult, repos }) => {
+      const deps = baseDeps({
+        spawnFn: okSpawn,
+        commitAndPushAll: async () => gitResult,
+        ensureWorkspaceSource: async () => ({ restored: false, repos: [], failed: [] }),
+        redirectHeavyDirs: async () => ({ links: [] }),
+      });
+      return runStage({ ...baseArgs, repos }, deps);
+    };
+
+    it('reports the sorted union when every repo reported a files array', async () => {
+      const res = await resultFor({
+        gitResult: {
+          ok: true,
+          committed: true,
+          results: [
+            {
+              repo: 'acme/web',
+              committed: true,
+              sha: 'b'.repeat(40),
+              files: ['acme/web/src/b.ts'],
+              provenance: { state: 'known', files: ['acme/web/src/b.ts'] },
+            },
+            {
+              repo: 'acme/api',
+              committed: true,
+              sha: 'a'.repeat(40),
+              files: ['acme/api/src/a.ts'],
+              provenance: { state: 'known', files: ['acme/api/src/a.ts'] },
+            },
+          ],
+        },
+        repos: ['acme/api', 'acme/web'],
+      });
+
+      expect(res.changedFiles).toEqual(['acme/api/src/a.ts', 'acme/web/src/b.ts']);
+    });
+
+    it('reports null when one repo omitted its files array', async () => {
+      const res = await resultFor({
+        gitResult: {
+          ok: true,
+          committed: true,
+          results: [
+            {
+              repo: 'acme/api',
+              committed: true,
+              sha: 'a'.repeat(40),
+              files: ['acme/api/src/a.ts'],
+              provenance: { state: 'known', files: ['acme/api/src/a.ts'] },
+            },
+            { repo: 'acme/web', committed: true, sha: 'b'.repeat(40) },
+          ],
+        },
+        repos: ['acme/api', 'acme/web'],
+      });
+
+      // NOT ['src/a.ts'] — a partial list silently understates what changed.
+      expect(res.changedFiles).toBeNull();
+    });
+
+    it('reports null when the git engine failed', async () => {
+      const res = await resultFor({
+        gitResult: {
+          ok: false,
+          committed: false,
+          results: [{ repo: 'acme/api', committed: false, files: ['src/a.ts'] }],
+        },
+        repos: ['acme/api'],
+      });
+
+      expect(res.changedFiles).toBeNull();
+    });
+
+    it('reports null when the git engine reported no repos at all', async () => {
+      const res = await resultFor({
+        gitResult: { ok: true, committed: false, results: [] },
+        repos: [],
+      });
+
+      expect(res.changedFiles).toBeNull();
+    });
+
+    it('treats a clean commit as an empty change set, not an unknown one', async () => {
+      const res = await resultFor({
+        gitResult: {
+          ok: true,
+          committed: false,
+          results: [
+            {
+              repo: 'acme/api',
+              committed: false,
+              reason: 'clean',
+              pushed: 'up_to_date',
+              provenance: { state: 'known', files: [] },
+            },
+            {
+              repo: 'acme/web',
+              committed: true,
+              sha: 'b'.repeat(40),
+              files: ['acme/web/src/b.ts'],
+              provenance: { state: 'known', files: ['acme/web/src/b.ts'] },
+            },
+          ],
+        },
+        repos: ['acme/api', 'acme/web'],
+      });
+
+      expect(res.changedFiles).toEqual(['acme/web/src/b.ts']);
+    });
+  });
+});
+
+const checkpointRunStore = ({ stageInstanceId, unitSlug = null }) => {
+  const store = spyStore();
+  const humanTasks = new Map();
+  const receipts = new Map();
+  const events = [];
+  const stageRow = { stageInstanceId, attempt: 0, state: 'RUNNING' };
+  const executionRow = {};
+  store.createHumanTask = async (args) => {
+    const row = { ...args, status: 'pending', answer: null, createdAt: 'T' };
+    humanTasks.set(args.humanTaskId, row);
+    return row;
+  };
+  store.getHumanTask = async (_executionId, humanTaskId) => humanTasks.get(humanTaskId) ?? null;
+  store.getStage = async () => ({ ...stageRow });
+  store.getExecution = async () => ({ ...executionRow });
+  store.updateStageState = async (patch) => {
+    store.calls.push(['updateStageState', patch]);
+    Object.assign(stageRow, patch);
+    return { ...stageRow };
+  };
+  store.updateExecution = async (patch) => {
+    store.calls.push(['updateExecution', patch]);
+    Object.assign(executionRow, patch);
+    return { ...executionRow };
+  };
+  store.resumeStageRow = async () => {
+    stageRow.state = 'RUNNING';
+    stageRow.pendingHumanTaskId = null;
+    stageRow.parkedAt = null;
+  };
+  store.appendEvent = async (event) => {
+    store.calls.push(['appendEvent', event]);
+    const row = { ...event, eventType: event.type, timestamp: 'T' };
+    events.push(row);
+    return row;
+  };
+  store.listEvents = async () => events;
+  store.listReceipts = async () => [...receipts.values()];
+  store.getReceipt = async (_executionId, selector) =>
+    receipts.get(
+      `RECEIPT#${selector.kind}#${selector.stageInstanceId}#${selector.attempt}#${selector.unitSlug ?? '-'}`,
+    ) ?? null;
+  store.putReceipt = async (args) => {
+    const sk = `RECEIPT#${args.kind}#${args.stageInstanceId}#${args.attempt}#${args.unitSlug ?? '-'}`;
+    const row = { ...args, sk };
+    receipts.set(sk, row);
+    return row;
+  };
+  store.raiseStageCounter = async ({ field, to }) => {
+    if (Number(stageRow[field] ?? 0) >= to) return false;
+    stageRow[field] = to;
+    return true;
+  };
+  store.listSensorRuns = async () => [];
+  store.getUnitPlan = async () => ({ units: [{ slug: unitSlug, kind: 'backend' }] });
+  return { store, humanTasks, stageRow };
+};
+
+const checkpointRun = ({
+  answerInline = false,
+  answerAfterPark = false,
+  repairCheckpoint = false,
+  sensor = false,
+  unit = false,
+  reviewer = false,
+}) => {
+  const stageId = unit ? 'code-generation' : 'requirements-analysis';
+  const unitSlug = unit ? 'billing' : null;
+  const sectionIndex = unit ? 2 : null;
+  const stageInstanceId = unit
+    ? planStageInstanceId('aidlc-v2@1', stageId, unitSlug, sectionIndex)
+    : BASE_STAGE_INSTANCE_ID;
+  const { store, humanTasks, stageRow } = checkpointRunStore({ stageInstanceId, unitSlug });
+  const lib = unit ? unitLibrary() : library();
+  const stageBlock = lib.stagesById[stageId];
+  stageBlock.produces = [];
+  stageBlock.summaryConfirmation = 'required';
+  if (sensor) {
+    stageBlock.sensors = ['required-sections'];
+    lib.sensorsById['required-sections'] = {
+      id: 'required-sections',
+      command: 'bun <runtime-managed>/tools/aidlc-sensor-required-sections.ts',
+      runtime: 'bun',
+      severity: 'advisory',
+      matches: '**/aidlc-docs/**',
+    };
+  }
+  if (reviewer) {
+    stageBlock.reviewer = 'aidlc-reviewer-agent';
+    lib.agentsById['aidlc-reviewer-agent'] = {
+      id: 'aidlc-reviewer-agent',
+      modelOverride: null,
+      bodyRef: { s3Key: 'blocks/bodies/sha256/reviewer' },
+    };
+  }
+  lib.fromRelease = true;
+  lib.scopesById = { feature: { id: 'feature', reviewCap: 'adversarial' } };
+
+  const bridge = createProcessBridge({
+    store,
+    scope: {
+      executionId: baseArgs.executionId,
+      intentId: baseArgs.intentId,
+      stageId,
+      stageInstanceId,
+      unitSlug,
+      sectionIndex,
+      stageAttempt: 0,
+      policy: { summaryConfirmation: 'required' },
+    },
+    pollIntervalMs: 1,
+    parkGraceMs: 1,
+    sleep: async () => {
+      if (!answerInline) return;
+      const task = [...humanTasks.values()].find((row) => row.status === 'pending');
+      if (task) {
+        task.status = 'answered';
+        task.answer = { perQuestion: [{ answer: 'Looks correct' }] };
+        task.answeredAt = 'T';
+        task.answeredBy = 'alice';
+      }
+    },
+  });
+  let spawnCount = 0;
+  const spawnFn = () => {
+    spawnCount += 1;
+    const child = new EventEmitter();
+    child.stdin = { end() {} };
+    child.stdout = new EventEmitter();
+    if (spawnCount === (repairCheckpoint ? 2 : 1)) {
+      void bridge
+        .confirmSummary({ summary: 'The lead summary' })
+        .then((outcome) => {
+          if (answerAfterPark && outcome.parked) {
+            const task = humanTasks.get(outcome.humanTaskId);
+            task.status = 'answered';
+            task.answer = { perQuestion: [{ answer: 'Looks correct' }] };
+            task.answeredAt = 'T';
+            task.answeredBy = 'alice';
+          }
+          setImmediate(() => child.emit('close', 0));
+        })
+        .catch(() => setImmediate(() => child.emit('close', 1)));
+    } else {
+      setImmediate(() => child.emit('close', 0));
+    }
+    return child;
+  };
+  const deps = baseDeps({
+    store,
+    spawnFn,
+    loadLibrary: async () => ({ workflow: unit ? unitWorkflow() : workflow(), library: lib }),
+  });
+  const args = {
+    ...baseArgs,
+    stageId,
+    ...(unit ? { unitSlug, sectionIndex } : {}),
+  };
+  return { args, deps, humanTasks, stageRow, getSpawnCount: () => spawnCount };
+};
+
+describe('runStage — checkpoint park races', () => {
+  it.each([false, true])(
+    'carries checkpoint repair provenance into sensors and feedback (recovery fails=%s)',
+    async (recoveryFails) => {
+      const workspaceDir = await mkdtemp(nodePath.join(tmpdir(), 'checkpoint-provenance-'));
+      try {
+        for (const file of ['before.ts', 'repaired.ts', 'untouched.ts']) {
+          await writeFile(nodePath.join(workspaceDir, file), 'export {};');
+        }
+        const run = checkpointRun({ repairCheckpoint: true, answerInline: true });
+        const loadLibrary = run.deps.loadLibrary;
+        run.deps.loadLibrary = async () => {
+          const loaded = await loadLibrary();
+          loaded.library.stagesById['requirements-analysis'].sensors = ['linter'];
+          loaded.library.sensorsById.linter = {
+            id: 'linter',
+            command: 'bun sensor.ts',
+            severity: 'blocking',
+            matches: '**/*.ts',
+            fireOn: 'write',
+          };
+          return loaded;
+        };
+        const leadSpawn = run.deps.spawnFn;
+        const inspected = [];
+        run.deps.spawnFn = (command, args) => {
+          if (command !== 'bun') return leadSpawn(command, args);
+          inspected.push(args[args.indexOf('--file-path') + 1]);
+          const child = new EventEmitter();
+          child.stdout = new EventEmitter();
+          child.stderr = new EventEmitter();
+          child.kill = () => {};
+          setImmediate(() => {
+            child.stdout.emit('data', Buffer.from('{"pass":true}'));
+            child.emit('close', 0);
+          });
+          return child;
+        };
+        const gitResult = (sha, files) => ({
+          ok: true,
+          committed: true,
+          results: [
+            {
+              repo: 'owner/repo',
+              committed: true,
+              pushed: true,
+              sha,
+              files,
+              provenance: { state: 'known', files },
+            },
+          ],
+        });
+        run.deps.commitAndPushAll = vi
+          .fn()
+          .mockResolvedValueOnce(gitResult('a'.repeat(40), ['before.ts']))
+          .mockResolvedValueOnce(gitResult('b'.repeat(40), ['repaired.ts']));
+        run.deps.gitResultForCommitRefs = vi.fn(async () => {
+          if (recoveryFails) throw new Error('git diff-tree failed');
+          return gitResult('b'.repeat(40), ['before.ts', 'repaired.ts']);
+        });
+        run.deps.loadBlockScript = async () => 'BODY';
+        run.deps.ensureWorkspaceSource = async () => ({ restored: false, repos: [], failed: [] });
+        run.deps.redirectHeavyDirs = async () => ({ links: [] });
+        run.deps.ingestStageCodeTraceability = async () => ({ codeFiles: 0 });
+        const result = await runStage(
+          {
+            ...run.args,
+            workspaceDir,
+            repos: ['owner/repo'],
+            baseBranch: 'develop',
+            methodologyRelease: { releaseId: 'release-a' },
+          },
+          run.deps,
+        );
+        expect(result).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+        expect(run.getSpawnCount()).toBe(2);
+        expect(run.deps.commitAndPushAll).toHaveBeenCalledTimes(2);
+        expect(run.deps.commitAndPushAll.mock.calls[1][0].baseBranch).toBe('develop');
+        expect(run.deps.gitResultForCommitRefs).toHaveBeenCalledWith(
+          expect.objectContaining({
+            commitRefs: [
+              { repo: 'owner/repo', sha: 'a'.repeat(40) },
+              { repo: 'owner/repo', sha: 'b'.repeat(40) },
+            ],
+          }),
+        );
+        const provenance = recoveryFails
+          ? { state: 'unknown', reason: 'git_commit_refs_failed', detail: 'git diff-tree failed' }
+          : { state: 'known', files: ['before.ts', 'repaired.ts'] };
+        expect(result.changedFileProvenance).toEqual(provenance);
+        expect(result.changedFiles).toEqual(recoveryFails ? null : provenance.files);
+        expect(inspected).toEqual(
+          recoveryFails
+            ? ['before.ts', 'repaired.ts', 'untouched.ts']
+            : ['before.ts', 'repaired.ts'],
+        );
+        const sensor = run.deps.store.calls.find(([name]) => name === 'recordSensorRun')[1];
+        expect(sensor.detail.provenance).toEqual(provenance);
+      } finally {
+        await rm(workspaceDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('parks a gate answered after the bridge park, without repair, sensors, or review', async () => {
+    const run = checkpointRun({ answerAfterPark: true, sensor: true, reviewer: true });
+    const result = await runStage(run.args, run.deps);
+
+    expect(result).toMatchObject({
+      ok: true,
+      state: 'WAITING_FOR_HUMAN',
+      humanTaskId: 'chk-summary-confirmation-si-f952091522a81cfb-0---0',
+    });
+    expect(run.getSpawnCount()).toBe(1);
+    expect(run.stageRow.state).toBe('WAITING_FOR_HUMAN');
+    expect(run.deps.store.calls.some((call) => call[0] === 'recordSensorRun')).toBe(false);
+    expect(
+      run.deps.store.calls.some(
+        (call) => call[0] === 'appendEvent' && call[1].type === 'v2.checkpoint.repair_requested',
+      ),
+    ).toBe(false);
+    expect(
+      run.deps.store.calls.some(
+        (call) => call[0] === 'appendEvent' && call[1].type === 'v2.review.running',
+      ),
+    ).toBe(false);
+    expect(
+      run.deps.store.calls.some(
+        (call) => call[0] === 'appendEvent' && call[1].type === 'v2.stage.succeeded',
+      ),
+    ).toBe(false);
+  });
+
+  it('continues inline after an inline checkpoint answer without parking or repairing', async () => {
+    const run = checkpointRun({ answerInline: true });
+    const result = await runStage(run.args, run.deps);
+
+    expect(result).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(run.getSpawnCount()).toBe(1);
+    expect(run.stageRow.state).toBe('SUCCEEDED');
+    expect(
+      run.deps.store.calls.some(
+        (call) => call[0] === 'appendEvent' && call[1].type === 'v2.checkpoint.repair_requested',
+      ),
+    ).toBe(false);
+    expect(
+      run.deps.store.calls.some(
+        (call) => call[0] === 'appendEvent' && call[1].type === 'v2.stage.parked',
+      ),
+    ).toBe(false);
+  });
+
+  it('keeps a parked unit-lane checkpoint attached to its own stage and section', async () => {
+    const run = checkpointRun({ answerAfterPark: true, sensor: true, unit: true });
+    const result = await runStage(run.args, run.deps);
+
+    expect(result).toMatchObject({ ok: true, state: 'WAITING_FOR_HUMAN', unitSlug: 'billing' });
+    expect(run.getSpawnCount()).toBe(1);
+    expect(run.stageRow.state).toBe('WAITING_FOR_HUMAN');
+    expect(
+      run.deps.store.calls.some(
+        (call) => call[0] === 'appendEvent' && call[1].type === 'v2.checkpoint.repair_requested',
+      ),
+    ).toBe(false);
+  });
+
+  it('parks a repair turn that leaves its own checkpoint pending', async () => {
+    const run = checkpointRun({ repairCheckpoint: true, sensor: true, reviewer: true });
+    const result = await runStage(run.args, run.deps);
+
+    expect(result).toMatchObject({ ok: true, state: 'WAITING_FOR_HUMAN' });
+    expect(run.getSpawnCount()).toBe(2);
+    expect(run.stageRow.state).toBe('WAITING_FOR_HUMAN');
+    expect([...run.humanTasks.values()]).toHaveLength(1);
+    expect([...run.humanTasks.values()][0].status).toBe('pending');
+    expect(run.deps.store.calls.some((call) => call[0] === 'recordSensorRun')).toBe(false);
+    expect(
+      run.deps.store.calls.some(
+        (call) => call[0] === 'appendEvent' && call[1].type === 'v2.review.running',
+      ),
+    ).toBe(false);
+    expect(
+      run.deps.store.calls.some(
+        (call) => call[0] === 'appendEvent' && call[1].type === 'v2.stage.succeeded',
+      ),
+    ).toBe(false);
+  });
+
+  it('does not run a checkpoint repair when its attempt counter cannot be persisted', async () => {
+    const run = checkpointRun({ repairCheckpoint: true });
+    run.deps.store.raiseStageCounter = async () => {
+      throw new Error('counter store unavailable');
+    };
+
+    const result = await runStage(run.args, run.deps);
+
+    expect(run.getSpawnCount()).toBe(1);
+    expect(
+      run.deps.store.calls.some(
+        (call) => call[0] === 'appendEvent' && call[1].type === 'v2.checkpoint.repair_requested',
+      ),
+    ).toBe(false);
+    expect(result).toMatchObject({ ok: false });
+    expect(result.detail).toContain('counter could not be persisted');
+    expect(run.stageRow.state).toBe('FAILED');
+  });
+});
+
+describe('runStage — unpinned runs keep their single sensor pass and reviewer reads', () => {
+  const okSpawn = () => ({
+    on: (ev, cb) => ev === 'close' && setImmediate(() => cb(0)),
+    stdin: { end() {} },
+  });
+
+  it('still runs a sensor that authors fire_on: gate', async () => {
+    const lib = library();
+    lib.stagesById['requirements-analysis'].sensors = ['required-sections'];
+    lib.sensorsById = {
+      'required-sections': {
+        id: 'required-sections',
+        command: 'bun <runtime-managed>/tools/aidlc-sensor-required-sections.ts',
+        runtime: 'bun',
+        severity: 'advisory',
+        matches: '**/aidlc-docs/**',
+        fireOn: 'gate',
+      },
+    };
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+    });
+
+    await runStage(baseArgs, deps);
+
+    const runs = deps.store.calls.filter(([name]) => name === 'recordSensorRun');
+    expect(runs.map(([, run]) => run.sensorId)).toContain('required-sections');
+  });
+
+  it('adds no gate reads after a reviewer verdict', async () => {
+    const lib = library();
+    lib.stagesById['requirements-analysis'].reviewer = 'aidlc-reviewer-agent';
+    lib.stagesById['requirements-analysis'].reviewerMaxIterations = 1;
+    lib.agentsById['aidlc-reviewer-agent'] = {
+      id: 'aidlc-reviewer-agent',
+      modelOverride: null,
+      bodyRef: { s3Key: 'blocks/bodies/sha256/reviewer' },
+    };
+    const store = spyStore();
+    store.listSensorRuns = async () => [
+      {
+        sensorRunId: 'review-1',
+        stageInstanceId: BASE_STAGE_INSTANCE_ID,
+        sensorId: 'reviewer:aidlc-reviewer-agent',
+        kind: 'reviewer',
+        result: 'PASS',
+        detail: { verdict: 'READY', findings: '' },
+      },
+    ];
+    const deps = baseDeps({
+      store,
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+    });
+
+    const res = await runStage(baseArgs, deps);
+
+    expect(res.state).toBe('SUCCEEDED');
+    const consistentStageReads = store.calls.filter(
+      ([name, , options]) => name === 'getStage' && options?.consistentRead === true,
+    );
+    expect(consistentStageReads).toHaveLength(1);
+  });
+});
+
+describe('runStage — AGENT.maxTurns on the reviewer run', () => {
+  const okSpawn = () => ({
+    on: (ev, cb) => ev === 'close' && setImmediate(() => cb(0)),
+    stdin: { end() {} },
+  });
+  const reviewerLibrary = ({ fromRelease }) => {
+    const lib = { ...library(), ...(fromRelease ? { fromRelease: true } : {}) };
+    lib.stagesById['requirements-analysis'].reviewer = 'aidlc-architecture-reviewer-agent';
+    lib.stagesById['requirements-analysis'].reviewerMaxIterations = 1;
+    lib.agentsById['aidlc-architecture-reviewer-agent'] = {
+      id: 'aidlc-architecture-reviewer-agent',
+      modelOverride: null,
+      maxTurns: 60,
+      bodyRef: { s3Key: 'blocks/bodies/sha256/reviewer' },
+    };
+    return lib;
+  };
+  const readyStore = () => {
+    const store = spyStore();
+    store.listSensorRuns = async () => [
+      {
+        sensorRunId: 'review-1',
+        stageInstanceId: BASE_STAGE_INSTANCE_ID,
+        sensorId: 'reviewer:aidlc-architecture-reviewer-agent',
+        kind: 'reviewer',
+        result: 'PASS',
+        detail: { verdict: 'READY', findings: '' },
+      },
+    ];
+    return store;
+  };
+  const release = { methodologyRelease: { releaseId: 'release-a' } };
+
+  it('caps the reviewer OpenCode run at the release reviewer agent turn limit', async () => {
+    const materializeOpenCodeConfig = vi.fn(async () => '{}');
+    const deps = baseDeps({
+      store: readyStore(),
+      spawnFn: okSpawn,
+      availableClis: ['opencode'],
+      materializeOpenCodeConfig,
+      loadLibrary: async () => ({
+        workflow: workflow(),
+        library: reviewerLibrary({ fromRelease: true }),
+      }),
+    });
+
+    await runStage({ ...baseArgs, ...release }, deps);
+
+    const reviewerCall = materializeOpenCodeConfig.mock.calls
+      .map(([args]) => args)
+      .find((args) => args.scope?.role === 'reviewer');
+    expect(reviewerCall).toMatchObject({ maxTurns: 60 });
+  });
+
+  it('caps the reviewer Claude run with --max-turns', async () => {
+    const spawned = [];
+    const deps = baseDeps({
+      store: readyStore(),
+      spawnFn: (command, args) => {
+        spawned.push(args);
+        return okSpawn();
+      },
+      loadLibrary: async () => ({
+        workflow: workflow(),
+        library: reviewerLibrary({ fromRelease: true }),
+      }),
+    });
+
+    await runStage({ ...baseArgs, ...release }, deps);
+
+    expect(spawned).toHaveLength(2);
+    expect(spawned[1].join(' ')).toContain('--max-turns 60');
+    expect(spawned[0]).not.toContain('--max-turns');
+  });
+
+  it('applies no turn cap on an unpinned run', async () => {
+    const spawned = [];
+    const deps = baseDeps({
+      store: readyStore(),
+      spawnFn: (command, args) => {
+        spawned.push(args);
+        return okSpawn();
+      },
+      loadLibrary: async () => ({
+        workflow: workflow(),
+        library: reviewerLibrary({ fromRelease: false }),
+      }),
+    });
+
+    await runStage(baseArgs, deps);
+
+    expect(spawned.flat()).not.toContain('--max-turns');
+  });
+
+  it('leaves the lead OpenCode run uncapped on an unpinned run', async () => {
+    const lib = library();
+    lib.agentsById['aidlc-product-agent'].maxTurns = 60;
+    const materializeStage = vi.fn(async ({ stage }) => ({
+      prompt: `PROMPT ${stage.stageId}`,
+      opencodeConfigContent: '{}',
+    }));
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      availableClis: ['opencode'],
+      materializeStage,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+    });
+
+    await runStage(baseArgs, deps);
+
+    expect(materializeStage.mock.calls[0][0].maxTurns ?? null).toBeNull();
+  });
+});
+
+describe('runStage — resume marker of the resumed gate', () => {
+  const okSpawn = () => ({
+    on: (ev, cb) => ev === 'close' && setImmediate(() => cb(0)),
+    stdin: { end() {} },
+  });
+  const resumedStore = (execution) =>
+    spyStore({
+      humanTask: { humanTaskId: 'q-1', status: 'answered', answer: { freeText: 'MVP' } },
+      stage: { cli: 'claude', cliSessionId: 'sess-7' },
+      execution,
+    });
+
+  it('clears the marker once the stage resumes on the gate it names', async () => {
+    const store = resumedStore({ resumeRequired: { humanTaskId: 'q-1', callbackId: 'cb-1' } });
+
+    await runStage({ ...baseArgs, resumeFrom: 'q-1' }, baseDeps({ store, spawnFn: okSpawn }));
+
+    expect(store.calls).toContainEqual([
+      'updateExecution',
+      { executionId: 'e1', resumeRequired: null, ifResumeRequiredFor: 'q-1' },
+    ]);
+  });
+
+  it('leaves a marker for another gate alone', async () => {
+    const store = resumedStore({ resumeRequired: { humanTaskId: 'q-2', callbackId: 'cb-2' } });
+
+    await runStage({ ...baseArgs, resumeFrom: 'q-1' }, baseDeps({ store, spawnFn: okSpawn }));
+
+    expect(
+      store.calls.filter(([name, args]) => name === 'updateExecution' && 'resumeRequired' in args),
+    ).toEqual([]);
+  });
+});
+
+describe('postAgentSensorPass', () => {
+  const { postAgentSensorPass } = __test;
+
+  it('keeps the single pass over every sensor on the whole workspace for an unpinned run', () => {
+    expect(
+      postAgentSensorPass({ methodologyRelease: null, attemptChangedFiles: ['src/a.ts'] }),
+    ).toEqual({ planes: null, changedFiles: null });
+  });
+
+  it('runs only the write plane, narrowed to the attempt, for a release-pinned run', () => {
+    expect(
+      postAgentSensorPass({
+        methodologyRelease: { releaseId: 'release-a' },
+        attemptChangedFiles: ['src/a.ts'],
+      }),
+    ).toEqual({ planes: ['write'], changedFiles: ['src/a.ts'] });
+  });
+});
+
+// The artifact-head observation the orchestrator turns into
+// `required_artifact_missing`. "Observed nothing" and "could not observe" are
+// different facts, and the stage result must say which one happened: an empty
+// SUCCESSFUL read is the evidence a release-mode stage produced no artifact.
+describe('runStage — produced-head observation', () => {
+  const okSpawn = () => ({
+    on: (event, callback) => event === 'close' && setImmediate(() => callback(0)),
+    stdin: { end() {} },
+  });
+  const releaseLibrary = () => {
+    const lib = library();
+    lib.fromRelease = true;
+    lib.scopesById = { feature: { id: 'feature', version: 1, sensorsPolicy: 'on' } };
+    return lib;
+  };
+  const runWithHeads = (readArtifactHeadHashes) =>
+    runStage(
+      baseArgs,
+      baseDeps({
+        spawnFn: okSpawn,
+        loadLibrary: async () => ({ workflow: workflow(), library: releaseLibrary() }),
+        openGraph: async () => ({}),
+        readArtifactHeadHashes,
+      }),
+    );
+
+  it('reports an empty successful read as an empty observation, not an absent one', async () => {
+    const res = await runWithHeads(async () => []);
+
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(res).toHaveProperty('producedHeads', []);
+    expect(res).not.toHaveProperty('producedHeadsUnavailable');
+  });
+
+  it('reports an unreadable graph as unavailable, with no observation at all', async () => {
+    const res = await runStage(
+      baseArgs,
+      baseDeps({
+        spawnFn: okSpawn,
+        loadLibrary: async () => ({ workflow: workflow(), library: releaseLibrary() }),
+        openGraph: async () => {
+          throw new Error('graph unavailable');
+        },
+        readArtifactHeadHashes: async () => [],
+      }),
+    );
+
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED', producedHeadsUnavailable: true });
+    expect(res).not.toHaveProperty('producedHeads');
+  });
+
+  it('carries the heads it did read', async () => {
+    const head = {
+      artifactType: 'requirements-analysis',
+      logicalKey: 'k1',
+      snapshotHash: 'sha-1',
+      stageInstanceId: BASE_STAGE_INSTANCE_ID,
+    };
+    const res = await runWithHeads(async () => [head]);
+
+    expect(res.producedHeads).toEqual([head]);
+  });
+
+  // The whole point of preserving the empty array: the gate evaluator the
+  // orchestrator runs on this result must report the declared output as missing.
+  it('lets the gate evaluator report the declared output as missing', async () => {
+    const res = await runWithHeads(async () => []);
+
+    const { ok, findings } = evaluateGatePreconditions({
+      stage: {
+        stageInstanceId: BASE_STAGE_INSTANCE_ID,
+        outputArtifacts: [{ artifact: 'requirements-analysis' }],
+      },
+      policy: { summaryConfirmation: 'none' },
+      // The orchestrator's own mapping: an array becomes the produced set, and
+      // anything else is "not observed".
+      producedArtifacts:
+        res.producedHeadsUnavailable !== true && Array.isArray(res.producedHeads)
+          ? [...new Set(res.producedHeads.map((head) => head.artifactType).filter(Boolean))]
+          : null,
+    });
+
+    expect(ok).toBe(false);
+    expect(findings.map((finding) => finding.code)).toEqual(['required_artifact_missing']);
+  });
+
+  it('observes nothing at all for an unpinned run', async () => {
+    const res = await runStage(
+      baseArgs,
+      baseDeps({
+        spawnFn: okSpawn,
+        openGraph: async () => ({}),
+        readArtifactHeadHashes: async () => [],
+      }),
+    );
+
+    expect(res).not.toHaveProperty('producedHeads');
+    expect(res).not.toHaveProperty('producedHeadsUnavailable');
   });
 });

@@ -6,6 +6,7 @@
 import path from 'node:path';
 import { lstat, readFile } from 'node:fs/promises';
 import { createGraphWriter, closeGraphSource, traceabilitySlug } from './mcp/graph-writer.js';
+import { repoTargetDir } from './repo-paths.js';
 
 // Re-exported from the persistence module so collection and persistence share
 // ONE slug implementation (they must agree to match evidence to vertices).
@@ -175,11 +176,20 @@ export const collectCodeTraceabilityBatches = async ({
     if (!change?.repo || !change?.sha || !Array.isArray(change.files) || !change.files.length) {
       continue;
     }
-    const repoDir = multi ? path.join(workspaceDir, change.repo) : workspaceDir;
+    // Same layout as the checkout (a CodeCommit ARN is not a path). An id the
+    // checkout would have refused cannot have produced these files.
+    let repoDir = workspaceDir;
+    if (multi) {
+      try {
+        repoDir = repoTargetDir({ url: change.repo, workspaceDir, multi });
+      } catch {
+        continue;
+      }
+    }
     // Sensor provenance uses workspace-relative paths; graph CodeFile paths
     // are relative to their repository. Older results without provenance
     // already expose repository-relative files.
-    const repoPrefix = `${change.repo}/`;
+    const repoPrefix = `${path.relative(workspaceDir, repoDir).split(path.sep).join('/')}/`;
     const hasKnownProvenance = change.provenance?.state === 'known';
     const changedFiles = hasKnownProvenance ? change.provenance.files : change.files;
     const normalized = [

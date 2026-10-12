@@ -64,6 +64,12 @@ variable "dynamodb_table_arns" {
   type        = list(string)
 }
 
+variable "kms_key_arn" {
+  description = "Customer-managed KMS key ARN for DynamoDB encryption. Empty uses the AWS-owned service default."
+  type        = string
+  default     = ""
+}
+
 variable "artifacts_bucket_name" {
   description = "S3 bucket name for artifacts"
   type        = string
@@ -87,6 +93,12 @@ variable "blocks_table_arn" {
 variable "aidlc_repo_ref" {
   description = "Pinned ref (commit SHA, tag, or branch) of awslabs/aidlc-workflows the seed-blocks lambda fetches the baseline from"
   type        = string
+}
+
+variable "aidlc_release_pinning" {
+  description = "Whether new intents are pinned to a published immutable AI-DLC release (\"on\"/\"off\")"
+  type        = string
+  default     = "off"
 }
 
 variable "github_oauth_secret_name" {

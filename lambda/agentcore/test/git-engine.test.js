@@ -112,6 +112,15 @@ describe('parsePorcelainZ', () => {
 });
 
 describe('toWorkspaceRelative', () => {
+  it('uses the CodeCommit checkout layout and preserves already normalized paths', () => {
+    const url = 'arn:aws:codecommit:eu-west-1:123456789012:app';
+    const prefix = 'codecommit/aws/eu-west-1/123456789012/app';
+    expect(toWorkspaceRelative(['src/a.ts', `${prefix}/src/b.ts`], { url, multi: true })).toEqual([
+      `${prefix}/src/a.ts`,
+      `${prefix}/src/b.ts`,
+    ]);
+  });
+
   it('prefixes repo-relative paths in a multi-repository workspace', () => {
     expect(toWorkspaceRelative(['src/index.ts'], { url: 'acme/shop', multi: true })).toEqual([
       'acme/shop/src/index.ts',

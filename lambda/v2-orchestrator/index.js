@@ -26,6 +26,7 @@ import { Logger } from '@aws-lambda-powertools/logger';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { SSMClient } from '@aws-sdk/client-ssm';
+import { S3Client } from '@aws-sdk/client-s3';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import {
   BedrockAgentCoreClient,
@@ -38,12 +39,28 @@ import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js'
 import { commandDefinition } from '../shared/agent-command-registry.js';
 import { repoProvider as sharedRepoProvider } from '../shared/repo-provider.js';
 import { createProcessStore } from '../shared/v2-process-store.js';
+import { eventTypeOf } from '../shared/v2-process-keys.js';
 import { loadExecutionPlan } from '../shared/v2-workflow-plan.js';
+import { intentMethodologyOptions } from '../shared/intent-methodology.js';
 import {
   planSegments,
   stageInstanceId as planStageInstanceId,
 } from '../shared/v2-execution-plan.js';
+import { humanTaskMatchesOwner, isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
+import {
+  evaluateGatePreconditions,
+  mergeFindings,
+  overridableFindings,
+} from '../shared/gate-preconditions.js';
 import { resolveSkipTo, skipTargetsFrom, resolveRecomposeSkips } from '../shared/stage-skip.js';
+import {
+  LOOP_BACK_LIMIT,
+  LOOP_BACK_OPTION,
+  LOOP_BACK_RECORDED_EVENT,
+  loopBackGateFields,
+  loopBackNote,
+  resolveLoopBackOffer,
+} from '../shared/stage-loopback.js';
 import { broadcastToIntentChannel } from '../shared/ws-fanout.js';
 import { resolveRuntimeTarget } from '../shared/runtime-target.js';
 import {
@@ -56,23 +73,53 @@ import {
 } from './section.js';
 import { runQuorumEdit } from './quorum-edit.js';
 import { buildIntentAttribution } from './pr-attribution.js';
+import { OVERRIDE_REASON_MAX } from '../shared/gate-answer.js';
+
+// The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
+// this module implements. Checked against the registry by a test, so a
+// capability cannot be declared handled without the code that handles it.
+export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze([
+  'policy.learnings.ritual@v1',
+  'protocol.loopback.gate-offered@v1',
+]);
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const ssm = new SSMClient({});
+const s3 = new S3Client({});
 const lambda = new LambdaClient({});
 const agentcore = new BedrockAgentCoreClient({});
 const defaultStore = createProcessStore({ ddb });
 
 const logger = new Logger({ persistentKeys: { component: 'v2-orchestrator' } });
 
+// Keep the gate's answer set in one pure function so the orchestrator and the
+// offline release matrix exercise the same three-outcome contract. A single
+// non-overridable block withholds `override-and-approve` even when other
+// blocking findings are overridable: offering it would let one answer waive a
+// finding no human is allowed to waive.
+export const buildGateOptions = ({ findings = [], loopBackOffered = false } = {}) => {
+  const blocking = findings.filter((item) => item.severity === 'blocking');
+  const everyBlockOverridable = blocking.every((item) => item.overridable);
+  return [
+    ...(blocking.length === 0
+      ? ['approve', 'request-changes']
+      : everyBlockOverridable && overridableFindings(findings).length > 0
+        ? ['request-changes', 'override-and-approve']
+        : ['request-changes']),
+    ...(loopBackOffered ? [LOOP_BACK_OPTION] : []),
+  ];
+};
+
 const RUNTIME_ARN = () => process.env.AGENTCORE_RUNTIME_ARN;
 const BLOCKS_TABLE = () => process.env.BLOCKS_TABLE;
+const ARTIFACTS_BUCKET = () => process.env.ARTIFACTS_BUCKET || '';
 const SOURCE_CONTROL_FN = () => process.env.SOURCE_CONTROL_FUNCTION;
 const APPLICATION_URL = () => process.env.APPLICATION_URL;
 const DURABLE_EXECUTION_TIMEOUT_SECONDS = () =>
   Number(process.env.DURABLE_EXECUTION_TIMEOUT_SECONDS || 31622400);
 const DURABLE_GATE_DEADLINE_MARGIN_SECONDS = () =>
   Number(process.env.DURABLE_GATE_DEADLINE_MARGIN_SECONDS || 300);
+const MAX_STAGE_APPROVAL_DETAIL_BYTES = 300 * 1024;
 
 // AgentCore requires a session id >= 33 chars; reuse ONE per intent so the
 // checkout stays warm across init-ws + every run-stage (matches scripts/phaseb.sh).
@@ -207,13 +254,13 @@ const defaultDeps = () => ({
   issueAgentCredentialGrant: (claims) => issueAgentCredentialGrant(ssm, claims),
   stopSession: stopRuntimeSession,
   broadcast: broadcastToIntentChannel,
-  openPr: ({ projectId, gitProvider, repoId, branch, baseBranch, title, body }) =>
+  openPr: ({ projectId, gitProvider, repoId, branch, baseBranch, title, body, attemptKey }) =>
     defaultSourceControlOperation({
       projectId,
       provider: gitProvider,
       repo: repoId,
       operation: 'create-pr',
-      args: { branch, baseBranch, title, body },
+      args: { branch, baseBranch, title, body, attemptKey },
     }),
   // PR-time verification (2026-07 incident): compare base...head BEFORE the PR
   // call so a never-pushed or commit-less intent branch is a LOUD failure, not
@@ -248,13 +295,22 @@ const defaultDeps = () => ({
           state: gitProvider === 'gitlab' && state === 'open' ? 'opened' : state,
         },
       }),
-    createDraft: ({ projectId, gitProvider, repoId, branch, baseBranch, title, body }) =>
+    createDraft: ({
+      projectId,
+      gitProvider,
+      repoId,
+      branch,
+      baseBranch,
+      title,
+      body,
+      attemptKey,
+    }) =>
       defaultSourceControlOperation({
         projectId,
         provider: gitProvider,
         repo: repoId,
         operation: 'create-pr',
-        args: { branch, baseBranch, title, body, draft: true },
+        args: { branch, baseBranch, title, body, draft: true, attemptKey },
       }),
     status: ({ projectId, gitProvider, repoId, number }) =>
       defaultSourceControlOperation({
@@ -608,7 +664,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         scope,
         ...(intentSkipIds.length ? { skipStageIds: intentSkipIds } : {}),
         ...(composedGrid ? { composedGrid } : {}),
-        ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
+        ...intentMethodologyOptions(meta, { s3, bucket: ARTIFACTS_BUCKET }),
       }),
     );
     if (!planResult.valid || !planResult.plan) {
@@ -791,6 +847,8 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         suffix = '',
         initialResumeFrom = null,
         reviewFeedback = null,
+        validationRound = 0,
+        validationGateId = null,
       } = opts;
       const label = `${unitSlug ? `${stage.stageId}-u-${unitSlug}` : stage.stageId}${suffix}`;
       const allSkipIds = [...intentSkipIds, ...dynamicSkipIds];
@@ -809,6 +867,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         workflowVersion,
         ...(meta.aidlcRepoRef ? { aidlcRepoRef: meta.aidlcRepoRef } : {}),
         ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
+        ...(meta.methodologyRelease ? { methodologyRelease: meta.methodologyRelease } : {}),
         scope,
         ...(allSkipIds.length ? { skipStageIds: allSkipIds } : {}),
         ...(composedGrid ? { composedGrid } : {}),
@@ -821,6 +880,12 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         sessionId: stageSessionId,
         cloneInputs: stageCloneInputs,
         reviewFeedback,
+        validationRound,
+        // The gate whose "Request changes" opened this revision. Carried on EVERY
+        // leg of the revision, including the ones resumed from a checkpoint or a
+        // question, so the container never has to infer the feedback from the gate
+        // it happens to be resuming.
+        validationGateId,
       };
       let result = await runStage(ctxArg, invokeIntentRuntime, {
         ...stageOpts,
@@ -872,23 +937,65 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // Create a durable callback and stamp it on the gate so the answer path
         // can resume THIS execution. Then suspend (zero compute) until answered.
         const [callbackPromise, callbackId] = await ctxArg.createCallback(`await-${humanTaskId}`);
+        const expectedStageInstanceId = result.stageInstanceId ?? stage.stageInstanceId ?? null;
+        const expectedCallbackOwner = `stage:${expectedStageInstanceId ?? label}`;
         const callbackBound = await ctxArg.step(`bind-callback-${humanTaskId}`, () =>
           store.setGateCallbackId({
             executionId,
             humanTaskId,
             callbackId,
-            stageInstanceId: result.stageInstanceId ?? stage.stageInstanceId ?? null,
-            callbackOwner: `stage:${result.stageInstanceId ?? stage.stageInstanceId ?? label}`,
+            stageInstanceId: expectedStageInstanceId,
+            callbackOwner: expectedCallbackOwner,
           }),
         );
+        let answeredEarly = false;
         if (!callbackBound) {
-          return {
-            state: 'TERMINAL',
-            value: await fail(
-              'gate_callback_conflict',
-              `gate ${humanTaskId} is already bound to a different stage callback`,
-            ),
-          };
+          // The answer can win the CAS immediately before this bind. In that
+          // case setGateCallbackId returns null because the gate is no longer
+          // pending, but no callback is needed: resume directly with the
+          // persisted answer. Any still-pending, differently owned, or already
+          // bound gate remains an invariant violation.
+          const gateAfterBindFailure = await ctxArg.step(
+            `gate-after-bind-failure-${humanTaskId}`,
+            () => store.getHumanTask(executionId, humanTaskId, { consistentRead: true }),
+          );
+          if (gateAfterBindFailure?.status === 'superseded') {
+            ctx.logger?.info?.('run retired before gate callback bind', {
+              intentId,
+              humanTaskId,
+            });
+            return {
+              state: 'TERMINAL',
+              value: { ok: false, reason: 'retired', intentId, humanTaskId },
+            };
+          }
+          const ownsExpectedStage = humanTaskMatchesOwner({
+            task: gateAfterBindFailure,
+            stageInstanceId: expectedStageInstanceId,
+            unitSlug,
+            sectionIndex,
+          });
+          const callbackIdCompatible =
+            gateAfterBindFailure?.callbackId == null ||
+            gateAfterBindFailure.callbackId === callbackId;
+          const callbackOwnerCompatible =
+            gateAfterBindFailure?.callbackOwner == null ||
+            gateAfterBindFailure.callbackOwner === expectedCallbackOwner;
+          answeredEarly =
+            isHumanTaskAnswerStatus(gateAfterBindFailure?.status) &&
+            Boolean(gateAfterBindFailure.answeredAt || gateAfterBindFailure.answer) &&
+            ownsExpectedStage &&
+            callbackIdCompatible &&
+            callbackOwnerCompatible;
+          if (!answeredEarly) {
+            return {
+              state: 'TERMINAL',
+              value: await fail(
+                'gate_callback_conflict',
+                `gate ${humanTaskId} bind failed without an unbound answer owned by this stage`,
+              ),
+            };
+          }
         }
 
         // Answer/bind race (field incident): a fast human can answer in the
@@ -898,10 +1005,14 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // parkReleaseSeconds stall the human reads as "my answer was
         // ignored"). Re-read AFTER binding: an already-answered gate skips
         // the wait entirely and resumes now.
-        const answeredEarly = await ctxArg.step(`gate-answered-early-${humanTaskId}`, async () => {
-          const gate = await store.getHumanTask(executionId, humanTaskId);
-          return Boolean(gate?.status) && gate.status !== 'pending';
-        });
+        if (callbackBound) {
+          answeredEarly = await ctxArg.step(`gate-answered-early-${humanTaskId}`, async () => {
+            const gate = await store.getHumanTask(executionId, humanTaskId, {
+              consistentRead: true,
+            });
+            return isHumanTaskAnswerStatus(gate?.status) || gate?.status === 'superseded';
+          });
+        }
         if (!answeredEarly) {
           // D1 release-on-park: if no human answers within parkReleaseSeconds, free
           // the warm microVM compute (StopRuntimeSession) while we keep waiting —
@@ -919,7 +1030,9 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
               ctxArg.wait(`release-timer-${humanTaskId}`, { seconds: parkReleaseSeconds }),
             ]);
             const stillPending = await ctxArg.step(`gate-status-${humanTaskId}`, async () => {
-              const gate = await store.getHumanTask(executionId, humanTaskId);
+              const gate = await store.getHumanTask(executionId, humanTaskId, {
+                consistentRead: true,
+              });
               return gate?.status === 'pending';
             });
             if (stillPending) {
@@ -935,7 +1048,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // wakes this callback with a cancel sentinel. The cancel/rewind path owns
         // META from here — exit WITHOUT any further write (docs/v2-steering.md).
         const gateAfter = await ctxArg.step(`gate-after-${humanTaskId}`, () =>
-          store.getHumanTask(executionId, humanTaskId),
+          store.getHumanTask(executionId, humanTaskId, { consistentRead: true }),
         );
         if (gateAfter?.status === 'superseded') {
           logger.info('run retired while parked', { humanTaskId });
@@ -969,7 +1082,18 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // before AgentCore restores a released session's workspace, otherwise
         // the re-clone is rejected while the execution still reads WAITING.
         const ownedUnpark = await ctxArg.step(`gate-unpark-${humanTaskId}`, async () => {
+          // Lane gates never park META: another lane may own its single pending
+          // gate pointer, and this lane's META status has remained RUNNING. The
+          // conditional ownership update leaves that status and pointer intact.
           try {
+            if (unitSlug) {
+              await store.updateExecution({
+                executionId,
+                orchestratorRunId: runId,
+                ifOrchestratorRunId: runId,
+              });
+              return true;
+            }
             await store.updateExecution({
               executionId,
               status: 'RUNNING',
@@ -1064,6 +1188,15 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
       // one gate approves the artifact AND the fan-out decisions, instead of a
       // second engine gate at section start.
       const nextSection = segments.slice(segIdx + 1).find((s) => s.kind === 'section') ?? null;
+      // How many Build-and-Test loop-backs this segment has taken.
+      // A backward jump RE-VISITS stages, and every durable step name in this walk
+      // is memoized by name — so without this token the second pass of a revisited
+      // stage would replay the first pass's memoized results instead of running.
+      // It is 0 on every run that never loops back, which is what keeps all of
+      // those step names, gate ids and checkpoint names byte-identical.
+      let loopBackPass = 0;
+      // The loop-back gate the target stage re-runs with (see the jump below).
+      let loopBackResumeFrom = null;
       for (let stageIdx = 0; stageIdx < segment.stages.length; stageIdx += 1) {
         const stage = segment.stages[stageIdx];
         // A stage deselected by an earlier gate's recompose delta is passed
@@ -1081,6 +1214,12 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // CONDITIONAL stages to deselect — validated below, applied after the
         // post-hooks alongside skipTo.
         let recomposeSkips = [];
+        // Gate-time "loop back to the code-generation stage": set
+        // by an approved `loop-back` answer below, applied after the stage's
+        // post-hooks — the BACKWARD twin of skipToIndex. Null on every run that
+        // does not offer it, which is every run without a resolved release
+        // policy.
+        let jumpBackIndex = null;
         const outputArtifactTypes = (stage.outputArtifacts ?? [])
           .map((o) => o.artifact ?? o)
           .filter(Boolean);
@@ -1093,12 +1232,27 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         const producesUnitDag = outputArtifactTypes.includes('unit-of-work-dependency');
         const fanoutSection = producesUnitDag ? nextSection : null;
         let validationRound = 0;
-        let resumeFromValidation = null;
+        let resumeFromValidation = loopBackResumeFrom;
+        // Set only by a "Request changes", so a loop-back's re-entry (round 0)
+        // never hands its own gate to the personas as revision feedback.
+        let validationGateId = null;
+        loopBackResumeFrom = null;
         for (;;) {
-          const suffix = validationRound ? `-validation-${validationRound}` : '';
+          const passTag = loopBackPass ? `-loopback-${loopBackPass}` : '';
+          const suffix = `${passTag}${validationRound ? `-validation-${validationRound}` : ''}`;
+          // The gate/receipt/event step names are keyed on the validation round;
+          // after a loop-back the same stage runs its round 0 again, so the pass
+          // joins the key. Unchanged (`0`, `1`, …) until a loop-back happens.
+          // A function because the revision event below names the round it is
+          // about to enter, not the one this iteration opened its gate on.
+          const roundToken = (forRound) =>
+            loopBackPass ? `lb${loopBackPass}-${forRound}` : `${forRound}`;
+          const round = roundToken(validationRound);
           const outcome = await executeStage(ctx, stage, {
             suffix,
             initialResumeFrom: resumeFromValidation,
+            validationRound,
+            validationGateId,
           });
           if (outcome.state === 'TERMINAL') return outcome.value;
           if (outcome.state === 'FAILED') {
@@ -1225,19 +1379,160 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
           // section names the section's first stage. null = final stage; the
           // gate reads as "Complete workflow".
           const nextStageId = nextStageIdAfter(runStages, stage);
+          // Gate preconditions. The stage result carries
+          // what only the runner could observe (the workspace); the receipts and
+          // stamps are RE-READ here rather than trusted from that result, so the
+          // decision the gate presents is taken from durable state at the moment
+          // the gate opens. Inert without a resolved release policy, which is
+          // what keeps the prompt and the option list byte-identical for an
+          // unpinned or 2.3.3-era run.
+          // Guarded outside the step so an unpinned gate records no extra
+          // durable operation and its history stays unchanged.
+          const gateFindings = stage.policy
+            ? await ctx.step(
+                `gate-preconditions-${stage.stageInstanceId ?? stage.stageId}-${round}`,
+                async () => {
+                  const row = await store.getStage(executionId, stage.stageInstanceId, {
+                    consistentRead: true,
+                  });
+                  const attempt = Number(row?.attempt ?? 0);
+                  const [receipts, events] = await Promise.all([
+                    store.listReceipts(executionId, {
+                      stageInstanceId: stage.stageInstanceId,
+                      attempt,
+                      consistentRead: true,
+                    }),
+                    store.listEvents(executionId, { consistentRead: true }),
+                  ]);
+                  const reread = evaluateGatePreconditions({
+                    stage,
+                    policy: stage.policy,
+                    attempt,
+                    validationRound,
+                    receipts,
+                    events: events.filter((e) => e.stageInstanceId === stage.stageInstanceId),
+                    sensorVerdicts: outcome.result?.gateSensorVerdicts ?? [],
+                    reviewVerdict: outcome.result?.reviewAdvisory ?? null,
+                    ensembleEvidence: outcome.result?.ensembleEvidence ?? null,
+                    changedInputs: outcome.result?.changedInputs ?? [],
+                    // `required_artifact_missing` is the one check the orchestrator
+                    // cannot derive from receipts: it needs what the stage actually
+                    // LEFT BEHIND. `producedHeads` is that observation (the container's
+                    // graph read of the artifact heads), and its artifact types are the
+                    // produced set. An EMPTY array is a successful observation of
+                    // nothing and is reported as missing outputs; `producedHeads`
+                    // absent — an unpinned run — or an explicitly unavailable read
+                    // leaves `producedArtifacts` null, which the evaluator treats as
+                    // "not observed" and never reports as missing.
+                    producedArtifacts:
+                      outcome.result?.producedHeadsUnavailable === true
+                        ? null
+                        : producedArtifactTypes(outcome.result?.producedHeads),
+                  });
+                  const merged = mergeFindings(outcome.result?.findings ?? [], reread.findings);
+                  // Logged inside the step so a durable replay does not repeat it: an
+                  // operator reading the logs can see why a gate withheld `approve`
+                  // without opening the intent.
+                  if (merged.length > 0) {
+                    logger.info('gate opened with findings', {
+                      executionId,
+                      stageId: stage.stageId,
+                      stageInstanceId: stage.stageInstanceId ?? null,
+                      findings: merged.map((item) => ({
+                        code: item.code,
+                        severity: item.severity,
+                        overridable: item.overridable,
+                      })),
+                    });
+                  }
+                  return merged;
+                },
+              )
+            : [];
+          // Learnings ritual. Upstream asks "anything to add for
+          // next time?" at every real human gate; we ask it INSIDE this gate
+          // rather than adding a second mandatory turn per stage across 18-33
+          // stages for a question with no decision content. Only release mode
+          // with `learnings: on` runs it, and only a gated stage — a stage with
+          // no human gate has nowhere to ask, which matches upstream.
+          const learningsRitual = stage.policy?.learnings === 'on';
+          const learningCandidates = learningsRitual
+            ? await ctx.step(
+                `learning-candidates-${stage.stageInstanceId ?? stage.stageId}-${round}`,
+                async () => {
+                  const events = await store.listEvents(executionId).catch(() => []);
+                  return events
+                    .filter(
+                      (row) =>
+                        eventTypeOf(row) === 'v2.learning.candidate' &&
+                        row.stageInstanceId === stage.stageInstanceId,
+                    )
+                    .map((row) => String(row.summary ?? '').slice(0, 300))
+                    .filter(Boolean);
+                },
+              )
+            : [];
+          // Build-and-Test loop-back. The offer is computed from durable state
+          // at the moment the gate opens: the recommendation the agent recorded
+          // on this stage's row, the plan's own stage order, and the per-intent
+          // tally on META. The step only reads: if the Lambda dies before its
+          // result is checkpointed, the replayed step must find the same
+          // recommendation. It is cleared in a later step, once the gate is open.
+          // Guarded outside the step so a run without the release policy records
+          // no extra durable step.
+          const loopBackLookup =
+            stage.policy?.loopBack === 'human-offered'
+              ? await ctx.step(
+                  `loop-back-offer-${stage.stageInstanceId ?? stage.stageId}-${round}`,
+                  async () => {
+                    const [row, execution] = await Promise.all([
+                      store.getStage(executionId, stage.stageInstanceId, { consistentRead: true }),
+                      store.getExecution(executionId, { consistentRead: true }),
+                    ]);
+                    if (!execution) {
+                      throw new Error('Execution metadata missing during loop-back lookup');
+                    }
+                    const offer = resolveLoopBackOffer({
+                      stage,
+                      segmentStages: segment.stages,
+                      currentIndex: stageIdx,
+                      // The same union the forward walk and the gate's skip
+                      // targets read. Intent-level skips are no less skipped than
+                      // the ones a gate flipped, and a target derivation that saw
+                      // only the dynamic ones could name a stage this run never
+                      // enters.
+                      skippedStageIds: [...intentSkipIds, ...dynamicSkipIds],
+                      recommendation: row?.loopBackRecommendation ?? null,
+                      loopBackCount: Number(execution.loopBackCount ?? 0),
+                    });
+                    return { offer, recommended: Boolean(row?.loopBackRecommendation) };
+                  },
+                )
+              : { offer: { offered: false }, recommended: false };
+          const loopBack = loopBackLookup.offer;
+          const overridable = overridableFindings(gateFindings);
+          // Blocking findings require an explicit override; the loop-back, when
+          // offered, remains a third option on this same gate.
+          const gateOptions = buildGateOptions({
+            findings: gateFindings,
+            loopBackOffered: loopBack.offered,
+          });
           const validation = await awaitEngineGate(ctx, sectionToolkit, {
-            name: `validation-${stage.stageInstanceId ?? stage.stageId}-${validationRound}`,
+            name: `validation-${stage.stageInstanceId ?? stage.stageId}-${round}`,
             kind: 'validation',
             stageInstanceId: stage.stageInstanceId ?? null,
             prompt: [
-              validationPrompt(
+              validationPrompt({
                 stage,
                 outputArtifactTypes,
-                validationRound,
-                gateSkipTargets,
+                round: validationRound,
+                skipTargets: gateSkipTargets,
                 nextStageId,
-                gateRecomposeTargets,
-              ),
+                recomposeTargets: gateRecomposeTargets,
+                findings: gateFindings,
+                learnings: learningsRitual ? { candidates: learningCandidates } : null,
+                loopBack,
+              }),
               // A2 rules 2/7/8: the unit-DAG stage's gate presents the fan-out
               // plan (units, waves, skeleton pick, skip matrix) and accepts
               // structured overrides on the approve answer.
@@ -1253,27 +1548,357 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
                   ]
                 : []),
             ].join('\n'),
-            options: ['approve', 'request-changes'],
+            options: gateOptions,
             nextStageId,
             ...(gateSkipTargets.length ? { skipTargets: gateSkipTargets } : {}),
             ...(gateRecomposeTargets.length ? { recomposeTargets: gateRecomposeTargets } : {}),
+            ...(gateFindings.length ? { findings: gateFindings } : {}),
+            ...(learningsRitual ? { learningsRitual: true } : {}),
+            // The reason, the outcome and its one-sentence explanation, for every
+            // outcome the agent recommended — not only the one that offers the
+            // option. `loopBackTarget` stays offered-only: the answer endpoint and
+            // the container read it as the engine's offer.
+            ...loopBackGateFields({ loopBack, stageId: stage.stageId }),
           });
+          // The gate holds the offer now, so the next validation round starts
+          // without a recommendation unless the agent records a new one.
+          if (loopBackLookup.recommended) {
+            await ctx.step(
+              `loop-back-clear-${stage.stageInstanceId ?? stage.stageId}-${round}`,
+              () =>
+                store.setLoopBackRecommendation({
+                  executionId,
+                  stageInstanceId: stage.stageInstanceId,
+                  reason: null,
+                }),
+            );
+          }
           if (validation.superseded) return { ok: false, reason: 'retired', intentId };
 
-          const choice =
-            parseChoice(validation.gate?.answer, ['approve', 'request-changes']) ??
-            (validation.gate?.status === 'approved'
+          const gateAnswer = validation.gate?.answer;
+          const invalidOverrideReason =
+            gateOptions.includes('override-and-approve') &&
+            parseChoice(gateAnswer, ['override-and-approve']) === 'override-and-approve' &&
+            !gateOverrideReason(gateAnswer);
+          const answered =
+            (invalidOverrideReason ? 'request-changes' : parseChoice(gateAnswer, gateOptions)) ??
+            (validation.gate?.status === 'approved' && gateOptions.includes('approve')
               ? 'approve'
               : validation.gate?.status === 'rejected'
                 ? 'request-changes'
-                : 'approve');
+                : // An unparseable answer falls back to the safest option the
+                  // gate actually offered: approve when nothing blocks (today's
+                  // behaviour), otherwise the re-run. A blocked gate NEVER
+                  // degrades into an approval — the `approved` status of a gate
+                  // whose option list has no `approve` is an answer the
+                  // engine cannot interpret, and re-running the stage is the only
+                  // safe reading of it.
+                  (gateOptions.find((option) => option === 'approve') ?? 'request-changes'));
+          // The loop-back is neither an approval nor a revision of THIS stage: it
+          // sends the run back to the stage that produced the code. Handled before
+          // either of those paths so nothing downstream of an approve/reject runs.
+          if (answered === LOOP_BACK_OPTION && loopBack.offered) {
+            const target = loopBack.target;
+            const targetStage = segment.stages[target.index];
+            // Reset this stage, then the target: both under this gate's id, which
+            // is unique to the run, so each row is reset exactly once per decision
+            // however often the step replays. Only the target's reset tallies the
+            // loop-back on META — the cap counts decisions, not rows. Each attempt
+            // bump makes the stage's earlier receipts unreachable without deleting
+            // them, so the reset is the invalidation and a lost CAS must fail the
+            // loop-back rather than leave a rejected pass's receipts in force.
+            // A failed reset marks the stage whose OWN reset failed, never the
+            // other one: the recommending stage's reset runs first, so attribution
+            // starts there and moves to the target only once the target's reset is
+            // the one in flight. Marking the untouched target FAILED would report a
+            // stage that was never written.
+            let resetFailureStage = stage;
+            try {
+              const recommenderReset = await ctx.step(
+                `loop-back-reset-${stage.stageInstanceId}-${round}`,
+                () =>
+                  store.resetStageRow({
+                    executionId,
+                    stageInstanceId: stage.stageInstanceId,
+                    loopBackId: validation.gate.humanTaskId,
+                    countsAgainstCap: false,
+                  }),
+              );
+              if (!recommenderReset) {
+                throw new Error(
+                  `recommending stage row was not reset; ${stage.stageId}'s receipts from the rejected pass would stay reachable`,
+                );
+              }
+              resetFailureStage = targetStage;
+              const reset = await ctx.step(
+                `loop-back-reset-${targetStage.stageInstanceId}-${round}`,
+                () =>
+                  store.resetStageRow({
+                    executionId,
+                    stageInstanceId: targetStage.stageInstanceId,
+                    loopBackId: validation.gate.humanTaskId,
+                  }),
+              );
+              if (!reset) {
+                throw new Error('target stage row was not reset; loop-back cap was not recorded');
+              }
+            } catch (error) {
+              const detail = error?.message ?? String(error);
+              logger.error('Loop-back stage reset failed', error);
+              await ctx.step(
+                `loop-back-reset-failed-stage-${resetFailureStage.stageInstanceId}-${round}`,
+                () =>
+                  store.updateStageState({
+                    executionId,
+                    stageInstanceId: resetFailureStage.stageInstanceId,
+                    state: 'FAILED',
+                    runtimeError: `loopback_reset_failed: ${detail}`,
+                    completedAt: nowIso(),
+                  }),
+              );
+              return await fail('loopback_reset_failed', `${resetFailureStage.stageId}: ${detail}`);
+            }
+            await emitEvent(
+              ctx,
+              `loop-back-recorded-${stage.stageId}-${round}`,
+              LOOP_BACK_RECORDED_EVENT,
+              `${validation.gate?.answeredByName || 'Someone'} sent ${stage.stageId} back to ${
+                target.stageId
+              } (loop-back ${loopBack.spent + 1} of ${LOOP_BACK_LIMIT}): ${loopBack.reason}`,
+            );
+            // The target re-runs with this gate's answer, so code generation is
+            // told why it was sent back and what the reviewer added.
+            loopBackResumeFrom = validation.gate.humanTaskId;
+            jumpBackIndex = target.index;
+            loopBackPass += 1;
+            break;
+          }
+          // Overriding IS approving, with the blocking findings and the human who
+          // accepted them on the record. Recorded before the stage is marked
+          // validated so the audit row exists even if a later step re-drives.
+          let stageApprovalOverride = null;
+          if (answered === 'override-and-approve') {
+            stageApprovalOverride = await ctx.step(
+              `gate-override-${stage.stageInstanceId ?? stage.stageId}-${round}`,
+              async () => {
+                // No catch on the reads and writes below: a failure retries the
+                // durable step, so the receipt lands under the real attempt and
+                // the stage is never approved without its audit row.
+                const row = await store.getStage(executionId, stage.stageInstanceId, {
+                  consistentRead: true,
+                });
+                const codes = overridable.map((item) => item.code);
+                // The human's stated reason, on the receipt and the audit event.
+                // Tolerant: an answer without one records null rather than
+                // refusing the override (the review UI requires it).
+                const reason = gateOverrideReason(validation.gate?.answer);
+                // Keep sensor overrides in their own receipt; stage approval
+                // records its override details alongside the approved inputs below.
+                const codesByKind = new Map();
+                for (const item of overridable) {
+                  const itemKind = item.receiptKind ?? 'sensor-override';
+                  codesByKind.set(itemKind, [...(codesByKind.get(itemKind) ?? []), item.code]);
+                }
+                const kind = [...codesByKind.keys()][0] ?? 'sensor-override';
+                // Upstream records a dedicated audit row when a human overrides a
+                // BLOCKING sensor verdict, naming the sensors, their results and
+                // the reasons (upstream §2.6). Reproduced verbatim as a structured
+                // sub-object rather than prose, so an auditor can query it. Absent
+                // when the override was of something other than a sensor, which is
+                // how "was a sensor overridden here?" stays answerable.
+                const overriddenSensors = overridable
+                  .filter((item) => item.code === 'sensor_gate_blocking')
+                  .map((item) => ({
+                    sensorId: item.detail?.sensorId ?? null,
+                    result: item.detail?.result ?? null,
+                    reason: item.detail?.reason ?? null,
+                  }))
+                  .filter((item) => item.sensorId);
+                const blockingSensorOverride = overriddenSensors.length
+                  ? {
+                      blockingSensorOverride: true,
+                      sensorIds: overriddenSensors.map((item) => item.sensorId),
+                      sensors: overriddenSensors,
+                    }
+                  : {};
+                stageApprovalOverride = codesByKind.has('stage-approval')
+                  ? {
+                      findingCodes: codesByKind.get('stage-approval'),
+                      reason,
+                    }
+                  : null;
+                for (const [receiptKind, kindCodes] of codesByKind) {
+                  if (receiptKind === 'stage-approval') continue;
+                  await store.putReceipt({
+                    executionId,
+                    kind: receiptKind,
+                    stageInstanceId: stage.stageInstanceId,
+                    attempt: Number(row?.attempt ?? 0),
+                    choice: 'override-and-approve',
+                    decidedBy: validation.gate?.answeredBy ?? null,
+                    decidedByName: validation.gate?.answeredByName ?? null,
+                    humanTaskId: validation.gate?.humanTaskId ?? null,
+                    detail: {
+                      findingCodes: kindCodes,
+                      reason,
+                      ...(receiptKind === 'sensor-override' ? blockingSensorOverride : {}),
+                    },
+                  });
+                }
+                await store.appendEvent({
+                  executionId,
+                  type: 'v2.gate.override',
+                  stageInstanceId: stage.stageInstanceId ?? null,
+                  actor: validation.gate?.answeredByName ?? validation.gate?.answeredBy ?? null,
+                  summary: `${validation.gate?.answeredByName || 'Someone'} overrode ${codes.length} blocking finding(s) and approved ${stage.stageId}: ${codes.join(', ')}`,
+                  detail: {
+                    findingCodes: codes,
+                    reason,
+                    receiptKind: kind,
+                    receiptKinds: [...codesByKind.keys()],
+                    ...blockingSensorOverride,
+                  },
+                });
+                return stageApprovalOverride;
+              },
+            );
+          }
+          const choice = answered === 'override-and-approve' ? 'approve' : answered;
           if (choice === 'approve') {
             await emitEvent(
               ctx,
-              `stage-validated-${stage.stageId}-${validationRound}`,
+              `stage-validated-${stage.stageId}-${round}`,
               'v2.stage.validated',
               `Stage ${stage.stageId} approved by human validation`,
             );
+            // Change control, recording half: the approval FREEZES
+            // the fingerprints of what this stage produced. A later stage that
+            // consumes one of them compares against this row to decide whether its
+            // input moved since a human last looked at it. Written only in release
+            // mode (`stage.policy`), and only with the fingerprints the container
+            // could read — the orchestrator has no Neptune access of its own.
+            //
+            // The same row carries the learnings ritual's outcome, including the
+            // explicit "nothing to add": an empty answer is a recorded decision,
+            // not an absence of one.
+            if (stage.policy) {
+              await ctx.step(
+                `stage-approval-receipt-${stage.stageInstanceId ?? stage.stageId}-${round}`,
+                async () => {
+                  const row = await store.getStage(executionId, stage.stageInstanceId, {
+                    consistentRead: true,
+                  });
+                  // `producedHeads` is an INTENT-WIDE observation (the container
+                  // reads every current artifact head). A human approving THIS
+                  // stage reviewed only what THIS stage produced, so the approval
+                  // covers that subset alone — otherwise approving stage B would
+                  // silently re-approve stage A's edited output and the next
+                  // consumer's change control would never ask about it. A head with
+                  // no recorded producer (legacy intents) stays in scope, because an
+                  // unattributed artifact cannot be proven to belong elsewhere.
+                  const observedHeads = outcome.result?.producedHeads ?? [];
+                  const stageHeads = observedHeads.filter(
+                    (head) =>
+                      head?.stageInstanceId == null ||
+                      head.stageInstanceId === '' ||
+                      head.stageInstanceId === stage.stageInstanceId,
+                  );
+                  const approvedInputs = stageHeads.map((head) => ({
+                    logicalKey: head.logicalKey,
+                    snapshotHash: head.snapshotHash,
+                  }));
+                  const detail = {
+                    ...stageApprovalOverride,
+                    approvedInputs,
+                    // Producing-stage and lane attribution for everything the
+                    // decision covers, recorded once rather than per entry.
+                    approvedInputsScope: {
+                      stageInstanceId: stage.stageInstanceId ?? null,
+                      sectionIndex: stageHeads[0]?.sectionIndex ?? null,
+                      unitSlug: stageHeads[0]?.unitSlug ?? null,
+                    },
+                    ...(observedHeads.length > stageHeads.length
+                      ? { observedInputsOutOfScope: observedHeads.length - stageHeads.length }
+                      : {}),
+                    ...(learningsRitual
+                      ? {
+                          learnings: gateLearnings(validation.gate?.answer) ? 'offered' : 'none',
+                        }
+                      : {}),
+                  };
+                  let boundedDetail = detail;
+                  if (
+                    Buffer.byteLength(JSON.stringify(detail), 'utf8') >
+                    MAX_STAGE_APPROVAL_DETAIL_BYTES
+                  ) {
+                    let low = 0;
+                    let high = approvedInputs.length;
+                    while (low <= high) {
+                      const count = Math.floor((low + high) / 2);
+                      const candidate = {
+                        ...detail,
+                        approvedInputs: approvedInputs.slice(0, count),
+                        approvedInputsTruncated: true,
+                        approvedInputsOmitted: approvedInputs.length - count,
+                      };
+                      if (
+                        Buffer.byteLength(JSON.stringify(candidate), 'utf8') <=
+                        MAX_STAGE_APPROVAL_DETAIL_BYTES
+                      ) {
+                        boundedDetail = candidate;
+                        low = count + 1;
+                      } else {
+                        high = count - 1;
+                      }
+                    }
+                    if (boundedDetail === detail) {
+                      throw new Error('stage-approval receipt detail exceeds its safe size limit');
+                    }
+                  }
+                  await store.putReceipt({
+                    executionId,
+                    kind: 'stage-approval',
+                    stageInstanceId: stage.stageInstanceId,
+                    attempt: Number(row?.attempt ?? 0),
+                    choice: answered,
+                    decidedBy: validation.gate?.answeredBy ?? null,
+                    decidedByName: validation.gate?.answeredByName ?? null,
+                    humanTaskId: validation.gate?.humanTaskId ?? null,
+                    detail: boundedDetail,
+                  });
+                },
+              );
+            }
+            // The learning itself is written by the container (no Neptune access
+            // here). A failure is recorded there and NEVER fails the run — the
+            // stage is already approved and the human's decision stands.
+            const offeredLearning = learningsRitual ? gateLearnings(validation.gate?.answer) : '';
+            if (offeredLearning) {
+              await ctx.step(
+                `record-learning-${stage.stageInstanceId ?? stage.stageId}-${round}`,
+                async () => {
+                  try {
+                    return await invokeIntentRuntime(
+                      {
+                        command: 'record-learning',
+                        projectId,
+                        intentId,
+                        executionId,
+                        stageInstanceId: stage.stageInstanceId ?? null,
+                        stageId: stage.stageId,
+                        learnings: offeredLearning,
+                        recordedBy: validation.gate?.answeredBy ?? null,
+                        recordedByName: validation.gate?.answeredByName ?? null,
+                      },
+                      sessionId,
+                    );
+                  } catch (e) {
+                    logger.error('record-learning dispatch failed', e);
+                    return { ok: false, reason: 'dispatch_failed' };
+                  }
+                },
+              );
+            }
             // Fan-out approval (A2 rules 2/7/8): freeze the effective
             // decisions — defaults + validated overrides riding the approve
             // answer — onto the UNITPLAN so the section runner schedules
@@ -1281,7 +1906,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
             // into a timeline event (never trusted, never silently dropped).
             if (fanoutGateNeeded) {
               const decisions = await ctx.step(
-                `fanout-decisions-${stage.stageId}-${validationRound}`,
+                `fanout-decisions-${stage.stageId}-${round}`,
                 async () => {
                   const bySlug = new Map((unitPlanForGate.units ?? []).map((u) => [u.slug, u]));
                   const overrides = validateFanoutOverrides(validation.gate?.answer, {
@@ -1316,7 +1941,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
               );
               await emitEvent(
                 ctx,
-                `fanout-approved-${stage.stageId}-${validationRound}`,
+                `fanout-approved-${stage.stageId}-${round}`,
                 'v2.units.fanout_approved',
                 `Fan-out approved for section ${fanoutSection.index}: skeleton ${decisions.walkingSkeleton}, ${(unitPlanForGate.units ?? []).length} unit(s)`,
               );
@@ -1331,7 +1956,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
               if (meta.stageSkipping !== 'enabled') {
                 await emitEvent(
                   ctx,
-                  `skip-to-rejected-${stage.stageId}-${validationRound}`,
+                  `skip-to-rejected-${stage.stageId}-${round}`,
                   'v2.stage.skip_rejected',
                   `Skip to "${requestedSkipTo}" ignored: stage skipping is disabled for this run`,
                 );
@@ -1344,7 +1969,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
                 if (skip.error) {
                   await emitEvent(
                     ctx,
-                    `skip-to-rejected-${stage.stageId}-${validationRound}`,
+                    `skip-to-rejected-${stage.stageId}-${round}`,
                     'v2.stage.skip_rejected',
                     `Skip to "${requestedSkipTo}" ignored: ${skip.error}`,
                   );
@@ -1364,7 +1989,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
               if (meta.stageSkipping !== 'enabled') {
                 await emitEvent(
                   ctx,
-                  `recompose-rejected-${stage.stageId}-${validationRound}`,
+                  `recompose-rejected-${stage.stageId}-${round}`,
                   'v2.stage.recompose_rejected',
                   `Recompose ignored: stage skipping is disabled for this run`,
                 );
@@ -1379,7 +2004,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
                 for (const rej of verdict.rejected) {
                   await emitEvent(
                     ctx,
-                    `recompose-rejected-${stage.stageId}-${validationRound}-${rej.stageId}`,
+                    `recompose-rejected-${stage.stageId}-${round}-${rej.stageId}`,
                     'v2.stage.recompose_rejected',
                     `Recompose skip of "${rej.stageId}" ignored: ${rej.reason}`,
                   );
@@ -1390,13 +2015,24 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
           }
 
           resumeFromValidation = validation.gate.humanTaskId;
+          validationGateId = validation.gate.humanTaskId;
           validationRound += 1;
           await emitEvent(
             ctx,
-            `stage-validation-revision-${stage.stageId}-${validationRound}`,
+            `stage-validation-revision-${stage.stageId}-${roundToken(validationRound)}`,
             'v2.stage.revision_requested',
             `Human requested changes for ${stage.stageId}; re-running stage with feedback`,
           );
+        }
+
+        // Apply an approved loop-back: the rows are already reset (attempt
+        // bumped, receipts invalidated) and the decision is on the timeline, so
+        // all that remains is to move the walk back. No checkpoint is published
+        // for a stage the human just sent back — the next attempt publishes its
+        // own.
+        if (jumpBackIndex != null) {
+          stageIdx = jumpBackIndex - 1; // the walk resumes AT the target stage
+          continue;
         }
 
         // Apply an approved "skip to stage X": mark every intermediate SKIPPED
@@ -1464,7 +2100,9 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
           dynamicSkipIds.push(flippedId);
         }
         await publishCheckpoint(
-          `checkpoint-stage-${stage.stageInstanceId ?? stage.stageId}`,
+          `checkpoint-stage-${stage.stageInstanceId ?? stage.stageId}${
+            loopBackPass ? `-loopback-${loopBackPass}` : ''
+          }`,
           stage.stageInstanceId ?? null,
         );
       }
@@ -1509,6 +2147,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         store,
         meta,
         executionId,
+        runId,
         applicationUrl,
         log: (m) => logger.info(m),
       }),
@@ -1618,6 +2257,7 @@ const runStage = async (
     workflowVersion,
     aidlcRepoRef = null,
     methodologyPins = null,
+    methodologyRelease = null,
     scope,
     // Per-run skip overlay (intent-level + accumulated gate-time skips) —
     // forwarded so the container's plan resolution matches the walk's.
@@ -1634,6 +2274,8 @@ const runStage = async (
     cloneInputs,
     resumeFrom,
     reviewFeedback = null,
+    validationRound = 0,
+    validationGateId = null,
     // Expected process-row identity for this attempt. The orchestrator already
     // has the resolved plan, so it can reconcile a dead worker even when no
     // callback result arrives to report the id.
@@ -1688,6 +2330,7 @@ const runStage = async (
         workflowVersion,
         ...(aidlcRepoRef ? { aidlcRepoRef } : {}),
         ...(methodologyPins ? { methodologyPins } : {}),
+        ...(methodologyRelease ? { methodologyRelease } : {}),
         scope,
         ...(skipStageIds?.length ? { skipStageIds } : {}),
         ...(composedGrid ? { composedGrid } : {}),
@@ -1701,6 +2344,16 @@ const runStage = async (
         // resolves a short-lived credential directly from the broker.
         ...cloneInputs,
         resumeFrom: resumeFrom ?? null,
+        // The validation revision the checkpoint receipts are scoped to. Sent
+        // only for a stage with a resolved release policy and only after a
+        // "Request changes", so every other payload is unchanged.
+        ...(stage.policy && validationRound ? { validationRound } : {}),
+        // The gate the revision's feedback lives on, sent under the same
+        // condition. A later leg of the revision resumes from whatever gate
+        // parked it, so the gate it resumes is not the one that asked for
+        // changes; naming the validation gate is what keeps the personas on the
+        // real feedback.
+        ...(stage.policy && validationRound && validationGateId ? { validationGateId } : {}),
         reviewFeedback: reviewFeedback
           ? {
               batchId: reviewFeedback.batchId ?? null,
@@ -1776,17 +2429,70 @@ const nextStageIdAfter = (runStages = [], stage = {}) => {
   return runStages[ix + 1]?.stageId ?? null;
 };
 
-const validationPrompt = (
+// The learnings ritual's payload on an approve answer. Tolerant of
+// the shapes the answer endpoint writes, and deliberately strict about emptiness:
+// whitespace is "nothing to add", which is a recorded decision, not a learning.
+// The reason a human gave for `override-and-approve`, bounded like every other
+// free text the engine persists from a gate answer. `null` when absent.
+const gateOverrideReason = (answer) => {
+  const raw = typeof answer === 'string' ? null : (answer?.reason ?? null);
+  const text = String(raw ?? '')
+    .trim()
+    .slice(0, OVERRIDE_REASON_MAX);
+  return text || null;
+};
+
+const gateLearnings = (answer) => {
+  const raw = typeof answer === 'string' ? null : (answer?.learnings ?? answer?.learning ?? null);
+  return String(raw ?? '').trim();
+};
+
+// The artifact TYPES a stage left behind, taken from the container's graph read
+// of the artifact heads. `null` in ⇒ `null` out: "not observed" must never be
+// mistaken for "produced nothing".
+const producedArtifactTypes = (producedHeads) =>
+  Array.isArray(producedHeads)
+    ? [...new Set(producedHeads.map((head) => head?.artifactType).filter(Boolean))]
+    : null;
+
+const findingLine = (item) =>
+  [
+    item.severity === 'blocking' ? `- ⛔ BLOCKING — ${item.title}` : `- ⚠️ ${item.title}`,
+    item.remediation ? `: ${item.remediation}` : '',
+    // The verbatim words, on their own indented quote line. A maintained dissent
+    // whose text is only in `detail` never reaches the human reading the gate,
+    // and a paraphrase of an objection is a different objection.
+    item.quote ? `\n    > ${String(item.quote).replaceAll('\n', '\n    > ')}` : '',
+  ].join('');
+
+const validationPrompt = ({
   stage,
   outputArtifactTypes = [],
   round = 0,
   skipTargets = [],
   nextStageId = null,
   recomposeTargets = [],
-) => {
+  // Gate preconditions. Empty on every run without a
+  // resolved release policy, and an empty list renders NOTHING — the prompt is
+  // then byte-identical to the pre-findings one.
+  findings = [],
+  // The learnings ritual, or null when the scope does not run it.
+  // `null` renders NOTHING, which is what keeps every other run's prompt
+  // byte-identical.
+  learnings = null,
+  // The Build-and-Test loop-back offer (resolveLoopBackOffer). Without a
+  // recommendation it renders NOTHING, which is what keeps every other run's
+  // prompt byte-identical. A recommendation the gate cannot offer (cap spent, or
+  // no linear target) is still SHOWN with its reason: a withheld option the human
+  // cannot see the reason for is exactly the silent block §8.1 invariant 5
+  // forbids.
+  loopBack = null,
+}) => {
   const artifacts = outputArtifactTypes.length
     ? outputArtifactTypes.join(', ')
     : 'no declared artifacts';
+  const blocking = findings.filter((item) => item.severity === 'blocking');
+  const overridable = blocking.filter((item) => item.overridable);
   return [
     `Review stage ${stage.stageId}${round ? ` (revision ${round})` : ''}.`,
     '',
@@ -1812,6 +2518,53 @@ const validationPrompt = (
           )}] — an arbitrary selection of later CONDITIONAL stages, marked SKIPPED in place; downstream stages treat their outputs as absent by design.`,
         ]
       : []),
+    ...(findings.length
+      ? [
+          '',
+          '## Findings for your decision',
+          '',
+          ...findings.map(findingLine),
+          ...(overridable.length > 0
+            ? [
+                '',
+                `Choose override-and-approve to accept ${overridable.length} blocking finding(s) on the record — your name and the finding codes are stored with the approval.`,
+              ]
+            : []),
+          ...(blocking.length > 0 && overridable.length === 0
+            ? [
+                '',
+                'A blocking finding cannot be overridden here: request-changes re-runs the stage so it can be resolved.',
+              ]
+            : []),
+        ]
+      : []),
+    ...(learnings
+      ? [
+          '',
+          '## Anything to add for next time?',
+          '',
+          // Upstream asks even with zero candidates, so the section is
+          // unconditional once the ritual is on — the empty case is the answer
+          // "nothing", which is itself recorded.
+          ...(learnings.candidates?.length
+            ? ['Candidates this stage surfaced:', ...learnings.candidates.map((c) => `  - ${c}`)]
+            : ['This stage surfaced no candidates.']),
+          'Your approve answer may carry { "learnings": "<text>" } to record a project guardrail for future intents — or leave it empty.',
+        ]
+      : []),
+    ...(loopBack?.reason
+      ? [
+          '',
+          loopBack.atCap
+            ? '## The agent recommends going back to the code, but the loop-back limit is spent'
+            : '## The agent recommends going back to the code',
+          '',
+          `Reason: ${loopBack.reason}`,
+          // The same sentence the gate row carries, so the prompt and the review
+          // UI cannot drift apart.
+          loopBackNote({ loopBack, stageId: stage.stageId }),
+        ]
+      : []),
   ].join('\n');
 };
 
@@ -1829,6 +2582,7 @@ const openIntentPrs = async ({
   store,
   meta,
   executionId,
+  runId = null,
   applicationUrl,
   log,
 }) => {
@@ -1994,6 +2748,12 @@ const openIntentPrs = async ({
         baseBranch: baseFor(repoId),
         title,
         body,
+        // One creation attempt per orchestrator run. The execution id alone
+        // is the intent id, identical across a rewind or repair relaunch, so
+        // it would replay a PR a reviewer closed in the meantime (CodeCommit
+        // cannot reopen it). A durable replay of this step keeps its run id
+        // and therefore its key.
+        attemptKey: runId ? `${executionId}:${runId}` : executionId,
       });
       if (res?.prUrl) {
         results.push({

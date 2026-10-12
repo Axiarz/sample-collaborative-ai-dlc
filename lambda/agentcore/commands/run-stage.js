@@ -28,7 +28,7 @@
 // whole flow is unit-tested with the CLI + AWS mocked.
 
 import { Logger } from '@aws-lambda-powertools/logger';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   selectCli,
   getDriver,
@@ -46,10 +46,22 @@ import {
   materializeOpenCodeConfig as defaultMaterializeOpenCodeConfig,
   materializeCodexHome as defaultMaterializeCodexHome,
   resolveCodexHome,
+  neutralizeTokens,
 } from '../stage-materializer.js';
+import { dispatchPersona, composePersonaPrompt, OFF_MOUNT_CACHE_ENV } from '../persona-dispatch.js';
+import {
+  MAX_PERSONA_SESSION_MS,
+  STAGE_BUDGET_MS,
+  stageDeadline,
+  contributionArtifactId,
+  ensembleGapFindings,
+  renderLeadTopologyBrief,
+  resolveEnsembleTopology as defaultResolveEnsembleTopology,
+  runEnsembleSessions,
+} from '../ensemble-runner.js';
 import { fetchCustomRules as defaultFetchCustomRules } from '../custom-rules.js';
 import { materializeAttachments } from '../attachments.js';
-import { toMcpServerMap } from '../../shared/mcp-validator.js';
+import { toMcpServerMap, validateMcpServers } from '../../shared/mcp-validator.js';
 import {
   computeSurvivors,
   resolveMcpSecrets as defaultResolveMcpSecrets,
@@ -84,8 +96,19 @@ import {
 } from '../git-engine.js';
 import { resolveStageModel } from '../model-resolver.js';
 import { createGraphWriter, closeGraphSource } from '../mcp/graph-writer.js';
+import { CHECKPOINTS, chosenLabel } from '../mcp/process-bridge.js';
+import { LOOP_BACK_OPTION, parseChoice } from '../../shared/gate-answer.js';
 import { ingestStageCodeTraceability as defaultIngestStageCodeTraceability } from '../code-traceability.js';
-import { createSensorRunner } from '../sensor-runner.js';
+import { createSensorRunner, isReleaseDependencyError } from '../sensor-runner.js';
+import {
+  evaluateGatePreconditions,
+  mergeFindings,
+  sensorGateFindings,
+} from '../../shared/gate-preconditions.js';
+import {
+  archiveArtifactsForStages as defaultArchiveArtifactsForStages,
+  readCurrentArtifactHeadHashes as defaultReadArtifactHeadHashes,
+} from '../../shared/artifact-versioning.js';
 import { compileContextPack as defaultCompileContextPack } from '../context-compiler.js';
 import { createCliOutputSink, stripTerminalControls } from '../output-normalizer.js';
 import {
@@ -93,11 +116,13 @@ import {
   stageInstanceId as planStageInstanceId,
   UNIT_FOR_EACH,
 } from '../../shared/v2-execution-plan.js';
+import { humanTaskMatchesOwner, isHumanTaskAnswerStatus } from '../../shared/v2-process-keys.js';
 import { credentialProviderForCli } from '../../shared/agent-credentials.js';
 import {
   mergeChangedFileProvenance,
   unknownChangedFileProvenance,
 } from '../../shared/changed-file-provenance.js';
+import { eventTypeOf } from '../../shared/v2-process-keys.js';
 import { pruneOutputArtifactsForUnit } from '../../shared/unit-kind-pruning.js';
 
 const logger = new Logger({ persistentKeys: { component: 'agentcore', module: 'run-stage' } });
@@ -106,6 +131,18 @@ const logger = new Logger({ persistentKeys: { component: 'agentcore', module: 'r
 // sensor: only stages that produce a registered structured artifact get it.
 import { REGISTRY } from '../../shared/artifact-extractors.js';
 import { invokeSourceControlOperation } from '../clients.js';
+
+// The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
+// this module implements. Checked against the registry by a test, so a
+// capability cannot be declared handled without the code that handles it.
+export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze([
+  'policy.change-control@v1',
+  'protocol.plan-approval.outcome-gate@v1',
+  'review.adversarial@v1',
+  'stage.mode.single-session@v1',
+  'workspace.always-restored@v1',
+  'agent.max-turns@v1',
+]);
 
 export const verifyReviewTargets = async ({
   targets = [],
@@ -152,15 +189,10 @@ export const verifyReviewTargets = async ({
 // NEVER on the 1 GiB session mount (AgentCore offers no larger size). The
 // 2026-07 incident filled the mount with npm state until the engine commit
 // ENOSPC'd and the run finished with zero durable work. The working tree (the
-// durable part) stays on the mount; caches are re-creatable.
-export const OFF_MOUNT_CACHE_ENV = {
-  npm_config_cache: '/tmp/aidlc-cache/npm',
-  YARN_CACHE_FOLDER: '/tmp/aidlc-cache/yarn',
-  PNPM_HOME: '/tmp/aidlc-cache/pnpm',
-  PIP_CACHE_DIR: '/tmp/aidlc-cache/pip',
-  UV_CACHE_DIR: '/tmp/aidlc-cache/uv',
-  TMPDIR: '/tmp',
-};
+// durable part) stays on the mount; caches are re-creatable. Definition now
+// lives in persona-dispatch.js (every dispatched persona session needs the
+// same floor); re-exported here for existing importers of run-stage.js.
+export { OFF_MOUNT_CACHE_ENV };
 
 // Free-space floor for the disk preflight — below this, installs and even the
 // engine commit are at ENOSPC risk on the 1 GiB mount.
@@ -230,13 +262,24 @@ const resolveStage = ({
   return { plan, stage };
 };
 
-// Concatenate the methodology knowledge bodies for an agent (best-effort). This
-// is the authored, baseline-shipped tier (KNOWLEDGE blocks from the library).
-const loadMethodologyKnowledge = async ({ agentRef, library, loadBlockBody }) => {
+// Concatenate the methodology knowledge bodies for an agent. Release mode does
+// NOT swallow a body failure: a missing or digest-mismatched KNOWLEDGE body is
+// tampered or absent methodology, and degrading it to '' would run the agent on
+// silently reduced steering — the same fail-closed rule the stage and agent
+// bodies already follow. Legacy mode keeps its lenient best-effort behaviour.
+const loadMethodologyKnowledge = async ({
+  agentRef,
+  library,
+  loadBlockBody,
+  methodologyRelease = null,
+}) => {
   const knowledgeBlocks = Object.values(library.knowledgeById ?? {}).filter(
     (k) => k.agentRef === agentRef || k.agentRef === 'shared',
   );
-  const bodies = await Promise.all(knowledgeBlocks.map((k) => loadBlockBody(k).catch(() => '')));
+  const readBody = methodologyRelease
+    ? (block) => loadBlockBody(block)
+    : (block) => loadBlockBody(block).catch(() => '');
+  const bodies = await Promise.all(knowledgeBlocks.map(readBody));
   return bodies.filter(Boolean).join('\n\n---\n\n');
 };
 
@@ -346,16 +389,22 @@ const renderReviewerReadScope = ({ unit, contracts }) => {
   ].join('\n');
 };
 
-const buildReviewerPrompt = ({
-  stage,
-  unit = null,
-  reviewerAgent,
-  reviewerPersona,
-  knowledge,
-  round,
-}) => {
+// Everything the reviewer prompt says EXCEPT the persona/knowledge tail —
+// that tail is generic across persona roles and lives in
+// composePersonaPrompt (persona-dispatch.js). Split out from
+// buildReviewerPrompt so runReviewer can hand this, alone, to dispatchPersona
+// as `brief` — the blindness seam (persona-dispatch.js) — while
+// buildReviewerPrompt keeps rendering the exact same full prompt below.
+const buildReviewerBrief = ({ stage, unit = null, reviewerAgent, round }) => {
   const outputs = (stage.outputArtifacts ?? []).map((o) => o.artifact ?? o).filter(Boolean);
   const inputs = (stage.inputArtifacts ?? []).map((i) => i.artifact ?? i).filter(Boolean);
+  // `review_artifact` (≥2.7.0) names the ONE canonical output under review. The
+  // other produced artifacts stay listed as context — narrowing the verdict
+  // target must not narrow what the reviewer may read to reach it.
+  const reviewArtifact = outputs.includes(stage.reviewer?.artifact)
+    ? stage.reviewer.artifact
+    : null;
+  const advisory = Boolean(stage.reviewer?.advisory);
   // The shared contracts actually resolved for this stage (never invent ids the
   // stage does not consume) — feeds the per-unit read-scope block.
   const contracts = SHARED_CONTRACT_ARTIFACTS.filter((id) => inputs.includes(id));
@@ -381,14 +430,43 @@ const buildReviewerPrompt = ({
       ? [`Unit under review: ${unit.slug}${unit.kind ? ` (kind: ${unit.kind})` : ''}`]
       : []),
     `Expected input artifacts: ${inputs.length ? inputs.join(', ') : 'none'}`,
-    `Produced artifacts to review: ${outputs.length ? outputs.join(', ') : 'none'}`,
+    ...(reviewArtifact
+      ? [
+          `Artifact under review: ${reviewArtifact} — your verdict judges THIS artifact.`,
+          `Context artifacts (read as needed, do not judge): ${
+            outputs.filter((o) => o !== reviewArtifact).join(', ') || 'none'
+          }`,
+        ]
+      : [`Produced artifacts to review: ${outputs.length ? outputs.join(', ') : 'none'}`]),
+    ...(advisory
+      ? [
+          '',
+          'This is an ADVISORY review: a single terminal pass with no repair round.',
+          'Your findings are recorded on this stage\u2019s timeline as a durable review',
+          'note that the human can open when they approve the stage; they are NOT',
+          'inlined into the approval prompt, and nothing is sent back to the author',
+          'agent on your behalf. State them plainly and completely, and assume the',
+          'reader has to seek them out.',
+        ]
+      : []),
     ...(readScope ? ['', readScope] : []),
-    '',
-    '## Reviewer role',
-    reviewerPersona || '(no reviewer persona supplied)',
-    knowledge ? `\n## Reference knowledge\n${knowledge}` : '',
   ].join('\n');
 };
+
+const buildReviewerPrompt = ({
+  stage,
+  unit = null,
+  reviewerAgent,
+  reviewerPersona,
+  knowledge,
+  round,
+}) =>
+  composePersonaPrompt({
+    brief: buildReviewerBrief({ stage, unit, reviewerAgent, round }),
+    persona: reviewerPersona,
+    knowledge,
+    role: 'reviewer',
+  });
 
 const latestReviewerVerdict = async ({ store, executionId, stageInstanceId, reviewerAgent }) => {
   if (typeof store.listSensorRuns !== 'function') return null;
@@ -398,6 +476,11 @@ const latestReviewerVerdict = async ({ store, executionId, stageInstanceId, revi
     .find((r) => r.kind === 'reviewer' && r.sensorId === `reviewer:${reviewerAgent}`);
 };
 
+// Thin caller: builds the reviewer's brief + emits the pre-run event, hands
+// the CLI-dispatch mechanics to dispatchPersona (persona-dispatch.js), then
+// resolves the verdict — reviewer-specific bookkeeping that doesn't
+// generalize (yet) to other persona roles, so it stays here rather than in
+// the generic dispatcher.
 const runReviewer = async ({
   stage,
   unit = null,
@@ -418,6 +501,7 @@ const runReviewer = async ({
   materializeOpenCodeConfig,
   materializeCodexHome,
   cleanupCodexHome,
+  withOpenCodeStore,
   store,
   executionId,
   projectId,
@@ -427,59 +511,11 @@ const runReviewer = async ({
   sectionIndex,
   publish,
   ids,
+  // The reviewer agent's AGENT.maxTurns, or null. Passed only for a release
+  // catalog, where upstream sets it (on the two reviewer agents).
+  maxTurns = null,
 }) => {
-  const driver = getDriver(cli);
-  const model = resolveStageModel({ cliModels, tierModels, agentBlock: reviewerBlock, cli, env });
-  const scope = {
-    executionId,
-    intentId,
-    projectId,
-    stageInstanceId,
-    unitSlug,
-    sectionIndex,
-    role: 'reviewer',
-    // Trusted reviewer identity: the bridge stamps THIS name on the verdict row
-    // (sensorId `reviewer:<name>`), never the agent's self-report — a hallucinated
-    // or omitted name can no longer detach the verdict from the round that ran.
-    reviewerAgent,
-    model,
-  };
-  const prompt = buildReviewerPrompt({
-    stage,
-    unit,
-    reviewerAgent,
-    reviewerPersona,
-    knowledge,
-    round,
-  });
-  const mcpKwargs =
-    cli === 'kiro'
-      ? {
-          agentName: await materializeKiroAgent({ workspaceDir, mcpEntry, scope, env }),
-        }
-      : cli === 'opencode'
-        ? {
-            opencodeConfigContent: await materializeOpenCodeConfig({
-              workspaceDir,
-              mcpEntry,
-              scope,
-              env,
-            }),
-          }
-        : cli === 'codex'
-          ? {
-              codexHome: await materializeCodexHome({ workspaceDir, mcpEntry, scope, env }),
-            }
-          : {
-              mcpConfigPath: await materializeMcpConfig({ workspaceDir, mcpEntry, scope, env }),
-            };
-  const invocation = driver.buildInvocation({
-    prompt,
-    model,
-    allowedTools: [],
-    sessionId: cli === 'claude' ? ids() : null,
-    ...mcpKwargs,
-  });
+  const brief = buildReviewerBrief({ stage, unit, reviewerAgent, round });
   await store
     .appendEvent({
       executionId,
@@ -491,27 +527,40 @@ const runReviewer = async ({
       summary: `Reviewer ${reviewerAgent} checking ${stage.stageId}`,
     })
     .catch(() => {});
-  const execute = () =>
-    runChild({
-      command: invocation.command,
-      args: invocation.args,
-      env: { ...OFF_MOUNT_CACHE_ENV, ...invocation.env, ...driver.envForAuth(env) },
-      cwd: workspaceDir,
-      prompt,
-      promptViaStdin: invocation.promptViaStdin,
-      spawnFn,
-    });
-  try {
-    if (cli === 'opencode') {
-      await defaultWithOpenCodeStore({ env, operation: execute });
-    } else {
-      await execute();
-    }
-  } finally {
-    if (cli === 'codex') {
-      await cleanupCodexHome({ codexHome: mcpKwargs.codexHome, env }).catch(() => false);
-    }
-  }
+  const dispatch = await dispatchPersona({
+    role: 'reviewer',
+    stageId: stage.stageId,
+    personaScope: { agentRef: reviewerAgent },
+    agentBlock: reviewerBlock,
+    persona: reviewerPersona,
+    knowledge,
+    brief,
+    cli,
+    cliModels,
+    tierModels,
+    env,
+    workspaceDir,
+    spawnFn,
+    mcpEntry,
+    materializeMcpConfig,
+    materializeKiroAgent,
+    materializeOpenCodeConfig,
+    materializeCodexHome,
+    cleanupCodexHome,
+    withOpenCodeStore,
+    executionId,
+    projectId,
+    intentId,
+    stageInstanceId,
+    unitSlug,
+    sectionIndex,
+    ids,
+    maxTurns,
+  });
+  // Only a thrown dispatch (materialize/spawn) propagates, to the per-round
+  // `.catch` that records `v2.review.failed`. A non-zero CLI exit does not: the
+  // reviewer may have submitted its verdict before exiting, so it is read below.
+  if (!dispatch.ok && dispatch.detail instanceof Error) throw dispatch.detail;
   const verdict = await latestReviewerVerdict({
     store,
     executionId,
@@ -568,17 +617,21 @@ const summarizeSensorDetail = (detail) => {
 // provenance. One unknown repository widens the whole workspace scan because a
 // failed Git collection may hide a relevant path in any sensor's match set.
 const changedFileProvenanceFromGitResults = (results = []) =>
-  mergeChangedFileProvenance(
-    results.map((result) => ({
-      source: result.repo ?? 'unknown repository',
-      provenance:
-        result.provenance ?? unknownChangedFileProvenance('missing_repository_provenance'),
-    })),
-  );
+  results.length === 0
+    ? unknownChangedFileProvenance('no_repository_results')
+    : mergeChangedFileProvenance(
+        results.map((result) => ({
+          source: result.repo ?? 'unknown repository',
+          provenance:
+            result.provenance ?? unknownChangedFileProvenance('missing_repository_provenance'),
+        })),
+      );
 
-// Run the stage's deterministic sensors after the agent finishes. Records a
-// SensorRun verdict + broadcasts an `agent.note` per sensor. Returns a
-// human-readable reason string when a BLOCKING sensor held the stage, else null.
+// Run the stage's deterministic sensors. Records a SensorRun verdict +
+// broadcasts an `agent.note` per sensor, and returns
+// `{ held, verdicts }` — `held` is a human-readable reason string when a
+// blocking verdict or a release integrity failure held the stage (else null),
+// `verdicts` is the raw list the gate plane turns into findings.
 // `graph` sensors need a graph-writer; we open the same private graph the rest
 // of run-stage uses (best-effort — an unreachable graph yields INCONCLUSIVE
 // graph verdicts, never a crash).
@@ -598,6 +651,8 @@ const runStageSensors = async ({
   spawnFn,
   store,
   publish,
+  changedFiles = null,
+  planes = null,
 }) => {
   let graph = null;
   let gConn = null;
@@ -624,6 +679,8 @@ const runStageSensors = async ({
       spawnFn,
       store,
       publish,
+      changedFiles,
+      planes,
     });
   } finally {
     await closeGraphSource(gConn);
@@ -665,6 +722,8 @@ const runSensorsWithGraph = async ({
   spawnFn,
   store,
   publish,
+  changedFiles = null,
+  planes = null,
 }) => {
   const runner = createSensorRunner({
     graph,
@@ -685,6 +744,8 @@ const runSensorsWithGraph = async ({
     outputArtifacts: stage.outputArtifacts ?? [],
     inputArtifacts: stage.inputArtifacts ?? [],
     stageId: stage.stageId,
+    changedFiles,
+    planes,
   });
 
   const heldReasons = [];
@@ -734,15 +795,537 @@ const runSensorsWithGraph = async ({
     }
     if (v.held) heldReasons.push(`${v.sensorId}=${v.result}`);
   }
-  return heldReasons.length ? heldReasons.join(', ') : null;
+  return { held: heldReasons.length ? heldReasons.join(', ') : null, verdicts };
+};
+
+// ── Change control ──────────────────────────────────────────────────────────
+// Upstream keys change control off its own state files; the platform keys it off
+// the fingerprints a `RECEIPT#stage-approval` recorded when the PRODUCING stage
+// was approved. Everything below is pure so the comparison and the answer
+// parsing are unit-testable without a graph, a store, or a CLI.
+
+// The gate is opened BEFORE the agent, so it is the one human task on a stage
+// that has no parked conversation behind it. The prefix is how the resume leg
+// recognizes that and re-enters fresh instead of demanding a session that never
+// existed; the id is deterministic per attempt so a re-drive reuses the gate
+// rather than opening a second one, and a rewind (which bumps attempt) asks again.
+const CHANGE_CONTROL_GATE_PREFIX = 'cc-';
+const CHANGE_CONTROL_OPTIONS = Object.freeze([
+  'Reconfirm and continue',
+  'Stop here so I can rewind',
+]);
+
+const changeControlGateId = (stageInstanceId, attempt, fingerprint = null) =>
+  `${CHANGE_CONTROL_GATE_PREFIX}${stageInstanceId}-${attempt}${
+    fingerprint ? `-${fingerprint}` : ''
+  }`;
+
+// The identity of the inputs a change-control decision is ABOUT: each changed
+// input's logical key (its type when the comparison could not read one) paired
+// with the fingerprint that was observed. The question and the reconfirmation
+// receipt are both bound to it, so a decision taken about one set of bytes can
+// never authorize a run against another — neither a later revision of the same
+// input nor a change that lands while the question is still pending.
+const changeControlFingerprint = (changedInputs = []) =>
+  createHash('sha256')
+    .update(
+      JSON.stringify(
+        (changedInputs ?? [])
+          .map(
+            (changed) =>
+              `${changed?.logicalKey ?? changed?.artifactType ?? changed?.artifactId ?? ''}\u0000${
+                changed?.toHash ?? 'unavailable'
+              }`,
+          )
+          .toSorted(),
+      ),
+    )
+    .digest('hex')
+    .slice(0, 16);
+
+const isChangeControlGate = (gate) =>
+  typeof gate?.humanTaskId === 'string' && gate.humanTaskId.startsWith(CHANGE_CONTROL_GATE_PREFIX);
+
+// A build-and-test gate answered `loop-back` sends the run back to this
+// code-generation stage. The gate belongs to another stage, whose reset left this
+// row with no session, so the stage runs fresh with the answer in its prompt.
+//
+// Keyed on the ENGINE's offer, never on what the human typed: `loopBackTarget` is
+// written only by `awaitEngineGate`/`createHumanTask`, and only when the gate
+// actually offered the jump, and it names the stage the walk rewound to. Requiring
+// it to name THIS stage is what stops a `loop-back` string in any answer field of
+// any other gate — a `question` gate's `freeText`, for instance — from skipping the
+// `resume_no_session` guard below and re-entering a stage as a fresh run.
+const isLoopBackAnswer = (gate, stageId) =>
+  typeof gate?.loopBackTarget === 'string' &&
+  gate.loopBackTarget === stageId &&
+  parseChoice(gate?.answer, [LOOP_BACK_OPTION]) !== null;
+
+// The approved inputs whose bytes moved since an approval recorded them.
+// Identity is the artifact's LOGICAL key, not its type: a stage may consume
+// several artifacts of one type, and comparing by type would report the wrong
+// one as changed. An input no approval ever recorded is not "changed" — there is
+// nothing to have changed FROM.
+const changedApprovedInputs = ({ requiredInputs = [], heads = [], approvals = [] }) => {
+  const approvedByKey = new Map();
+  let latestTruncatedApprovalAt = null;
+  for (const receipt of approvals) {
+    const decidedAt = String(receipt.decidedAt ?? receipt.sk ?? '');
+    if (
+      receipt?.detail?.approvedInputsTruncated === true &&
+      (!latestTruncatedApprovalAt || decidedAt >= latestTruncatedApprovalAt)
+    ) {
+      latestTruncatedApprovalAt = decidedAt;
+    }
+    for (const input of receipt?.detail?.approvedInputs ?? []) {
+      if (!input?.logicalKey || !input?.snapshotHash) continue;
+      const seen = approvedByKey.get(input.logicalKey);
+      if (!seen || decidedAt >= seen.decidedAt) {
+        approvedByKey.set(input.logicalKey, { snapshotHash: input.snapshotHash, decidedAt });
+      }
+    }
+  }
+  const wanted = new Set(requiredInputs);
+  return heads
+    .filter((head) => wanted.has(head.artifactType))
+    .map((head) => {
+      const approved = approvedByKey.get(head.logicalKey) ?? null;
+      const approvalHistoryUnknown =
+        latestTruncatedApprovalAt != null &&
+        (!approved || latestTruncatedApprovalAt >= approved.decidedAt);
+      return { head, approved, approvalHistoryUnknown };
+    })
+    .filter(
+      ({ head, approved, approvalHistoryUnknown }) =>
+        approvalHistoryUnknown || (approved && approved.snapshotHash !== head.snapshotHash),
+    )
+    .map(({ head, approved, approvalHistoryUnknown }) => ({
+      artifactId: head.artifactId,
+      artifactType: head.artifactType,
+      logicalKey: head.logicalKey,
+      fromHash: approvalHistoryUnknown ? null : approved.snapshotHash,
+      toHash: head.snapshotHash,
+      approvedAt: approvalHistoryUnknown ? latestTruncatedApprovalAt : approved.decidedAt || null,
+      ...(approvalHistoryUnknown ? { approvalHistoryUnknown: true } : {}),
+    }));
+};
+
+// Which of the two offered options the human chose. `null` means the answer did
+// not name either one. The caller HALTS on that (recoverable via rewind) rather
+// than inferring a reconfirmation: strict change control exists to stop a stage
+// running against moved inputs without an explicit yes, and a garbled answer is
+// not a yes.
+const changeControlChoice = (gate) => {
+  const answer = gate?.answer ?? null;
+  const text =
+    typeof answer === 'string'
+      ? answer
+      : (answer?.perQuestion?.[0]?.answer ?? answer?.freeText ?? answer?.decision ?? '');
+  const normalized = String(text ?? '').toLowerCase();
+  if (normalized.includes('stop')) return 'stop';
+  if (normalized.includes('reconfirm') || normalized.includes('continue')) return 'reconfirm';
+  return null;
+};
+
+// The prompt section a changed approved input adds. `relaxed` states the change
+// and continues; `strict` states that the human already reconfirmed it, so the
+// agent knows the divergence was accepted deliberately rather than missed.
+// A fingerprint the comparison could not read is rendered as such. A null hash is
+// a real state here — an unreadable approval or artifact history records no
+// fingerprints at all — and the documented behaviour for it is to state the gap
+// and continue (relaxed) or ask about it (strict), never to crash before the
+// agent runs.
+const shortFingerprint = (hash) =>
+  typeof hash === 'string' && hash ? hash.slice(0, 12) : 'unavailable';
+
+const renderChangedInputs = (changed, { reconfirmed = false } = {}) => {
+  if (!changed.length) return '';
+  const artifactHistoryReadFailed = changed.some((item) => item.artifactHistoryReadFailed);
+  // The heading speaks for the WHOLE list, so it only claims the approval history was
+  // unreadable when that is true of every item; a mixed list keeps the generic
+  // heading and the per-item lines say which is which.
+  const approvalHistoryReadFailed = changed.every((item) => item.approvalHistoryReadFailed);
+  const lines = changed.map((item) =>
+    item.artifactHistoryReadFailed
+      ? `- ${item.artifactType ?? item.artifactId}: current artifact history could not be read`
+      : item.approvalHistoryReadFailed
+        ? `- ${item.artifactType ?? item.artifactId}: approval history could not be read, so no approved fingerprint is known`
+        : item.approvalHistoryUnknown
+          ? `- ${item.artifactType ?? item.artifactId} has incomplete approval history (receipt size limit); current fingerprint ${shortFingerprint(item.toHash)}`
+          : `- ${item.artifactType ?? item.artifactId} changed since it was approved (${shortFingerprint(item.fromHash)} → ${shortFingerprint(item.toHash)})`,
+  );
+  return [
+    artifactHistoryReadFailed
+      ? '## Artifact history could not be read'
+      : approvalHistoryReadFailed
+        ? '## Approval history could not be read'
+        : '## Inputs that changed since they were approved',
+    '',
+    ...lines,
+    '',
+    reconfirmed
+      ? 'The human reconfirmed the current state of these inputs and asked you to continue. Read the CURRENT content of each one — not a remembered version — and say in your output where it affected your work.'
+      : 'Read the CURRENT content of each one — not a remembered version — and say in your output where the change affected your work.',
+  ].join('\n');
+};
+
+// ── The checkpoint completion ladder ────────────────────────────────────────
+//
+// Runs after the agent finishes and BEFORE the sensor pass, so a stage that never
+// obtained its authorization never burns a reviewer session.
+//
+// Every outcome is one of exactly three (the anti-stuck contract): proceed, a
+// human gate carrying an overridable blocking finding, or a rewind-eligible
+// fail(). The repair turn is capped at ONE per attempt on a PERSISTED counter,
+// because an uncapped repair loop is the classic stuck path.
+const CHECKPOINT_FINDING_CODES = Object.freeze([
+  'summary_confirmation_missing',
+  'summary_confirmation_stale',
+  'plan_approval_missing',
+]);
+
+// Which persisted counter bounds the repair turn for a given finding, which event
+// records the unresolved state, and which tool the agent must call to fix it.
+const CHECKPOINT_LADDER = Object.freeze({
+  summary_confirmation_missing: {
+    counter: 'summaryRepairAttempts',
+    event: 'v2.summary.noncompliant',
+    tool: 'confirm_summary',
+  },
+  summary_confirmation_stale: {
+    counter: 'summaryRepairAttempts',
+    event: 'v2.summary.noncompliant',
+    tool: 'confirm_summary',
+  },
+  plan_approval_missing: {
+    counter: 'planApprovalRepairAttempts',
+    event: 'v2.plan.noncompliant',
+    tool: 'request_plan_approval',
+  },
+});
+
+// The newest recorded commit for this stage attempt, or null when the stage wrote
+// no code at all. Plan Approval's enforcement seam is boundary LINEAGE, not
+// interception: we cannot block the write, so we require the commit to be newer
+// than the approval. A stage with no commit has nothing to have written
+// unauthorized, so the receipt alone satisfies it.
+const latestCommitAt = (events) =>
+  (events ?? [])
+    .filter((event) => eventTypeOf(event) === 'v2.git.pushed')
+    .map((event) => String(event.timestamp ?? ''))
+    .toSorted()
+    .at(-1) ?? null;
+
+// Drop a plan-approval receipt the stage's own commit predates, so the shared
+// evaluator reports it exactly as it reports an absent one. Reusing the evaluator
+// rather than hand-rolling a second finding keeps ONE definition of the finding
+// shape, severity and remediation.
+const withPlanApprovalLineage = (receipts, events) => {
+  const commitAt = latestCommitAt(events);
+  if (!commitAt) return receipts;
+  return receipts.filter(
+    (row) => row?.kind !== 'plan-approval' || commitAt > String(row.decidedAt ?? ''),
+  );
+};
+
+const readCheckpointFindings = async ({
+  store,
+  executionId,
+  stageInstanceId,
+  stage,
+  policy,
+  attempt,
+  validationRound = 0,
+}) => {
+  // Tolerant of a store without the receipt family (older injected test doubles,
+  // and any deployment mid-rollout): no evidence store means no evidence to judge,
+  // and a crash here would fail a stage for a reason the human cannot act on.
+  const [receipts, allEvents] = await Promise.all([
+    typeof store.listReceipts === 'function'
+      ? store.listReceipts(executionId, { stageInstanceId, attempt }).catch(() => [])
+      : [],
+    typeof store.listEvents === 'function' ? store.listEvents(executionId).catch(() => []) : [],
+  ]);
+  const events = allEvents.filter((event) => event.stageInstanceId === stageInstanceId);
+  const { findings } = evaluateGatePreconditions({
+    stage,
+    policy,
+    attempt,
+    validationRound,
+    receipts: withPlanApprovalLineage(receipts, events),
+    events,
+  });
+  return findings.filter((finding) => CHECKPOINT_FINDING_CODES.includes(finding.code));
+};
+
+// The deterministic repair message. It names the missing evidence and the exact
+// remedy — a vague "you did not comply" wastes the one turn the ladder allows.
+const repairMessage = (findings) =>
+  [
+    'STAGE OUTPUT REJECTED — a required authorization is missing.',
+    '',
+    ...findings.map((finding) => `- ${finding.title}. ${finding.remediation ?? ''}`.trimEnd()),
+    '',
+    'Fix this NOW, in this order:',
+    ...[...new Set(findings.map((finding) => CHECKPOINT_LADDER[finding.code]?.tool))]
+      .filter(Boolean)
+      .map((tool) => `1. Call \`${tool}\` and obtain the affirmative answer.`),
+    '2. Re-save EVERY required output artifact afterwards (create_artifact /',
+    '   update_artifact), so each write is recorded under that authorization.',
+    '',
+    'This is your only opportunity to correct it: if the evidence is still missing',
+    'afterwards the stage is handed to the human with this finding attached.',
+  ].join('\n');
+
+// The message that re-enters the lead's conversation between adversarial reviewer
+// rounds. The reviewer's findings are agent-authored text reaching another session,
+// so the runtime-managed template tokens are neutralized like every other body
+// that crosses a session boundary.
+const reviewerRepairMessage = ({ reviewerAgent, round, reviewerFindings }) =>
+  [
+    `REVIEW ROUND ${round} — ${reviewerAgent} returned NOT-READY.`,
+    '',
+    'Findings:',
+    neutralizeTokens(reviewerFindings) || '(no findings text recorded)',
+    '',
+    'Address every finding NOW and re-save the stage output artifacts',
+    '(create_artifact / update_artifact) so the next review reads your revision.',
+    'Do not argue with the reviewer and do not ask the human: fix what you can and',
+    'say plainly in the output what you did not change and why.',
+  ].join('\n');
+
+// The WP2 durability rule as data: the failure a git result must turn into when
+// new work is at risk, or null. Shared by the stage commit and the repair-turn
+// commits so a repair cannot finish the stage with unpushed work.
+const workAtRiskFailure = (gitResult) => {
+  const atRiskRepos = gitResult?.ok
+    ? []
+    : (gitResult?.results ?? []).filter(
+        (r) =>
+          (r.committed === true &&
+            r.pushed !== true &&
+            r.pushed !== 'empty' &&
+            r.pushed !== 'up_to_date') ||
+          (r.committed !== true && (r.dirty === true || r.reason === 'engine_crashed')),
+      );
+  if (atRiskRepos.length === 0) return null;
+  const detail = atRiskRepos
+    .map(
+      (r) =>
+        `${r.repo}: ${r.reason ?? 'push_failed'}${r.detail ? ` — ${String(r.detail).slice(0, 300)}` : ''}`,
+    )
+    .join('; ');
+  const uncommitted = atRiskRepos.some((r) => r.committed !== true);
+  // 'push_failed' keeps its v1 meaning (commit exists, push did not land);
+  // 'git_commit_failed' is the new durability failure (work never became a
+  // commit at all — the loss mode the engine exists to close).
+  return { code: uncommitted ? 'git_commit_failed' : 'push_failed', detail };
+};
+
+// The post-agent sensor pass. Release mode splits the sensors into a write pass
+// here (narrowed to the attempt's changed files) and a gate pass after the
+// reviewer. An unpinned run has no gate pass, so it keeps the single pass over
+// every sensor on the whole workspace.
+const postAgentSensorPass = ({ methodologyRelease, attemptChangedFiles }) =>
+  methodologyRelease
+    ? { planes: ['write'], changedFiles: attemptChangedFiles }
+    : { planes: null, changedFiles: null };
+
+// Whether this dispatch ends at a validation gate that shows the stage's
+// findings. Unit-lane stages do not: the lane merges on its own outcome and the
+// batch gate after it carries no per-stage findings, so a blocking finding on a
+// lane must fail the stage instead of riding a result nobody reads.
+const stageHasHumanGate = ({ stage, unitSlug = null }) =>
+  stage?.humanValidation === 'required' && !unitSlug;
+
+/**
+ * Enforce the checkpoint policy for a finished stage.
+ *
+ * `runRepairTurn` re-enters the SAME CLI session with a message and resolves once
+ * the agent's turn ends; it is injected so the ladder is testable without a CLI,
+ * and may be null when no resumable session exists (then the ladder skips straight
+ * to the gate/fail rung rather than pretending a repair happened).
+ *
+ * Returns `{ findings }` to carry to the gate, or `{ failure }` when the stage has
+ * no human gate to carry them to.
+ */
+const runCheckpointLadder = async ({
+  store,
+  executionId,
+  stageInstanceId,
+  unitSlug,
+  sectionIndex,
+  stage,
+  policy,
+  stageLabel,
+  runRepairTurn = null,
+  // Whether a repair turn may START now (the stage wall-clock budget). A refusal
+  // takes the same path as "no resumable session": straight to the gate/fail rung,
+  // with `onRepairSkipped` recording why.
+  repairAllowed = () => true,
+  onRepairSkipped = async () => {},
+  pendingGate = null,
+  validationRound = 0,
+  logger: log = logger,
+}) => {
+  if (!policy) return { findings: [] };
+  if (typeof store.listReceipts !== 'function') return { findings: [] };
+  const parkedBeforeLadder = await pendingGate?.();
+  if (parkedBeforeLadder) return { findings: [], parked: parkedBeforeLadder };
+  const stageRow = await store.getStage(executionId, stageInstanceId).catch(() => null);
+  const attempt = Number(stageRow?.attempt ?? 0);
+  const read = () =>
+    readCheckpointFindings({
+      store,
+      executionId,
+      stageInstanceId,
+      stage,
+      policy,
+      attempt,
+      validationRound,
+    });
+
+  let findings = await read();
+  if (findings.length === 0) return { findings: [] };
+
+  // One bounded repair turn per counter per validation revision. The counter on
+  // the STAGE# row is raised to revision + 1 by a conditional write, so a
+  // re-invoked runner (or a concurrent one) cannot claim a second turn in the
+  // same revision, and a rewind (which resets the counters) starts over.
+  const counters = [
+    ...new Set(findings.map((finding) => CHECKPOINT_LADDER[finding.code]?.counter).filter(Boolean)),
+  ];
+  const repairBudget = Number(validationRound ?? 0) + 1;
+  let alreadyRepaired = counters.some(
+    (counter) => Number(stageRow?.[counter] ?? 0) >= repairBudget,
+  );
+  const budgetAllowsRepair = runRepairTurn && !alreadyRepaired ? repairAllowed() : true;
+  if (!budgetAllowsRepair) await onRepairSkipped();
+  if (runRepairTurn && !alreadyRepaired && budgetAllowsRepair) {
+    const parkedBeforeRepair = await pendingGate?.();
+    if (parkedBeforeRepair) return { findings, parked: parkedBeforeRepair };
+    let counterPersistenceFailed = false;
+    for (const counter of counters) {
+      const raised = await Promise.resolve(
+        store.raiseStageCounter?.({
+          executionId,
+          stageInstanceId,
+          field: counter,
+          to: repairBudget,
+        }),
+      ).catch((error) => {
+        counterPersistenceFailed = true;
+        log.error('checkpoint repair counter not persisted', { error, counter });
+      });
+      if (raised === false) alreadyRepaired = true;
+    }
+    if (counterPersistenceFailed) {
+      return {
+        failure: {
+          code: findings[0].code,
+          detail: `checkpoint repair counter could not be persisted; rewind before retrying ${stageLabel}`,
+        },
+      };
+    }
+    if (!alreadyRepaired) {
+      await store
+        .appendEvent({
+          executionId,
+          type: 'v2.checkpoint.repair_requested',
+          stageInstanceId,
+          unitSlug,
+          sectionIndex,
+          actor: 'agentcore',
+          summary: `Stage ${stageLabel} re-entered once for: ${findings
+            .map((finding) => finding.code)
+            .join(', ')}`,
+          detail: { codes: findings.map((finding) => finding.code), attempt },
+        })
+        .catch(() => {});
+      const parkedBeforeResume = await pendingGate?.();
+      if (parkedBeforeResume) return { findings, parked: parkedBeforeResume };
+      await runRepairTurn(repairMessage(findings)).catch((error) =>
+        log.error('checkpoint repair turn failed', { error }),
+      );
+      const parkedAfterRepair = await pendingGate?.();
+      if (parkedAfterRepair) return { findings, parked: parkedAfterRepair };
+      findings = await read();
+      if (findings.length === 0) return { findings: [] };
+    }
+  }
+
+  for (const code of new Set(findings.map((finding) => finding.code))) {
+    await store
+      .appendEvent({
+        executionId,
+        type: CHECKPOINT_LADDER[code]?.event ?? 'v2.checkpoint.noncompliant',
+        stageInstanceId,
+        unitSlug,
+        sectionIndex,
+        actor: 'agentcore',
+        summary: `Stage ${stageLabel} completed without the required authorization (${code})`,
+        detail: { code, attempt },
+      })
+      .catch(() => {});
+  }
+
+  // A stage WITH a human gate carries the blocking finding there: the human can
+  // approve (waiving it on the record), request changes, or override. A stage
+  // WITHOUT one has no human to ask, so it fails with a rewind-eligible code
+  // rather than succeeding with the semantic silently missing.
+  if (stageHasHumanGate({ stage, unitSlug })) return { findings };
+  return {
+    failure: {
+      code: findings[0].code,
+      detail: findings.map((finding) => finding.title).join('; '),
+    },
+  };
 };
 
 // Render an answered gate into the message that re-enters the parked conversation.
 // The agent asked structured questions; we feed back the human's answer so it
 // continues from where it parked. Tolerant of the answer shapes the resume lambda
 // / phaseb-answer write (`perQuestion[]`, `freeText`, or a raw string).
-const formatResumeAnswer = (gate) => {
+const formatResumeAnswer = (gate, stageId) => {
   const a = gate?.answer ?? null;
+  // A checkpoint gate (summary confirmation / plan approval) is a `question` row
+  // carrying `detail.checkpoint`, so it must be recognised BEFORE the generic
+  // question branch: the agent needs to know which of the two decisions it got
+  // and what that obliges it to do next, not just "the human answered".
+  const checkpoint = gate?.detail?.checkpoint ?? null;
+  if (checkpoint) {
+    // The same label parser and labels the bridge uses to decide whether a
+    // receipt is written, so this message never contradicts the receipt.
+    const label = chosenLabel(a);
+    const approved = label === CHECKPOINTS[checkpoint]?.approve;
+    const free = typeof a === 'string' ? '' : (a?.freeText ?? a?.feedback ?? '');
+    if (approved) {
+      return (
+        `The human answered the ${checkpoint} checkpoint: "${label}".` +
+        `${free ? `\nThey added: ${free}` : ''}\n\n` +
+        (checkpoint === 'plan-approval'
+          ? 'Your plan is approved and the approval is recorded. Implement it now.'
+          : 'Your summary is confirmed and the authorization is recorded. Record your stage ' +
+            'output artifacts NOW (create_artifact / update_artifact) so each one is written ' +
+            'under this authorization, then finish.')
+      );
+    }
+    return (
+      `The human answered the ${checkpoint} checkpoint: "${label}" — nothing is authorized yet.` +
+      `${free ? `\nWhat they want changed: ${free}` : ''}\n\n` +
+      `Revise accordingly, then call ${
+        checkpoint === 'plan-approval' ? '`request_plan_approval`' : '`confirm_summary`'
+      } again with the revision.`
+    );
+  }
+  if (isLoopBackAnswer(gate, stageId)) {
+    const feedback = typeof a === 'string' ? '' : (a?.feedback ?? a?.freeText ?? '');
+    return (
+      `Build-and-test sent this work back to you: ${gate.loopBackReason || 'no reason recorded'}.` +
+      `${feedback ? `\nThe reviewer added: ${feedback}` : ''}\n\n` +
+      'Revise the generated code to address this, then finish again.'
+    );
+  }
   // Validation gates AND engine gates answered request-changes (skeleton /
   // batch revision loops, docs/v2-parallel.md WP5) both re-enter the stage as
   // a REVISION with the human's feedback.
@@ -916,28 +1499,67 @@ export const isBenignKiroEmptyCompletion = (stderrTail = '') => {
   return !transportCause.test(s);
 };
 
-// Return THIS stage's still-pending HUMAN gate. Stage ownership is the source
-// of truth because one META pointer cannot represent concurrent lane questions.
-// The META fallback supports old rows, but only when the gate names this exact
-// stage; a sibling's question can therefore never park the current stage.
-const pendingGate = async ({ store, executionId, stageInstanceId, unitSlug, sectionIndex }) => {
-  const stage = await store.getStage(executionId, stageInstanceId).catch(() => null);
+// Return the HUMAN gate still owned by THIS stage at CLI exit. Stage ownership
+// is the source of truth because one META pointer cannot represent concurrent
+// lane questions. The META fallback supports old rows, but only when the gate
+// names this exact stage; a sibling's question can therefore never park the
+// current stage.
+//
+// Deliberately do NOT require gate.status === 'pending'. The human answer can
+// land after ask_question's grace window but before the CLI exits. In that
+// window the stage row still owns the gate and the conversation still needs a
+// resume turn with the answer; treating the answered gate as absent would let
+// the stage continue to sensors/success without ever delivering the answer.
+const ownedGateAtExit = async ({ store, executionId, stageInstanceId, unitSlug, sectionIndex }) => {
+  const stage = await store
+    .getStage(executionId, stageInstanceId, { consistentRead: true })
+    .catch(() => null);
   let humanTaskId = stage?.pendingHumanTaskId ?? null;
   if (!humanTaskId) {
-    const meta = await store.getExecution(executionId).catch(() => null);
+    const meta = await store.getExecution(executionId, { consistentRead: true }).catch(() => null);
     humanTaskId = meta?.pendingHumanTaskId ?? null;
   }
   if (!humanTaskId) return null;
-  const gate = await store.getHumanTask(executionId, humanTaskId).catch(() => null);
-  const ownsStage = gate?.stageInstanceId === stageInstanceId;
-  const ownsUnit = (gate?.unitSlug ?? null) === (unitSlug ?? null);
-  const ownsSection =
-    gate?.sectionIndex == null ||
-    sectionIndex == null ||
-    Number(gate.sectionIndex) === Number(sectionIndex);
+  const gate = await store
+    .getHumanTask(executionId, humanTaskId, { consistentRead: true })
+    .catch(() => null);
+  if (!gate || (gate.status !== 'pending' && !isHumanTaskAnswerStatus(gate.status))) {
+    return null;
+  }
   // createdAt rides along for wait accounting: the park's parkedAt is the ASK
   // moment, not the (later) CLI exit.
-  return gate && gate.status === 'pending' && ownsStage && ownsUnit && ownsSection
+  return humanTaskMatchesOwner({ task: gate, stageInstanceId, unitSlug, sectionIndex })
+    ? { humanTaskId, createdAt: gate.createdAt ?? null }
+    : null;
+};
+
+// Return this stage's pending gate, including an answer that landed while the
+// CLI was shutting down. Consistent reads and the shared ownership predicate
+// keep a sibling lane's single META pointer from parking this stage.
+const pendingGate = async ({ store, executionId, stageInstanceId, unitSlug, sectionIndex }) => {
+  const stage = await store
+    .getStage(executionId, stageInstanceId, { consistentRead: true })
+    .catch(() => null);
+  let humanTaskId = stage?.pendingHumanTaskId ?? null;
+  if (!humanTaskId) {
+    const meta = await store.getExecution(executionId, { consistentRead: true }).catch(() => null);
+    humanTaskId = meta?.pendingHumanTaskId ?? null;
+  }
+  if (!humanTaskId) return null;
+  const gate = await store
+    .getHumanTask(executionId, humanTaskId, { consistentRead: true })
+    .catch(() => null);
+  const stageStillParked =
+    stage?.state === 'WAITING_FOR_HUMAN' && stage.pendingHumanTaskId === humanTaskId;
+  const gateStillOwnsPark =
+    gate?.status === 'pending' || (stageStillParked && isHumanTaskAnswerStatus(gate?.status));
+  return gateStillOwnsPark &&
+    humanTaskMatchesOwner({
+      task: gate,
+      stageInstanceId,
+      unitSlug,
+      sectionIndex,
+    })
     ? { humanTaskId, createdAt: gate.createdAt ?? null }
     : null;
 };
@@ -971,6 +1593,20 @@ export const runStage = async (
     workflowVersion,
     aidlcRepoRef = null,
     methodologyPins = null,
+    // Immutable AI-DLC release pinned on the intent's META row (issue #482).
+    // Present => the methodology library and the conductor resolve from that
+    // release closure alone, never from the reseedable SYSTEM rows or the
+    // mutable aidlc-runtime/ prefix. Absent => unchanged legacy resolution.
+    methodologyRelease = null,
+    // Which validation revision of this attempt the dispatch runs (0 first,
+    // +1 per "Request changes" at the stage's validation gate). Sent only for a
+    // stage with a resolved release policy, where the checkpoint receipts are
+    // scoped by it.
+    validationRound = 0,
+    // The gate whose "Request changes" opened this revision, which is NOT the gate
+    // a later leg resumes: a leg parked on a checkpoint or a question resumes from
+    // that gate instead. Absent on an unpinned/2.3.3 run and on revision 0.
+    validationGateId = null,
     scope,
     // Per-run skip overlay (shared/stage-skip.js): intent-level deselections +
     // accumulated gate-time skips, forwarded by the orchestrator on EVERY
@@ -1046,6 +1682,7 @@ export const runStage = async (
   const {
     store,
     loadLibrary,
+    resolveEnsembleTopology = defaultResolveEnsembleTopology,
     loadBlockBody,
     loadBlockScript = async () => '',
     loadConductor = async () => '',
@@ -1092,6 +1729,11 @@ export const runStage = async (
     // Injected for tests; Git remains authoritative after workspace re-clones.
     gitResultForCommitRefs = defaultGitResultForCommitRefs,
     compileContextPack = defaultCompileContextPack,
+    // The artifact content fingerprints change control compares against. Injected
+    // like every other graph reader so the comparison is testable without a real
+    // Gremlin traversal.
+    readArtifactHeadHashes = defaultReadArtifactHeadHashes,
+    archiveArtifactsForStages = defaultArchiveArtifactsForStages,
     // Fetch project custom agent rules (.md bodies) from S3 → written into the
     // selected CLI's native rules dir by the materializer. Injected for tests.
     fetchCustomRules = defaultFetchCustomRules,
@@ -1099,9 +1741,29 @@ export const runStage = async (
     // fail-closed). Injected for tests.
     resolveMcpSecrets = defaultResolveMcpSecrets,
     verifyReviewTargets: recheckReviewTargets = verifyReviewTargets,
+    // The stage wall-clock budget (ensemble-runner STAGE_BUDGET_MS), read against
+    // `nowMs` (epoch ms) and anchored on the start of THIS leg: each runStage call
+    // (a fresh run or a resume) gets its own budget. Injected for tests.
+    nowMs = Date.now,
+    stageBudgetMs = STAGE_BUDGET_MS,
+    // How long this container has been running. The intent's runtime session is
+    // not stopped between serial stages, so a stage can start in a microVM that
+    // is already hours into its `max_lifetime`; the deadline below takes whichever
+    // of the two bounds comes first. Injected for tests.
+    processUptimeMs = () => process.uptime() * 1000,
   } = deps;
 
   const now = () => clock();
+  const stageStartedAtMs = nowMs();
+  const stageDeadlineMs = stageDeadline({
+    startedAtMs: stageStartedAtMs,
+    budgetMs: stageBudgetMs,
+    containerStartedAtMs: stageStartedAtMs - processUptimeMs(),
+  });
+  // A lead repair turn has no timeout of its own, so it is started only while a
+  // full persona session's worth of budget remains; past that it is skipped with a
+  // note rather than risk the runtime killing the container mid-turn.
+  const repairBudgetLeft = () => stageDeadlineMs - nowMs() >= MAX_PERSONA_SESSION_MS;
   const reviewFeedbackPrompt =
     typeof reviewFeedback === 'string' ? reviewFeedback : reviewFeedback?.prompt;
   const reviewFeedbackTargets =
@@ -1150,6 +1812,16 @@ export const runStage = async (
   };
 
   const fail = async (stageInstanceId, reason, detail, { clearPending = false } = {}) => {
+    // Every stage failure gets ONE structured operator line. Without it the only
+    // trace of a FAILED run is a DynamoDB event row, so an operator reading logs
+    // cannot correlate the failure code with the execution that produced it.
+    logger.warn('stage failed', {
+      code: reason,
+      stageId,
+      executionId,
+      stageInstanceId: stageInstanceId ?? null,
+      detail: detail ? String(detail).slice(0, 300) : null,
+    });
     if (stageInstanceId) {
       await store
         .updateStageState({
@@ -1213,6 +1885,14 @@ export const runStage = async (
     await publish({ action: 'agent.note', noteType: 'v2.workspace.disk_low', summary });
   };
 
+  // Release-aware body/script readers. In release mode these verify each
+  // object's sha256 against the closure and THROW on any mismatch; the legacy
+  // readers are unchanged. Everything downstream reads through these so no call
+  // site can accidentally bypass the integrity check.
+  const releaseArg = methodologyRelease ? { methodologyRelease } : undefined;
+  const loadBody = (block) => loadBlockBody(block, releaseArg);
+  const loadScript = (block) => loadBlockScript(block, releaseArg);
+
   // 1. Load the pinned workflow + library, then fold in the project's accrued
   // runtime memory (team knowledge + learning rules) read from Neptune. Learning
   // rules are merged into the workflow/library BEFORE resolution so the existing
@@ -1222,7 +1902,13 @@ export const runStage = async (
   // agentRef, merge, then resolve against the enriched library.
   let loaded;
   try {
-    loaded = await loadLibrary({ workflowId, workflowVersion, methodologyPins, aidlcRepoRef });
+    loaded = await loadLibrary({
+      workflowId,
+      workflowVersion,
+      methodologyPins,
+      aidlcRepoRef,
+      ...(methodologyRelease ? { methodologyRelease } : {}),
+    });
   } catch (error) {
     return fail(null, 'methodology_snapshot_unavailable', error.message);
   }
@@ -1329,6 +2015,59 @@ export const runStage = async (
   const stageLabel = unitSlug ? `${stageId} [unit ${unitSlug}]` : stageId;
 
   if (stage.notImplemented) return fail(stageInstanceId, 'not_implemented', `mode ${stage.mode}`);
+
+  // Stored configs may predate current validation. Check both tiers, as verify-mcp
+  // does, before resolving MCP secrets or launching a CLI (fresh AND resume).
+  for (const tier of ['global', 'project']) {
+    const validation = validateMcpServers(mcpServersByTier?.[tier] ?? {});
+    if (!validation.valid) {
+      // Report field paths, not raw config values that might contain secrets.
+      const fields = validation.issues.map(({ path }) => path || '<root>').join(', ');
+      const httpsHint = validation.issues.some(({ code }) => code === 'https_required')
+        ? ' Remote MCP URLs must use https://.'
+        : '';
+      return fail(
+        stageInstanceId,
+        'mcp_config_error',
+        `Invalid ${tier} MCP configuration at ${fields}.${httpsHint} Correct MCP settings, then retry the intent to reload the corrected configuration.`,
+      );
+    }
+  }
+
+  // Release-authored scope policy can silently REMOVE verification (a reviewer, a
+  // sensor list). Record what it took away so an operator reading the timeline
+  // can see why a stage ran without the checks its stage block declares.
+  const policyEffect = (plan.policyEffects ?? []).find((effect) => effect.stageId === stageId);
+  if (policyEffect) {
+    await store
+      .appendEvent({
+        executionId,
+        type: 'v2.policy.applied',
+        stageInstanceId,
+        unitSlug,
+        sectionIndex,
+        actor: 'agentcore',
+        summary: `Release scope policy lowered verification for ${stageLabel}: review class ${policyEffect.reviewClass}${
+          policyEffect.removedReviewer ? `, reviewer ${policyEffect.removedReviewer} removed` : ''
+        }${
+          policyEffect.removedSensors.length
+            ? `, sensors removed: ${policyEffect.removedSensors.join(', ')}`
+            : ''
+        }`,
+      })
+      // Non-fatal, but NOT silent: this event is the only record that the scope
+      // policy removed verification, so losing it must leave a trace an operator
+      // can correlate with a stage that ran without its declared checks.
+      .catch((error) =>
+        logger.warn('v2.policy.applied event not recorded', error, {
+          stageInstanceId,
+          stageId,
+          reviewClass: policyEffect.reviewClass,
+          removedReviewer: policyEffect.removedReviewer ?? null,
+          removedSensors: policyEffect.removedSensors,
+        }),
+      );
+  }
 
   const agentBlock = library.agentsById[stage.agentRef] ?? null;
 
@@ -1478,16 +2217,99 @@ export const runStage = async (
       stageInstanceId,
     });
     resumeGate = resumeFrom
-      ? await store.getHumanTask(executionId, resumeFrom).catch(() => null)
+      ? await store
+          .getHumanTask(executionId, resumeFrom, { consistentRead: true })
+          .catch(() => null)
       : null;
     if (resumeFrom && !resumeGate) return fail(stageInstanceId, 'gate_not_found', resumeFrom);
     if (resumeFrom && resumeGate.status === 'pending')
       return fail(stageInstanceId, 'gate_not_answered', resumeFrom);
-    const row = await store.getStage(executionId, stageInstanceId).catch(() => null);
+    // The answer reached this stage, so a resume marker the answer path left for
+    // this gate (its first callback send failed) is resolved.
+    if (resumeFrom) {
+      const resumeMeta = await store.getExecution(executionId).catch(() => null);
+      if (resumeMeta?.resumeRequired?.humanTaskId === resumeFrom) {
+        // Conditional: a marker another gate's failed callback wrote in the
+        // meantime is not this stage's to clear.
+        await store
+          .updateExecution({ executionId, resumeRequired: null, ifResumeRequiredFor: resumeFrom })
+          .catch((error) => {
+            if (error?.name !== 'ConditionalCheckFailedException') {
+              logger.error('resume marker not cleared', { error, stageInstanceId });
+            }
+          });
+      }
+    }
+    const row = await store
+      .getStage(executionId, stageInstanceId, { consistentRead: true })
+      .catch(() => null);
     cli = row?.cli ?? null;
     const priorSessionId = row?.cliSessionId ?? null;
-    if ((!cli || !priorSessionId) && !reviewFeedback) {
+    // A gate the ENGINE opened BEFORE the agent ran (change control, §6.3) has no
+    // parked conversation by construction, so demanding a session would fail a
+    // stage that never started one. Re-enter as a fresh run instead: the answer
+    // is already durable and the change-control block below reads it from the
+    // receipt, so nothing is lost and nothing is re-asked.
+    const preAgentGate = isChangeControlGate(resumeGate);
+    const freshFromGate = preAgentGate || isLoopBackAnswer(resumeGate, stageId);
+    if ((!cli || !priorSessionId) && !reviewFeedback && !freshFromGate) {
       return fail(stageInstanceId, 'resume_no_session', `stage has no persisted CLI session`);
+    }
+    // A loop-back is a two-stage rewind in all but name, so it owes the same
+    // artifact history: rewind runs `archiveArtifactsForStages` BEFORE it touches a
+    // stage row, which writes an immutable version of each current head and marks
+    // the head and its HAS_SECTION/HAS_ITEM items superseded. The loop-back only
+    // reset the rows. Left unarchived, `create_artifact` overwrites the pass-0 head
+    // in place (rehabilitation only happens for a superseded head), so the
+    // build-test-results the human acted on and the plan behind them are gone, and
+    // anything pass 1 does not rewrite stays current as if the new attempt had
+    // produced it.
+    //
+    // The orchestrator has no Neptune access, so the archive runs HERE, at the
+    // target's re-run, keyed on the same gate id as the resets, covering BOTH stage
+    // instances — the target this stage is, and the recommender the gate belongs to
+    // — and before the agent writes anything. It fails the stage closed, exactly as
+    // rewind aborts when the snapshot fails: a re-run that silently overwrote
+    // unversioned heads is the loss this guards.
+    if (isLoopBackAnswer(resumeGate, stageId)) {
+      const loopBackId = resumeGate.humanTaskId;
+      if (row?.loopBackArchiveId !== loopBackId) {
+        if (!openGraph) {
+          return fail(
+            stageInstanceId,
+            'loopback_archive_failed',
+            'no graph connection to archive the rewound stages',
+          );
+        }
+        let gArchive = null;
+        try {
+          gArchive = await openGraph();
+          await archiveArtifactsForStages({
+            g: gArchive,
+            intentId,
+            stageInstanceIds: [
+              ...new Set([stageInstanceId, resumeGate.stageInstanceId].filter(Boolean)),
+            ],
+            restartId: `loopback-${loopBackId}`,
+            reason: `Loop-back to ${stageId}: ${resumeGate.loopBackReason || 'no reason recorded'}`,
+            actor: resumeGate.answeredByName || resumeGate.answeredBy || 'unknown',
+          });
+        } catch (error) {
+          logger.error('loop-back artifact archive failed', { error, stageInstanceId });
+          return fail(stageInstanceId, 'loopback_archive_failed', error?.message ?? String(error));
+        } finally {
+          await closeGraphSource(gArchive).catch(() => {});
+        }
+        // Stamped only after the archive completed, so a crash mid-archive retries
+        // the whole archive rather than skipping it.
+        if (typeof store.markLoopBackArchived === 'function') {
+          await store
+            .markLoopBackArchived({ executionId, stageInstanceId, loopBackId })
+            .catch((error) =>
+              logger.error('loop-back archive marker not stamped', { error, stageInstanceId }),
+            );
+        }
+      }
     }
     if (cli && !availableClis.includes(cli)) {
       const detail = credentialFailureDetail({
@@ -1499,8 +2321,16 @@ export const runStage = async (
         return fail(stageInstanceId, 'no_cli', `resume CLI "${cli}" not installed`);
       cli = null;
     }
-    resumeAnswer = reviewFeedbackPrompt || formatResumeAnswer(resumeGate);
-    if (!cli || !priorSessionId) {
+    // A pre-agent gate answer is NOT a reply to the agent: injecting "Reconfirm
+    // and continue" as an answer to a question it never asked would be noise. The
+    // change-control block renders the decision into the prompt instead.
+    resumeAnswer = preAgentGate
+      ? null
+      : reviewFeedbackPrompt || formatResumeAnswer(resumeGate, stageId);
+    // A pre-agent gate re-enters as a fresh run even when the row names a
+    // session: the conversation was never started, and resuming it would send
+    // the CLI neither the stage prompt nor the change-control decision.
+    if (!cli || !priorSessionId || preAgentGate) {
       demotedResume = true;
       cli = selectCli({ requested: requestedCli, availableClis });
       if (!cli) {
@@ -1593,6 +2423,15 @@ export const runStage = async (
     stageAttempt: priorStageRow?.attempt ?? 0,
     role: 'author',
     model,
+    // Carries the resolved policy to the MCP server, which registers the
+    // checkpoint tools it requires and withholds the ones it turns off. Null on
+    // an unpinned/2.3.3 run, which registers exactly today's tool list.
+    policy: stage.policy ?? null,
+    ...(stage.policy && validationRound ? { validationRound } : {}),
+    // The lead's trusted identity under a resolved policy, so graph-writer lets
+    // it write only its OWN contribution — never forge a support's evidence.
+    // Absent on an unpinned/2.3.3 run, whose MCP config stays byte-identical.
+    ...(stage.policy && stage.agentRef ? { agentRef: stage.agentRef } : {}),
   };
 
   let codexHome = null;
@@ -1643,6 +2482,403 @@ export const runStage = async (
       if (recoveryFailure) return recoveryFailure;
     } else if (!restoredOk) {
       logger.error('codex rollout store not configured for resume', { stageInstanceId });
+    }
+  }
+
+  // 2c. Change control — BEFORE the stage is marked RUNNING and before pending
+  // course corrections are consumed, because the point is to decide whether this
+  // stage should run at all against inputs that moved since they were approved.
+  // A park or a halt here therefore leaves the steering rows pending for the run
+  // that does go ahead, and never records a conversation that was not started. Gated on release mode via `stage.policy` (the plan
+  // resolves it only from a verified closure) AND on the field being effective:
+  // `policy.changeControl == null` means neither the scope authored it nor did
+  // the catalog prove it has change control, so nothing here runs and the prompt
+  // is unchanged.
+  //
+  // Three terminal outcomes, no fourth: continue (relaxed, or strict after a
+  // reconfirmation), a two-option human gate (strict, first entry), or
+  // `fail('change_control_halt')` — which the existing rewind API recovers.
+  let changedInputs = [];
+  let changeControlFindings = [];
+  let changeControlMessage = '';
+  if (stage.policy?.changeControl && openGraph) {
+    const ccRow = await store.getStage(executionId, stageInstanceId).catch(() => null);
+    const ccAttempt = Number(ccRow?.attempt ?? priorStageRow?.attempt ?? 0);
+    let heads = [];
+    let gCc = null;
+    let artifactHistoryReadFailed = false;
+    try {
+      gCc = await openGraph();
+      heads = await readArtifactHeadHashes({ g: gCc, intentId });
+    } catch {
+      artifactHistoryReadFailed = true;
+      heads = [];
+    } finally {
+      await closeGraphSource(gCc);
+    }
+    // An unreadable approval history is not "nothing changed": like an
+    // unreadable artifact history it is treated as unknown, which strict mode
+    // asks about before the agent runs.
+    let approvalHistoryReadFailed = false;
+    const approvals = await (
+      store.listReceipts?.(executionId, { kind: 'stage-approval' }) ?? Promise.resolve([])
+    ).catch(() => {
+      approvalHistoryReadFailed = true;
+      return [];
+    });
+    const requiredInputs = (stage.inputArtifacts ?? [])
+      .filter((input) => input?.required !== false && !input?.expectedAbsent)
+      .map((input) => input.artifact ?? input)
+      .filter(Boolean);
+    changedInputs = changedApprovedInputs({
+      requiredInputs,
+      heads,
+      approvals,
+    });
+    if (artifactHistoryReadFailed || approvalHistoryReadFailed) {
+      changedInputs = [...new Set(requiredInputs)].map((artifactType) => ({
+        artifactId: null,
+        artifactType,
+        logicalKey: null,
+        fromHash: null,
+        toHash: null,
+        approvedAt: null,
+        approvalHistoryUnknown: true,
+        ...(artifactHistoryReadFailed
+          ? { artifactHistoryReadFailed: true }
+          : { approvalHistoryReadFailed: true }),
+      }));
+    }
+    if (changedInputs.length > 0) {
+      changeControlFindings = changedInputs.map((changed) => ({
+        code: 'change_control_input_changed',
+        severity: 'advisory',
+        title: changed.artifactHistoryReadFailed
+          ? `Artifact history for ${changed.artifactType} could not be read`
+          : changed.approvalHistoryReadFailed
+            ? `Approval history for ${changed.artifactType} could not be read`
+            : `Approved input ${changed.artifactType ?? changed.artifactId} changed since it was approved`,
+        detail: changed,
+        overridable: false,
+        receiptKind: null,
+        remediation:
+          changed.artifactHistoryReadFailed || changed.approvalHistoryReadFailed
+            ? 'Confirm the stage against the current artifact state.'
+            : 'Confirm the stage still holds against the changed input.',
+      }));
+    }
+    const approvalHistoryUnknown = changedInputs.some((changed) => changed.approvalHistoryUnknown);
+    if (
+      changedInputs.length > 0 &&
+      stage.policy.changeControl === 'relaxed' &&
+      approvalHistoryUnknown
+    ) {
+      for (const changed of changedInputs) {
+        await store
+          .appendEvent({
+            executionId,
+            type: 'v2.change.accepted',
+            stageInstanceId,
+            unitSlug,
+            sectionIndex,
+            actor: 'agentcore',
+            summary: changed.artifactHistoryReadFailed
+              ? `Artifact history for ${changed.artifactType} could not be read; continuing under change_control: relaxed`
+              : changed.approvalHistoryReadFailed
+                ? `Approval history for ${changed.artifactType} could not be read; continuing under change_control: relaxed`
+                : `Approval history for ${changed.artifactType} is incomplete; continuing under change_control: relaxed`,
+            detail: changed,
+          })
+          .catch(() => {});
+      }
+      changeControlMessage = renderChangedInputs(changedInputs);
+    } else if (
+      changedInputs.length > 0 &&
+      stage.policy.changeControl === 'relaxed' &&
+      !approvalHistoryUnknown
+    ) {
+      // Deduplicated on (artifactId, fromHash, toHash): the same change seen by
+      // two consecutive stages is ONE accepted change, not two, and a re-drive of
+      // this step must not add a third.
+      const priorEvents = await store.listEvents?.(executionId).catch(() => []);
+      const already = new Set(
+        (priorEvents ?? [])
+          .filter((event) => eventTypeOf(event) === 'v2.change.accepted')
+          .map(
+            (event) =>
+              `${event.detail?.artifactId}\u0000${event.detail?.fromHash}\u0000${event.detail?.toHash}`,
+          ),
+      );
+      for (const changed of changedInputs) {
+        const identity = `${changed.artifactId}\u0000${changed.fromHash}\u0000${changed.toHash}`;
+        if (already.has(identity)) continue;
+        already.add(identity);
+        await store
+          .appendEvent({
+            executionId,
+            type: 'v2.change.accepted',
+            stageInstanceId,
+            unitSlug,
+            sectionIndex,
+            actor: 'agentcore',
+            summary: `Approved input ${changed.artifactType ?? changed.artifactId} changed since approval; continuing under change_control: relaxed`,
+            detail: changed,
+          })
+          .catch(() => {});
+      }
+      changeControlMessage = renderChangedInputs(changedInputs);
+    } else if (
+      changedInputs.length > 0 &&
+      (stage.policy.changeControl === 'strict' || approvalHistoryUnknown)
+    ) {
+      const ccFingerprint = changeControlFingerprint(changedInputs);
+      const reconfirmed = await (
+        store.listReceipts?.(executionId, {
+          kind: 'change-reconfirm',
+          stageInstanceId,
+          attempt: ccAttempt,
+        }) ?? Promise.resolve([])
+      ).catch(() => []);
+      // A reconfirmation covers the inputs it was taken about and nothing else: a
+      // receipt whose fingerprint no longer matches what this run observed reopens
+      // the decision instead of waving the stage through.
+      if (reconfirmed.some((row) => (row?.detail?.inputsFingerprint ?? null) === ccFingerprint)) {
+        changeControlMessage = renderChangedInputs(changedInputs, { reconfirmed: true });
+      } else {
+        const ccGateId = changeControlGateId(stageInstanceId, ccAttempt, ccFingerprint);
+        const ccGate = await store.getHumanTask(executionId, ccGateId).catch(() => null);
+        const choice = ccGate && ccGate.status !== 'pending' ? changeControlChoice(ccGate) : null;
+        // Anything but an explicit reconfirmation halts: `stop`, and an answer
+        // naming neither option (`choice === null`), which must not be read as
+        // consent to run against the changed inputs.
+        if (ccGate && ccGate.status !== 'pending' && choice !== 'reconfirm') {
+          const producers = [
+            ...new Set(
+              (stage.inputArtifacts ?? [])
+                .filter((input) =>
+                  changedInputs.some((changed) => changed.artifactType === input.artifact),
+                )
+                .flatMap((input) => input.producedBy ?? []),
+            ),
+          ];
+          await store
+            .appendEvent({
+              executionId,
+              type: 'v2.change.halted',
+              stageInstanceId,
+              unitSlug,
+              sectionIndex,
+              actor: ccGate.answeredByName ?? ccGate.answeredBy ?? 'human',
+              summary: `Stage ${stageLabel} halted at change control${
+                choice === 'stop' ? '' : ' (the answer named neither option)'
+              }; rewind to ${producers.join(', ') || 'the producing stage'} to re-approve the changed input(s)`,
+              detail: {
+                changedInputs,
+                producers,
+                ...(choice === 'stop' ? {} : { unparsed: true }),
+              },
+            })
+            .catch(() => {});
+          return fail(
+            stageInstanceId,
+            'change_control_halt',
+            `changed approved input(s) ${changedInputs
+              .map((changed) => changed.artifactType ?? changed.artifactId)
+              .join(', ')}; rewind to ${producers.join(', ') || 'the producing stage'}`,
+            { clearPending: true },
+          );
+        }
+        if (ccGate && ccGate.status !== 'pending') {
+          try {
+            await store.putReceipt({
+              executionId,
+              kind: 'change-reconfirm',
+              stageInstanceId,
+              attempt: ccAttempt,
+              unitSlug,
+              sectionIndex,
+              choice,
+              decidedBy: ccGate.answeredBy ?? null,
+              decidedByName: ccGate.answeredByName ?? null,
+              humanTaskId: ccGateId,
+              detail: { changedInputs, inputsFingerprint: ccFingerprint },
+            });
+          } catch (error) {
+            logger.error('change-control reconfirmation receipt could not be persisted', {
+              error,
+              executionId,
+              stageInstanceId,
+              attempt: ccAttempt,
+            });
+            return fail(
+              stageInstanceId,
+              'change_control_receipt_failed',
+              'could not persist the strict change-control reconfirmation; rewind before retrying',
+              { clearPending: true },
+            );
+          }
+          await store
+            .appendEvent({
+              executionId,
+              type: 'v2.change.reconfirmed',
+              stageInstanceId,
+              unitSlug,
+              sectionIndex,
+              actor: ccGate.answeredByName ?? ccGate.answeredBy ?? 'human',
+              summary: `${ccGate.answeredByName || 'Someone'} reconfirmed ${changedInputs.length} changed approved input(s) for ${stageLabel}`,
+              detail: { changedInputs },
+            })
+            .catch(() => {});
+          changeControlMessage = renderChangedInputs(changedInputs, { reconfirmed: true });
+        } else {
+          if (!ccGate) {
+            // The inputs moved again while an earlier question was still waiting,
+            // so that question is about bytes nobody will run against. Retire it
+            // rather than leaving the team two live change-control gates.
+            const stalePending = ccRow?.pendingHumanTaskId ?? null;
+            if (
+              stalePending &&
+              stalePending !== ccGateId &&
+              isChangeControlGate({ humanTaskId: stalePending })
+            ) {
+              await (
+                store.supersedeHumanTask?.({
+                  executionId,
+                  humanTaskId: stalePending,
+                  supersededBy: ccGateId,
+                }) ?? Promise.resolve()
+              ).catch(() => {});
+            }
+            try {
+              await store.createHumanTask({
+                executionId,
+                humanTaskId: ccGateId,
+                stageInstanceId,
+                unitSlug,
+                sectionIndex,
+                kind: 'question',
+                questions: JSON.stringify([
+                  {
+                    text: artifactHistoryReadFailed
+                      ? `Artifact history for ${changedInputs
+                          .map((changed) => changed.artifactType ?? changed.artifactId)
+                          .join(
+                            ', ',
+                          )} could not be read. Reconfirm before ${stage.stageId} runs against the current artifacts?`
+                      : approvalHistoryReadFailed
+                        ? `Approval history for ${changedInputs
+                            .map((changed) => changed.artifactType ?? changed.artifactId)
+                            .join(
+                              ', ',
+                            )} could not be read. Reconfirm before ${stage.stageId} runs against the current artifacts?`
+                        : approvalHistoryUnknown
+                          ? `Approval history for ${changedInputs
+                              .map((changed) => changed.artifactType ?? changed.artifactId)
+                              .join(
+                                ', ',
+                              )} is incomplete because the approval receipt exceeded its size limit. Reconfirm before ${stage.stageId} runs against the current artifacts?`
+                          : `${changedInputs
+                              .map((changed) => changed.artifactType ?? changed.artifactId)
+                              .join(
+                                ', ',
+                              )} changed since ${changedInputs.length === 1 ? 'it was' : 'they were'} approved. Reconfirm before ${stage.stageId} runs against ${changedInputs.length === 1 ? 'it' : 'them'}?`,
+                    type: 'single',
+                    options: CHANGE_CONTROL_OPTIONS.map((label) => ({ label })),
+                  },
+                ]),
+              });
+            } catch (error) {
+              // Parking on a gate that does not exist would leave the stage
+              // waiting for an answer nobody can give.
+              logger.error('change-control gate could not be created', {
+                error,
+                executionId,
+                stageInstanceId,
+                attempt: ccAttempt,
+              });
+              return fail(
+                stageInstanceId,
+                'change_control_gate_failed',
+                'could not open the strict change-control question; retry the stage',
+                { clearPending: true },
+              );
+            }
+            // Deliberately NOT `v2.question.asked`: that event is the data
+            // `summary_confirmation: if-present` reads as "a conditional question
+            // flow ran", and an engine-opened gate is not the agent asking.
+            await store
+              .appendEvent({
+                executionId,
+                type: 'v2.change.review_requested',
+                stageInstanceId,
+                unitSlug,
+                sectionIndex,
+                actor: 'agentcore',
+                summary: `Change control (strict): ${changedInputs.length} approved input(s) changed; asking before ${stageLabel} runs`,
+                detail: { changedInputs },
+              })
+              .catch(() => {});
+          }
+          if (!unitSlug) {
+            await store
+              .updateExecution({ executionId, status: 'WAITING', pendingHumanTaskId: ccGateId })
+              .catch(() => {});
+          }
+          // No conversation exists yet, so the parked row records none: the
+          // answer re-enters as a fresh run (see `preAgentGate` above).
+          await store.putStage({
+            executionId,
+            stageInstanceId,
+            stageId,
+            unitSlug,
+            sectionIndex,
+            phase: stage.phase,
+            state: 'WAITING_FOR_HUMAN',
+            attempt: priorStageRow?.attempt ?? 0,
+            cli,
+            cliSessionId: null,
+            resolvedModel: model,
+            stageCallbackId,
+            aidlcRepoRef,
+            pendingCodeCommitRefs: retainedCodeCommitRefs,
+            pendingHumanTaskId: ccGateId,
+          });
+          await store
+            .updateStageState({
+              executionId,
+              stageInstanceId,
+              state: 'WAITING_FOR_HUMAN',
+              pendingHumanTaskId: ccGateId,
+              parkedAt: ccGate?.createdAt ?? true,
+              cli,
+            })
+            .catch(() => {});
+          await publish({
+            action: 'agent.question',
+            stageInstanceId,
+            unitSlug,
+            sectionIndex,
+            humanTaskId: ccGateId,
+          }).catch(() => {});
+          await publish({
+            action: 'agent.stage',
+            stageInstanceId,
+            stageId,
+            unitSlug,
+            sectionIndex,
+            state: 'WAITING_FOR_HUMAN',
+          }).catch(() => {});
+          return {
+            ok: true,
+            state: 'WAITING_FOR_HUMAN',
+            stageInstanceId,
+            unitSlug,
+            sectionIndex,
+            humanTaskId: ccGateId,
+            cli,
+          };
+        }
+      }
     }
   }
 
@@ -1851,6 +3087,36 @@ export const runStage = async (
     return { mcpConfigPath };
   };
 
+  // Native ensemble sessions: the authored `pipeline` / `mob`
+  // / `subagent`-with-supports topology becomes REAL per-persona sessions instead
+  // of one agent role-playing everybody. Resolved on BOTH the fresh and resume
+  // legs, because a resume after a mid-ensemble park has to know the topology to
+  // skip the personas that already produced their evidence. Null => the stage
+  // keeps today's single-session behaviour, byte for byte (non-release mode, or
+  // a mode that resolves no support persona). Resolution only reads anything in
+  // release mode, so a failure (an unverifiable support persona body) fails the
+  // stage closed, like any other pinned body.
+  let ensemble = null;
+  // The lead's persona body, reused verbatim for its integration session. Set on
+  // the fresh leg where the prompt is materialized; re-read on a resume leg,
+  // which never materializes a prompt at all.
+  let leadPersonaBody = null;
+  try {
+    ensemble = await resolveEnsembleTopology({
+      stage,
+      library,
+      loadBlockBody: loadBody,
+      methodologyRelease,
+    });
+  } catch (error) {
+    return fail(
+      stageInstanceId,
+      'ensemble_topology_unresolved',
+      `Ensemble topology could not be resolved for ${stageId}: ${error?.message ?? String(error)}`,
+      { clearPending: true },
+    );
+  }
+
   let invocation;
   let prompt = null;
   if (!freshRun) {
@@ -1865,20 +3131,53 @@ export const runStage = async (
     });
   } else {
     const stageBlock = library.stagesById[stageId] ?? {};
-    const [stageBody, agentPersona, conductor] = await Promise.all([
-      loadBlockBody(stageBlock).catch(() => ''),
-      agentBlock ? loadBlockBody(agentBlock).catch(() => '') : Promise.resolve(''),
-      loadConductor(aidlcRepoRef || env.AIDLC_REPO_REF).catch(() => ''),
-    ]);
+    // Release mode does NOT swallow a body failure: the whole point of a pinned
+    // release is that its bytes are the ones that run, so a missing, unreadable,
+    // or digest-mismatched stage/agent body fails the stage instead of degrading
+    // to '' and running the agent on a prompt with no instructions or persona.
+    // Legacy mode keeps its lenient behaviour.
+    const loadPromptBody = methodologyRelease
+      ? loadBody
+      : (block) => loadBody(block).catch(() => '');
+    const conductorLoad = methodologyRelease
+      ? loadConductor(null, { methodologyRelease }).then(
+          (content) => ({ content }),
+          (error) => ({ error }),
+        )
+      : loadConductor(aidlcRepoRef || env.AIDLC_REPO_REF)
+          .catch(() => '')
+          .then((content) => ({ content }));
+    let bodies;
+    try {
+      bodies = await Promise.all([
+        loadPromptBody(stageBlock),
+        agentBlock ? loadPromptBody(agentBlock) : Promise.resolve(''),
+        conductorLoad,
+      ]);
+    } catch (error) {
+      return fail(stageInstanceId, 'methodology_body_unavailable', error?.message ?? String(error));
+    }
+    const [stageBody, agentPersona, conductorResult] = bodies;
+    leadPersonaBody = agentPersona;
+    if (conductorResult.error) {
+      return fail(stageInstanceId, 'conductor_unavailable', conductorResult.error.message);
+    }
+    const conductor = conductorResult.content;
     // Knowledge has two tiers: the authored methodology (library blocks) and the
     // project's accrued team knowledge (already read from Neptune above). Both are
     // injected into the prompt so the agent always receives them; the team tier is
     // also re-readable on demand via the get_team_knowledge MCP tool.
-    const methodology = await loadMethodologyKnowledge({
-      agentRef: stage.agentRef,
-      library,
-      loadBlockBody,
-    });
+    let methodology;
+    try {
+      methodology = await loadMethodologyKnowledge({
+        agentRef: stage.agentRef,
+        library,
+        loadBlockBody: loadBody,
+        methodologyRelease,
+      });
+    } catch (error) {
+      return fail(stageInstanceId, 'methodology_body_unavailable', error?.message ?? String(error));
+    }
     const knowledge = composeKnowledge(methodology, memory.teamKnowledge);
 
     // Resolve rule bodies for the steering doc. A merged learning rule carries its
@@ -1891,7 +3190,7 @@ export const runStage = async (
         const body =
           typeof ruleBlock.body === 'string' && ruleBlock.body
             ? ruleBlock.body
-            : await loadBlockBody(ruleBlock).catch(() => '');
+            : await loadPromptBody(ruleBlock);
         return [id, body];
       }),
     );
@@ -1948,8 +3247,16 @@ export const runStage = async (
       cli,
       customRules: customRuleDocs,
       attachments: attachmentRefs,
+      // AGENT.maxTurns is a release-catalog field; an unpinned run keeps
+      // running without a cap, as it always has.
+      maxTurns: methodologyRelease ? (agentBlock?.maxTurns ?? null) : null,
     });
     prompt = materialized.prompt;
+    // Native ensemble sessions: the lead's own role in the topology, appended so
+    // a stage without one keeps its prompt untouched.
+    if (ensemble) {
+      prompt = `${prompt}\n\n${renderLeadTopologyBrief(ensemble)}`;
+    }
     // Demoted resume (D2): the parked conversation was lost with the wiped mount,
     // so we re-run the stage fresh — but prepend the human's already-given answer
     // so the agent applies it instead of re-asking the same question.
@@ -1961,6 +3268,12 @@ export const runStage = async (
     // the stage body would otherwise have the agent do first.
     if (steeringMessage) {
       prompt = `${steeringMessage}\n\n---\n\n${prompt}`;
+    }
+    // Change control (§6.3): the changed approved inputs lead the prompt, because
+    // reading a stale remembered version of one is the failure the field exists
+    // to prevent.
+    if (changeControlMessage) {
+      prompt = `${changeControlMessage}\n\n---\n\n${prompt}`;
     }
     // The stage materializer already created only the selected CLI's context;
     // pick it up via the driver's contextKey. Older injected test materializers
@@ -1978,6 +3291,7 @@ export const runStage = async (
       model,
       allowedTools: [],
       sessionId: cliSessionId,
+      maxTurns: methodologyRelease ? (agentBlock?.maxTurns ?? null) : null,
       ...mcpKwargs,
     });
 
@@ -2296,6 +3610,377 @@ export const runStage = async (
     }
   }
 
+  // The authoritative commit evidence. `v2.git.pushed` is what the plan-approval
+  // lineage rule (`latestCommitAt` / `withPlanApprovalLineage`) reads to decide
+  // whether the stage's code predates its approval, so EVERY commit of the attempt
+  // must publish it — a repair commit that stayed silent left the lineage check
+  // judging the stage on its pre-approval commit.
+  const publishGitEvidence = async (result, { label = null } = {}) => {
+    if (!result || (!result.committed && result.ok)) return;
+    const failedRepos = (result.results ?? [])
+      .filter((r) => r.pushed !== true && r.pushed !== 'empty' && r.pushed !== 'up_to_date')
+      // Carry the git stderr into the event — the 2026-07 incident's ENOSPC
+      // root cause was invisible because only the reason label was recorded.
+      .map(
+        (r) =>
+          `${r.repo} (${r.reason ?? 'unknown'}${r.detail ? `: ${String(r.detail).slice(0, 300)}` : ''})`,
+      );
+    const scope = label ? `${stageLabel} (${label})` : stageLabel;
+    const gitSummary = result.ok
+      ? `Engine committed + pushed work for ${scope} (${(result.results ?? [])
+          .filter((r) => r.committed)
+          .map((r) => `${r.repo}@${(r.sha ?? '').slice(0, 8)}`)
+          .join(', ')})`
+      : `Engine push failed for ${scope}: ${failedRepos.join(', ')}`;
+    await store
+      .appendEvent({
+        executionId,
+        type: result.ok ? 'v2.git.pushed' : 'v2.git.push_failed',
+        stageInstanceId,
+        unitSlug,
+        sectionIndex,
+        actor: 'agentcore',
+        summary: gitSummary,
+      })
+      .catch(() => {});
+    // Surface a push failure live (agent.note is the timeline-note action the
+    // UI already routes) — the user must see git trouble at stage N, not after
+    // the whole run has burned its tokens.
+    if (!result.ok) {
+      await publish({
+        action: 'agent.note',
+        noteType: 'v2.git.push_failed',
+        stageInstanceId,
+        unitSlug,
+        sectionIndex,
+        summary: gitSummary,
+      });
+    }
+  };
+
+  // ── Native ensemble sessions ───────────────────────────────────────────────
+  // ONE call point. The lead's session has fully wound down (its CLI store is
+  // persisted, its session id captured), and the engine commit has NOT run yet —
+  // so every persona's work, whether it lands in the graph or in the working
+  // tree, is captured by the single commit below.
+  //
+  // Skipped when the lead parked (the human owes it an answer before anybody
+  // enriches its draft) or when the lead did not finish cleanly. Session budget:
+  // these are sequential dispatchPersona sessions, exactly like the reviewer loop
+  // below, so they ride the SAME liveness mechanism — run-stage-start's
+  // background job with its 60s heartbeats, which is what keeps a long stage
+  // distinguishable from a dead container. The heartbeat cannot stop the runtime's
+  // max_lifetime kill, though, so the whole topology runs against the stage's
+  // aggregate deadline (`stageDeadlineMs`): a persona past it becomes a GAP.
+  let ensembleEvidence = null;
+  let stageFindings = [];
+  // A typed release failure on a persona or knowledge body read during the
+  // ensemble sessions below. It fails the stage, but only after the engine
+  // commit, so the lead's work is still made durable.
+  let releaseBodyFailure = null;
+  // The lead-draft commit made before the personas ran, so its refs join the
+  // attempt's even when the ensemble phase then fails or fills the mount.
+  let leadDraftGit = null;
+  if (ensemble) {
+    const leadParked = await pendingGate({
+      store,
+      executionId,
+      stageInstanceId,
+      unitSlug,
+      sectionIndex,
+    });
+    const leadFinished =
+      exitCode === 0 || (cli === 'kiro' && isBenignKiroEmptyCompletion(result?.stderrTail));
+    if (leadParked || !leadFinished) {
+      await store
+        .appendEvent({
+          executionId,
+          type: 'v2.persona.gap',
+          stageInstanceId,
+          unitSlug,
+          sectionIndex,
+          actor: 'agentcore',
+          summary: `Ensemble sessions ${
+            leadParked ? 'deferred until the lead resumes' : 'skipped'
+          } for ${stageId}: the lead session ${
+            leadParked ? 'parked on a question' : `exited ${exitCode}`
+          } before its draft was complete`,
+          detail: {
+            mode: ensemble.mode,
+            role: 'ensemble',
+            reason: leadParked ? 'lead_parked' : 'lead_incomplete',
+          },
+        })
+        .catch(() => {});
+    } else {
+      // The lead's draft becomes durable BEFORE any persona session starts. The
+      // ensemble can run for hours across up to MAX_SUPPORT_PERSONAS × 2 tries
+      // plus the integrator and the dissent rounds, and a persona session may
+      // install dependencies into the same 1 GiB mount — so leaving the draft
+      // uncommitted until the engine commit below would put it in the blast
+      // radius of the documented ENOSPC loss. Same helper and same evidence
+      // event as a repair turn; the engine commit below then captures whatever
+      // the personas added.
+      await warnIfDiskLow('before the lead-draft commit');
+      leadDraftGit = await commitAndPushAll({
+        repos,
+        workspaceDir,
+        branch,
+        gitProvider,
+        repoProviders,
+        projectId,
+        executionId,
+        author: gitAuthor,
+        message: unitSlug
+          ? `aidlc(${stageId}): ${unitSlug} — ${executionId} (lead draft)`
+          : `aidlc(${stageId}): ${executionId} (lead draft)`,
+      }).catch((error) => ({
+        ok: false,
+        committed: false,
+        results: [{ repo: '-', reason: 'engine_crashed', detail: error?.message }],
+      }));
+      const leadDraftRefs = mergeCodeCommitRefs(carriedCodeCommitRefs, leadDraftGit);
+      if (leadDraftRefs.length > 0) retainedCodeCommitRefs = leadDraftRefs;
+      await publishGitEvidence(leadDraftGit, { label: 'lead draft' });
+      // The attempt this leg wrote on the stage row (putStage above).
+      const attempt = Number(priorStageRow?.attempt ?? 0);
+      // The feedback this revision is answering is the VALIDATION gate's answer,
+      // read from that gate by id. `resumeAnswer` is the answer to whatever gate
+      // THIS leg resumes, which on a leg that parked on a checkpoint or a question
+      // is a different gate entirely — passing it would hand the personas the
+      // checkpoint's answer as the human's requested changes. An older
+      // orchestrator sends no id, so that dispatch keeps the previous behaviour.
+      // A gate that cannot be read yields no feedback rather than the wrong one.
+      let revisionFeedback = null;
+      if (validationRound) {
+        if (validationGateId) {
+          const validationGate =
+            validationGateId === resumeFrom
+              ? resumeGate
+              : await store
+                  .getHumanTask(executionId, validationGateId, { consistentRead: true })
+                  .catch(() => null);
+          if (validationGate) revisionFeedback = formatResumeAnswer(validationGate, stageId);
+          else
+            logger.error('validation gate not readable for revision feedback', {
+              stageInstanceId,
+              validationGateId,
+            });
+        } else {
+          revisionFeedback = resumeAnswer ?? null;
+        }
+      }
+      // A resume leg never materialized a prompt, so the lead persona is re-read
+      // here. For a pinned intent a typed release failure (digest mismatch,
+      // unreadable object, unresolvable overlay) must not seat the integration
+      // session on an empty persona: the sessions are skipped and the stage fails
+      // after the commit below. Any other error keeps the lenient fallback.
+      let leadPersona = leadPersonaBody ?? '';
+      if (leadPersonaBody == null && agentBlock) {
+        try {
+          leadPersona = await loadBody(agentBlock);
+        } catch (error) {
+          if (methodologyRelease && isReleaseDependencyError(error)) releaseBodyFailure = error;
+        }
+      }
+      const dispatchContext = {
+        stageId,
+        stageAttempt: attempt,
+        cli,
+        cliModels,
+        tierModels,
+        env,
+        workspaceDir,
+        spawnFn,
+        mcpEntry,
+        materializeMcpConfig,
+        materializeKiroAgent,
+        materializeOpenCodeConfig,
+        materializeCodexHome,
+        cleanupCodexHome,
+        withOpenCodeStore,
+        ids,
+      };
+      const personaScope = { policy: stage.policy ?? null, checkpointOwner: false };
+      // The graph is the evidence channel: a support's contribution counts only
+      // when the row is actually there (upstream §3.6 — artifacts alone never
+      // satisfy, and neither does a session that exited 0 writing nothing). With
+      // no graph we can observe nothing, which honestly reads as "no evidence"
+      // and reaches the human as an advisory finding, never as a failure.
+      // `systemWriter` marks this as the PLATFORM's writer: the only one allowed
+      // to record a gap stub for another persona's contribution.
+      const withGraph = async (operation, fallback) => {
+        if (!openGraph) return fallback;
+        let g = null;
+        try {
+          g = await openGraph();
+          return await operation(
+            createGraphWriter({
+              g,
+              scope: {
+                projectId,
+                intentId,
+                executionId,
+                stageInstanceId,
+                unitSlug,
+                sectionIndex,
+                systemWriter: true,
+              },
+            }),
+          );
+        } catch {
+          return fallback;
+        } finally {
+          await closeGraphSource(g);
+        }
+      };
+      // The module is written never to throw (every internal surprise degrades to a
+      // gap). This is the floor UNDER that: if it ever does, the stage still
+      // SUCCEEDS with the same advisory findings naming every persona, because
+      // these stages already run under the single-session approximation and a
+      // regression here must not block a real intent.
+      let ensembleResult = null;
+      if (releaseBodyFailure) {
+        await store
+          .appendEvent({
+            executionId,
+            type: 'v2.persona.gap',
+            stageInstanceId,
+            unitSlug,
+            sectionIndex,
+            actor: 'agentcore',
+            summary: `Ensemble sessions skipped for ${stageId}: the pinned lead persona could not be verified (${releaseBodyFailure.message})`,
+            detail: {
+              mode: ensemble.mode,
+              role: 'ensemble',
+              reason: 'lead_persona_unavailable',
+              code: releaseBodyFailure.code ?? null,
+              attempt,
+            },
+          })
+          .catch(() => {});
+      }
+      // Skipping keeps ensembleResult null, so no receipts or evidence are recorded.
+      const runSessions = releaseBodyFailure ? async () => null : runEnsembleSessions;
+      try {
+        ensembleResult = await runSessions({
+          topology: ensemble,
+          stage,
+          unit,
+          policy: stage.policy ?? null,
+          personaScope,
+          attempt,
+          validationRound,
+          // On a "Request changes" revision the supports review the lead's
+          // response to the human, so they get the feedback the LEAD got. Resolved
+          // above from the validation gate itself, never from the gate this leg
+          // happens to resume. The PR-feedback lane dispatches with no
+          // validationRound at all, and a change-control gate is answered BEFORE the
+          // agent runs, so neither is ever handed to a persona as rejected-draft
+          // feedback.
+          humanFeedback: revisionFeedback,
+          lead: { persona: leadPersona, block: agentBlock },
+          dispatchContext,
+          knowledgeFor: (agentRef) =>
+            loadMethodologyKnowledge({
+              agentRef,
+              library,
+              loadBlockBody: loadBody,
+              methodologyRelease,
+            }),
+          isFatalLoadError: (error) =>
+            Boolean(methodologyRelease) && isReleaseDependencyError(error),
+          readContributions: () =>
+            withGraph(
+              (writer) =>
+                writer.lookupArtifacts({ artifactType: 'contribution', includeContent: true }),
+              [],
+            ),
+          // The link/integrator evidence channel: the current rows of every declared
+          // output. Compact (no bodies) — the runner only fingerprints them.
+          readStageOutputs: () =>
+            withGraph(async (writer) => {
+              const rows = [];
+              for (const artifactType of (stage.outputArtifacts ?? [])
+                .map((output) => output?.artifact ?? output)
+                .filter(Boolean)) {
+                rows.push(...(await writer.lookupArtifacts({ artifactType }).catch(() => [])));
+              }
+              return rows;
+            }, []),
+          writeGapStub: ({ agentRef, reason }) =>
+            withGraph(
+              (writer) =>
+                writer.createArtifact({
+                  artifactType: 'contribution',
+                  id: contributionArtifactId({ stageId, agentRef }),
+                  title: `Contribution gap: ${agentRef}`,
+                  content: `**Collaborator:** ${agentRef}\n\n## Contribution\n\nNone recorded — ${reason}.\n\n## Positions\n\n(none)\n`,
+                  props: { collaborator: agentRef, status: 'gap', positions: '' },
+                }),
+              null,
+            ),
+          pendingGate: () =>
+            pendingGate({ store, executionId, stageInstanceId, unitSlug, sectionIndex }),
+          store,
+          publish,
+          executionId,
+          projectId,
+          intentId,
+          stageInstanceId,
+          unitSlug,
+          sectionIndex,
+          deadlineMs: stageDeadlineMs,
+          nowMs,
+          logger,
+        });
+      } catch (error) {
+        // A typed release failure the runner rethrew (pinned persona knowledge
+        // that could not be verified) is recorded like any other ensemble error,
+        // and then fails the stage after the commit below.
+        if (methodologyRelease && isReleaseDependencyError(error)) releaseBodyFailure = error;
+        logger.error('ensemble sessions degraded', {
+          stage: stageId,
+          mode: ensemble.mode,
+          msg: error?.message ?? String(error),
+        });
+        await store
+          .appendEvent({
+            executionId,
+            type: 'v2.persona.gap',
+            stageInstanceId,
+            unitSlug,
+            sectionIndex,
+            actor: 'agentcore',
+            summary: `Ensemble sessions failed for ${stageId}: ${error?.message ?? String(error)}`,
+            detail: {
+              mode: ensemble.mode,
+              role: 'ensemble',
+              reason: releaseBodyFailure ? 'persona_knowledge_unavailable' : 'ensemble_error',
+              ...(releaseBodyFailure ? { code: releaseBodyFailure.code ?? null } : {}),
+              attempt,
+            },
+          })
+          .catch(() => {});
+        stageFindings = mergeFindings(
+          stageFindings,
+          ensembleGapFindings({
+            stage,
+            policy: stage.policy ?? null,
+            attempt,
+            validationRound,
+            topology: ensemble,
+            reason: `ensemble sessions failed: ${error?.message ?? String(error)}`,
+          }),
+        );
+      }
+      if (ensembleResult) {
+        ensembleEvidence = ensembleResult.ensembleEvidence;
+        stageFindings = mergeFindings(stageFindings, ensembleResult.findings);
+      }
+    }
+  }
+
   // Engine-owned git (docs/v2-parallel.md WP2): commit + push the working tree
   // after EVERY CLI exit — success, park, or failure — so no work ever exists
   // only on the wipeable session mount (the documented v2 loss mode: the mount
@@ -2373,124 +4058,44 @@ export const runStage = async (
       ? `aidlc(${stageId}): ${unitSlug} — ${executionId}`
       : `aidlc(${stageId}): ${executionId}`,
   });
-  const stageCodeCommitRefs = mergeCodeCommitRefs(carriedCodeCommitRefs, gitResult);
+  // Every commit of this attempt: carried from a parked leg, this leg's, and the
+  // repair turns' (added by runRepairTurn below).
+  let stageCodeCommitRefs = mergeCodeCommitRefs(
+    mergeCodeCommitRefs(carriedCodeCommitRefs, leadDraftGit),
+    gitResult,
+  );
   retainedCodeCommitRefs = stageCodeCommitRefs.length ? stageCodeCommitRefs : null;
-  if (gitResult.committed || !gitResult.ok) {
-    const failedRepos = gitResult.results
-      .filter((r) => r.pushed !== true && r.pushed !== 'empty' && r.pushed !== 'up_to_date')
-      // Carry the git stderr into the event — the 2026-07 incident's ENOSPC
-      // root cause was invisible because only the reason label was recorded.
-      .map(
-        (r) =>
-          `${r.repo} (${r.reason ?? 'unknown'}${r.detail ? `: ${String(r.detail).slice(0, 300)}` : ''})`,
-      );
-    const gitSummary = gitResult.ok
-      ? `Engine committed + pushed work for ${stageLabel} (${gitResult.results
-          .filter((r) => r.committed)
-          .map((r) => `${r.repo}@${(r.sha ?? '').slice(0, 8)}`)
-          .join(', ')})`
-      : `Engine push failed for ${stageLabel}: ${failedRepos.join(', ')}`;
-    await store
-      .appendEvent({
-        executionId,
-        type: gitResult.ok ? 'v2.git.pushed' : 'v2.git.push_failed',
-        stageInstanceId,
-        unitSlug,
-        sectionIndex,
-        actor: 'agentcore',
-        summary: gitSummary,
-      })
-      .catch(() => {});
-    // Surface a push failure live (agent.note is the timeline-note action the
-    // UI already routes) — the user must see git trouble at stage N, not after
-    // the whole run has burned its tokens.
-    if (!gitResult.ok) {
-      await publish({
-        action: 'agent.note',
-        noteType: 'v2.git.push_failed',
-        stageInstanceId,
-        unitSlug,
-        sectionIndex,
-        summary: gitSummary,
-      });
-    }
-  }
+  await publishGitEvidence(gitResult);
 
-  // 5. Park check — did the agent leave a pending question? ask_question parks
-  // (returns a sentinel) instead of blocking, so the agent is told to stop. The
-  // durable pending gate — NOT the CLI exit code — is the source of truth for a
-  // park: a clean exit OR a non-zero exit AFTER parking both mean "waiting on a
-  // human". We therefore check the gate BEFORE treating a non-zero exit as failure,
-  // so a Kiro run that parks then errors on its next turn parks rather than fails.
-  const parked = await pendingGate({
-    store,
-    executionId,
-    stageInstanceId,
-    unitSlug,
-    sectionIndex,
-  });
-  if (parked && (cli === 'opencode' || cli === 'codex') && !cliSessionId) {
-    return fail(
-      stageInstanceId,
-      `${cli}_session_missing`,
-      `${cli === 'codex' ? 'Codex' : 'OpenCode'} parked the stage without emitting a session id; the conversation cannot be resumed`,
-    );
-  }
-  if (parked && cli === 'codex' && codexStoreConfigured && !codexPersistResult?.ok) {
-    await (store.supersedeHumanTask?.({
-      executionId,
-      humanTaskId: parked.humanTaskId,
-      supersededBy: 'codex_store_persist_failed',
-    }) ?? Promise.resolve());
-    if (!unitSlug) {
-      await store
-        .updateExecution({
-          executionId,
-          pendingHumanTaskId: null,
-        })
-        .catch(() => {});
+  const parkStage = async (parked) => {
+    if ((cli === 'opencode' || cli === 'codex') && !cliSessionId) {
+      return fail(
+        stageInstanceId,
+        `${cli}_session_missing`,
+        `${cli === 'codex' ? 'Codex' : 'OpenCode'} parked the stage without emitting a session id; the conversation cannot be resumed`,
+      );
     }
-    return fail(
-      stageInstanceId,
-      'codex_store_persist_failed',
-      'Codex parked the stage, but its rollout could not be written to durable storage',
-      { clearPending: true },
-    );
-  }
-  if (!parked && exitCode !== 0) {
-    // Kiro's benign empty-final-completion crash: the turn's work completed, the
-    // agent just ended without closing text and kiro-cli's ACP rejected the empty
-    // message. Treat as success (not a stage failure) but record a note so the
-    // signature stays visible. Sensors below still run and can hold the stage.
-    if (cli === 'kiro' && isBenignKiroEmptyCompletion(result?.stderrTail)) {
-      logger.error('kiro empty-completion (benign); treating as success', {
-        stage: stageId,
-        exitCode,
-      });
-      await store
-        .appendEvent({
-          executionId,
-          type: 'v2.stage.note',
-          stageInstanceId,
-          unitSlug,
-          sectionIndex,
-          actor: 'agentcore',
-          summary: `Kiro exited ${exitCode} with an empty final message after completing work; treated as success (ACP empty-completion).`,
-        })
-        .catch(() => {});
-    } else if (isCredentialFailure(result?.stderrTail)) {
-      const detail =
-        credentialFailureDetail({
-          binding: credentialBindingForCli(credentialBindings, cli),
-          state: 'rejected',
-        }) ??
-        'The pinned agent credential was rejected; rotate it at the selected credential scope';
-      return fail(stageInstanceId, 'credential_invalid', detail);
-    } else {
-      return fail(stageInstanceId, 'cli_nonzero_exit', String(exitCode));
+    if (cli === 'codex' && codexStoreConfigured && !codexPersistResult?.ok) {
+      await (store.supersedeHumanTask?.({
+        executionId,
+        humanTaskId: parked.humanTaskId,
+        supersededBy: 'codex_store_persist_failed',
+      }) ?? Promise.resolve());
+      if (!unitSlug) {
+        await store
+          .updateExecution({
+            executionId,
+            pendingHumanTaskId: null,
+          })
+          .catch(() => {});
+      }
+      return fail(
+        stageInstanceId,
+        'codex_store_persist_failed',
+        'Codex parked the stage, but its rollout could not be written to durable storage',
+        { clearPending: true },
+      );
     }
-  }
-  if (parked) {
     await store
       .updateStageState({
         executionId,
@@ -2534,8 +4139,56 @@ export const runStage = async (
       cliSessionId,
       cli,
     };
-  }
+  };
 
+  // Check the durable park marker before any completion work. An answer that
+  // lands after the bridge parks but before the CLI exits still belongs to the
+  // orchestrator's resume callback; only an inline answer clears the marker.
+  const parked = await ownedGateAtExit({
+    store,
+    executionId,
+    stageInstanceId,
+    unitSlug,
+    sectionIndex,
+  });
+  if (parked) return parkStage(parked);
+
+  // A clean exit OR a non-zero exit AFTER parking means "waiting on a human".
+  // Check the park marker before treating a non-zero exit as failure so a run
+  // that parks and then errors on its next turn still parks rather than fails.
+  if (exitCode !== 0) {
+    // Kiro's benign empty-final-completion crash: the turn's work completed, the
+    // agent just ended without closing text and kiro-cli's ACP rejected the empty
+    // message. Treat as success (not a stage failure) but record a note so the
+    // signature stays visible. Sensors below still run and can hold the stage.
+    if (cli === 'kiro' && isBenignKiroEmptyCompletion(result?.stderrTail)) {
+      logger.error('kiro empty-completion (benign); treating as success', {
+        stage: stageId,
+        exitCode,
+      });
+      await store
+        .appendEvent({
+          executionId,
+          type: 'v2.stage.note',
+          stageInstanceId,
+          unitSlug,
+          sectionIndex,
+          actor: 'agentcore',
+          summary: `Kiro exited ${exitCode} with an empty final message after completing work; treated as success (ACP empty-completion).`,
+        })
+        .catch(() => {});
+    } else if (isCredentialFailure(result?.stderrTail)) {
+      const detail =
+        credentialFailureDetail({
+          binding: credentialBindingForCli(credentialBindings, cli),
+          state: 'rejected',
+        }) ??
+        'The pinned agent credential was rejected; rotate it at the selected credential scope';
+      return fail(stageInstanceId, 'credential_invalid', detail);
+    } else {
+      return fail(stageInstanceId, 'cli_nonzero_exit', String(exitCode));
+    }
+  }
   // A previous durable rollout may still exist after an atomic replace fails.
   // Clear the handle on an otherwise successful leg so later review feedback
   // demotes to fresh instead of resuming that stale transcript.
@@ -2558,62 +4211,199 @@ export const runStage = async (
   // v2.git.push_failed event above but does not change stage behavior.
   // A parked stage (above) parks regardless — the human loop must not be
   // blocked by a push outage; the resume leg retries the push.
-  const atRiskRepos = gitResult.ok
-    ? []
-    : gitResult.results.filter(
-        (r) =>
-          (r.committed === true &&
-            r.pushed !== true &&
-            r.pushed !== 'empty' &&
-            r.pushed !== 'up_to_date') ||
-          (r.committed !== true && (r.dirty === true || r.reason === 'engine_crashed')),
-      );
-  if (atRiskRepos.length > 0) {
-    const detail = atRiskRepos
-      .map(
-        (r) =>
-          `${r.repo}: ${r.reason ?? 'push_failed'}${r.detail ? ` — ${String(r.detail).slice(0, 300)}` : ''}`,
-      )
-      .join('; ');
-    const uncommitted = atRiskRepos.some((r) => r.committed !== true);
-    // 'push_failed' keeps its v1 meaning (commit exists, push did not land);
-    // 'git_commit_failed' is the new durability failure (work never became a
-    // commit at all — the loss mode the engine exists to close).
-    return fail(stageInstanceId, uncommitted ? 'git_commit_failed' : 'push_failed', detail);
+  const gitFailure = workAtRiskFailure(gitResult);
+  if (gitFailure) return fail(stageInstanceId, gitFailure.code, gitFailure.detail);
+  if (releaseBodyFailure) {
+    return fail(
+      stageInstanceId,
+      'methodology_body_unavailable',
+      releaseBodyFailure.message ?? String(releaseBodyFailure),
+    );
   }
 
-  // Include commits retained across park/resume and retry legs before sensors
-  // select files. A clean final leg does not mean the whole stage was clean.
   let completedGitResult = gitResult;
   let completedGitError = null;
-  if (carriedCodeCommitRefs.length > 0) {
-    try {
-      completedGitResult = await gitResultForCommitRefs({
-        commitRefs: stageCodeCommitRefs,
-        repos,
-        workspaceDir,
-      });
-    } catch (error) {
-      completedGitError = error;
+  let attemptProvenance = changedFileProvenanceFromGitResults(gitResult.results);
+  let changedFileProvenance = attemptProvenance;
+  let changedFiles = changedFileProvenance.state === 'known' ? changedFileProvenance.files : null;
+  let recoveredCommitRefs = null;
+  // Parked legs and repair turns belong to this same stage attempt. Recover
+  // their full delta before each sensor plane and before returning feedback.
+  // A failed recovery remains unknown instead of exposing a partial file list.
+  const refreshCompletedGitResult = async () => {
+    const refsKey = JSON.stringify(stageCodeCommitRefs);
+    if ((carriedCodeCommitRefs.length > 0 || repairCommitted) && refsKey !== recoveredCommitRefs) {
+      recoveredCommitRefs = refsKey;
+      try {
+        completedGitResult = await gitResultForCommitRefs({
+          commitRefs: stageCodeCommitRefs,
+          repos,
+          workspaceDir,
+        });
+        completedGitError = null;
+      } catch (error) {
+        completedGitError = error;
+      }
     }
+    changedFileProvenance = completedGitError
+      ? unknownChangedFileProvenance('git_commit_refs_failed', completedGitError.message)
+      : mergeChangedFileProvenance([
+          { provenance: attemptProvenance },
+          { provenance: changedFileProvenanceFromGitResults(completedGitResult.results) },
+        ]);
+    changedFiles = changedFileProvenance.state === 'known' ? changedFileProvenance.files : null;
+  };
+
+  // The lead repair turn: re-enter the SAME conversation with one deterministic
+  // message and commit whatever it rewrote. Hoisted out of the checkpoint ladder
+  // because the adversarial reviewer loop needs the identical machinery between
+  // NOT-READY rounds. Codex is excluded in BOTH callers: its CODEX_HOME was
+  // already cleaned up above and restoring a rollout is the resume path's job. With
+  // no resumable session the callers simply skip the repair rung.
+  const canRepair = Boolean(cliSessionId) && cli !== 'codex';
+  // A repair commit goes through the same rule as the stage commit: its refs join
+  // the attempt's, and new work it could not push fails the stage (checked after
+  // the ladder and after the reviewer loop, once no park is pending).
+  let repairCommitted = false;
+  let repairGitFailure = null;
+  const runRepairTurn = canRepair
+    ? async (message, { label = 'checkpoint repair' } = {}) => {
+        const mcpKwargs = await materializeCliMcp();
+        const repair = driver.buildResumeInvocation({
+          sessionId: cliSessionId,
+          answerMessage: message,
+          model,
+          ...mcpKwargs,
+        });
+        const repairSink = createCliOutputSink({ cli, emit: emitCliOutput });
+        const spawnRepair = () =>
+          runChild({
+            command: repair.command,
+            args: repair.args,
+            env: { ...childEnv, ...repair.env },
+            cwd: workspaceDir,
+            prompt: repair.prompt,
+            promptViaStdin: repair.promptViaStdin,
+            captureStderrTail: 16_384,
+            onStdout: (chunk) => repairSink.write(chunk),
+            spawnFn,
+          });
+        try {
+          if (cli === 'opencode') {
+            await withOpenCodeStore({
+              env,
+              operation: spawnRepair,
+              restore: restoreOpenCodeStore,
+              persist: persistOpenCodeStore,
+            });
+          } else {
+            await spawnRepair();
+          }
+        } finally {
+          repairSink.flush();
+          await outputQueue;
+          if (cli === 'kiro') await persistKiroStore({ env }).catch(() => false);
+        }
+        // The repair turn re-saves artifacts, so the tree moved: commit it, or
+        // the lineage check (and the next reviewer round) would judge the stage on
+        // the pre-repair commit.
+        const repairGit = await commitAndPushAll({
+          repos,
+          workspaceDir,
+          branch,
+          baseBranch,
+          baseBranches,
+          gitProvider,
+          repoProviders,
+          projectId,
+          executionId,
+          author: gitAuthor,
+          message: unitSlug
+            ? `aidlc(${stageId}): ${unitSlug} — ${executionId} (${label})`
+            : `aidlc(${stageId}): ${executionId} (${label})`,
+        }).catch((error) => ({
+          ok: false,
+          committed: false,
+          results: [{ repo: '-', reason: 'engine_crashed', detail: error?.message }],
+        }));
+        attemptProvenance = mergeChangedFileProvenance([
+          { provenance: attemptProvenance },
+          { provenance: changedFileProvenanceFromGitResults(repairGit.results) },
+        ]);
+        const refsBefore = stageCodeCommitRefs.length;
+        stageCodeCommitRefs = mergeCodeCommitRefs(stageCodeCommitRefs, repairGit);
+        if (stageCodeCommitRefs.length > refsBefore) repairCommitted = true;
+        retainedCodeCommitRefs = stageCodeCommitRefs.length ? stageCodeCommitRefs : null;
+        await publishGitEvidence(repairGit, { label });
+        repairGitFailure ??= workAtRiskFailure(repairGit);
+      }
+    : null;
+
+  // 5b. Checkpoint completion ladder — the authorization boundary. Placed after
+  // the agent (and its commit, which Plan Approval's lineage check reads) and
+  // BEFORE the sensor pass, so a stage that never obtained its authorization never
+  // burns a reviewer session. Inert without a resolved release policy.
+  // Records that a repair turn was skipped because the stage budget is spent, so
+  // the timeline says why the lead was not re-entered.
+  const noteRepairSkipped = async (what, detail = {}) => {
+    await store
+      .appendEvent({
+        executionId,
+        type: 'v2.stage.repair_skipped',
+        stageInstanceId,
+        unitSlug,
+        sectionIndex,
+        actor: 'agentcore',
+        summary: `Skipped the ${what} for ${stageLabel}: the stage wall-clock budget is spent`,
+        detail: { reason: 'stage_budget_exhausted', what, ...detail },
+      })
+      .catch(() => {});
+  };
+  if (stage.policy) {
+    const ladder = await runCheckpointLadder({
+      store,
+      executionId,
+      stageInstanceId,
+      unitSlug,
+      sectionIndex,
+      stage,
+      policy: stage.policy,
+      stageLabel,
+      runRepairTurn,
+      repairAllowed: repairBudgetLeft,
+      onRepairSkipped: () => noteRepairSkipped('checkpoint repair turn'),
+      pendingGate: () =>
+        pendingGate({ store, executionId, stageInstanceId, unitSlug, sectionIndex }),
+      validationRound,
+    });
+    if (ladder.parked) return parkStage(ladder.parked);
+    if (repairGitFailure) {
+      return fail(stageInstanceId, repairGitFailure.code, repairGitFailure.detail);
+    }
+    if (ladder.failure) {
+      return fail(stageInstanceId, ladder.failure.code, ladder.failure.detail);
+    }
+    // ONE findings channel: the ensemble stream writes `stageFindings` too, so the
+    // ladder MERGES into it rather than replacing it \u2014 a stage can carry a missing
+    // authorization AND a persona gap to the same human decision.
+    stageFindings = mergeFindings(stageFindings, ladder.findings);
   }
 
-  // Any repository whose Git collection failed makes provenance unknown and
-  // widens checking, including a failure to recover an earlier leg's commits.
-  const changedFileProvenance = completedGitError
-    ? unknownChangedFileProvenance('git_commit_refs_failed', completedGitError.message)
-    : changedFileProvenanceFromGitResults(completedGitResult.results);
-  const changedFiles = changedFileProvenance.state === 'known' ? changedFileProvenance.files : null;
+  await refreshCompletedGitResult();
 
-  // 6. Deterministic sensors — the verification axis that runs AFTER the agent.
-  // Graph sensors evaluate the produced artifacts' content in-process; script
-  // sensors spawn against the workspace checkout. Advisory verdicts record a
-  // note and never hold; a BLOCKING sensor that did not PASS fails the stage.
+  // 6. Deterministic sensors, WRITE plane — the verification axis that runs
+  // AFTER the agent and BEFORE the reviewer. Graph sensors evaluate the produced
+  // artifacts' content in-process; script sensors spawn against the workspace
+  // checkout. Advisory verdicts normally record a note without holding;
+  // release-pinned script integrity failures hold regardless of severity, as
+  // does any non-PASS blocking sensor. `fire_on: gate` sensors are NOT run here
+  // — the adversarial repair loop below can still rewrite artifacts, so a gate
+  // verdict taken now would not be on the bytes the human approves.
   // Best-effort wiring: a sensor subsystem error never masks a successful run.
   // The list is the authored sensors PLUS the platform-injected ones (see
   // withPlatformSensors) — hence the gate checks the merged list.
   if (withPlatformSensors(stage).length > 0) {
-    const held = await runStageSensors({
+    const writePlane = await runStageSensors({
       stage,
       stageInstanceId,
       unitSlug,
@@ -2622,34 +4412,58 @@ export const runStage = async (
       projectId,
       intentId,
       openGraph,
-      loadBlockScript,
+      loadBlockScript: loadScript,
       workspaceDir,
       changedFileProvenance,
       env,
       spawnFn,
       store,
       publish,
+      ...postAgentSensorPass({ methodologyRelease, attemptChangedFiles: changedFiles }),
     }).catch(() => null);
-    if (held) {
-      return fail(stageInstanceId, 'sensor_blocked', held);
+    if (writePlane?.held) {
+      return fail(stageInstanceId, 'sensor_blocked', writePlane.held);
     }
   }
 
+  let reviewAdvisory = null;
   if (stage.reviewer?.reviewerAgent) {
     const reviewerAgent = stage.reviewer.reviewerAgent;
+    const reviewArtifactUnderReview = stage.reviewer.artifact ?? null;
     const reviewerBlock = library.agentsById[reviewerAgent] ?? null;
     if (!reviewerBlock) {
       return fail(stageInstanceId, 'reviewer_not_found', reviewerAgent);
     }
-    const [reviewerPersona, reviewerMethodology] = await Promise.all([
-      loadBlockBody(reviewerBlock).catch(() => ''),
-      loadMethodologyKnowledge({
+    // Release mode fails closed on the reviewer persona too: tampered persona
+    // bytes are a tampered verdict, and '' would seat a personaless judge.
+    let reviewerPersona;
+    try {
+      reviewerPersona = methodologyRelease
+        ? await loadBody(reviewerBlock)
+        : await loadBody(reviewerBlock).catch(() => '');
+    } catch (error) {
+      return fail(stageInstanceId, 'methodology_body_unavailable', error?.message ?? String(error));
+    }
+    let reviewerMethodology;
+    try {
+      reviewerMethodology = await loadMethodologyKnowledge({
         agentRef: reviewerAgent,
         library,
-        loadBlockBody,
-      }).catch(() => ''),
-    ]);
-    const maxIterations = Math.max(1, Number(stage.reviewer.maxIterations ?? 1) || 1);
+        loadBlockBody: loadBody,
+        methodologyRelease,
+      });
+    } catch (error) {
+      return fail(stageInstanceId, 'methodology_body_unavailable', error?.message ?? String(error));
+    }
+    // An ADVISORY reviewer (≥2.6.18 `review_class: advisory`, or an adversarial
+    // stage lowered by a scope `review_cap`) runs ONE terminal pass: the plan
+    // already pinned maxIterations to 1, and NOT-READY must neither fail the
+    // stage nor trigger a repair round. Its findings are instead persisted
+    // verbatim so the human sees them at the approval gate.
+    const advisory = Boolean(stage.reviewer.advisory);
+    const maxIterations = advisory
+      ? 1
+      : Math.max(1, Number(stage.reviewer.maxIterations ?? 1) || 1);
     let verdict = null;
     for (let round = 1; round <= maxIterations; round += 1) {
       verdict = await runReviewer({
@@ -2657,6 +4471,7 @@ export const runStage = async (
         unit,
         reviewerAgent,
         reviewerBlock,
+        maxTurns: methodologyRelease ? (reviewerBlock.maxTurns ?? null) : null,
         reviewerPersona,
         knowledge: reviewerMethodology,
         round,
@@ -2672,6 +4487,7 @@ export const runStage = async (
         materializeOpenCodeConfig,
         materializeCodexHome,
         cleanupCodexHome,
+        withOpenCodeStore,
         store,
         executionId,
         projectId,
@@ -2695,17 +4511,233 @@ export const runStage = async (
           .catch(() => {});
         return null;
       });
+      // Only a release-mode stage can open a gate between reviewer rounds (the
+      // repair turn below); an unpinned reviewer loop has nothing to re-check.
+      const reviewerParked = stage.policy
+        ? await pendingGate({ store, executionId, stageInstanceId, unitSlug, sectionIndex })
+        : null;
+      if (reviewerParked) return parkStage(reviewerParked);
       const ready = verdict?.result === 'PASS' || verdict?.detail?.verdict === 'READY';
       const notReady = verdict?.result === 'FAIL' || verdict?.detail?.verdict === 'NOT-READY';
       if (ready || !notReady) break;
+      // Upstream re-reviews only AFTER the builder has answered the findings. The
+      // platform's pre-existing loop re-ran the reviewer against the SAME bytes, so
+      // round 2 could only repeat round 1. In release mode with a resolved policy
+      // the lead is resumed once per NOT-READY round with the findings, its work is
+      // committed, and only then is the reviewer re-dispatched. Bounded by the same
+      // `maxIterations` as the loop itself (no repair after the final round), and
+      // inert for an unpinned/2.3.3 run, whose loop stays byte-identical.
+      if (!methodologyRelease || !stage.policy || !runRepairTurn || round >= maxIterations) {
+        continue;
+      }
+      // Out of budget: re-reviewing unrepaired bytes can only repeat this verdict,
+      // so the loop ends here with this round's NOT-READY as the result.
+      if (!repairBudgetLeft()) {
+        await noteRepairSkipped(`review repair turn after round ${round}`, {
+          round,
+          reviewerAgent,
+        });
+        break;
+      }
+      const reviewerFindings = String(verdict?.detail?.findings ?? '').slice(0, 8000);
+      await store
+        .appendEvent({
+          executionId,
+          type: 'v2.review.repair_requested',
+          stageInstanceId,
+          unitSlug,
+          sectionIndex,
+          actor: 'agentcore',
+          summary: `Reviewer ${reviewerAgent} returned NOT-READY on round ${round}; resuming ${
+            stage.agentRef ?? 'the lead'
+          } to address the findings before round ${round + 1}`,
+          detail: { round, reviewerAgent, attempt: priorStageRow?.attempt ?? 0 },
+        })
+        .catch(() => {});
+      await runRepairTurn(reviewerRepairMessage({ reviewerAgent, round, reviewerFindings }), {
+        label: `review repair r${round}`,
+      }).catch((error) => logger.error('reviewer repair turn failed', { error, round }));
+      const repairParked = await pendingGate({
+        store,
+        executionId,
+        stageInstanceId,
+        unitSlug,
+        sectionIndex,
+      });
+      if (repairParked) return parkStage(repairParked);
     }
+    if (repairGitFailure) {
+      return fail(stageInstanceId, repairGitFailure.code, repairGitFailure.detail);
+    }
+    const ready = verdict?.result === 'PASS' || verdict?.detail?.verdict === 'READY';
     const notReady = verdict?.result === 'FAIL' || verdict?.detail?.verdict === 'NOT-READY';
-    if (notReady && stage.humanValidation !== 'required') {
+    if (advisory) {
+      reviewAdvisory = {
+        reviewerAgent,
+        // The flag the gate-precondition evaluator keys off: it must be able to
+        // tell an advisory verdict (a finding for the human) from an adversarial
+        // one (which already failed or repaired the stage) from the DTO alone.
+        advisory: true,
+        verdict: verdict?.detail?.verdict ?? verdict?.result ?? 'INCONCLUSIVE',
+        findings: verdict?.detail?.findings ?? null,
+        ...(reviewArtifactUnderReview ? { artifact: reviewArtifactUnderReview } : {}),
+      };
+      const findingsText = reviewAdvisory.findings
+        ? String(reviewAdvisory.findings).slice(0, 4000)
+        : 'no findings recorded';
+      await store
+        .appendEvent({
+          executionId,
+          type: 'v2.review.advisory',
+          stageInstanceId,
+          unitSlug,
+          sectionIndex,
+          actor: reviewerAgent,
+          summary: `Advisory review of ${stage.stageId} by ${reviewerAgent}: ${reviewAdvisory.verdict} — ${findingsText}`,
+        })
+        .catch(() => {});
+      await publish({
+        action: 'agent.note',
+        noteType: 'v2.review.advisory',
+        stageInstanceId,
+        unitSlug,
+        sectionIndex,
+        kind: 'review',
+        note: `advisory review (${reviewerAgent}): ${reviewAdvisory.verdict}`,
+        summary: findingsText,
+      }).catch(() => {});
+    } else if (notReady && stage.humanValidation !== 'required') {
       return fail(
         stageInstanceId,
         'reviewer_not_ready',
         verdict?.detail?.findings ?? `${reviewerAgent} returned NOT-READY`,
       );
+    } else if (!ready && stage.policy && stage.humanValidation === 'required') {
+      // A gated stage does not fail on a terminal NOT-READY — the human decides.
+      // But the decision has to CARRY the verdict, so the same DTO is handed to the
+      // gate with `advisory: false`, which the precondition evaluator surfaces as
+      // an advisory finding; `approve` stays on offer. Without this the
+      // reviewer's unresolved objection reached the gate as silence. A reviewer
+      // that crashed or wrote no verdict is not a READY one, so it reaches the
+      // gate the same way, as INCONCLUSIVE with the reason. Release mode only: an
+      // unpinned gate reads no preconditions, so the DTO would change the durable
+      // stage result and nothing else.
+      reviewAdvisory = {
+        reviewerAgent,
+        advisory: false,
+        verdict: verdict?.detail?.verdict ?? verdict?.result ?? 'INCONCLUSIVE',
+        findings: verdict
+          ? (verdict.detail?.findings ?? null)
+          : `${reviewerAgent} recorded no verdict`,
+        ...(reviewArtifactUnderReview ? { artifact: reviewArtifactUnderReview } : {}),
+      };
+    }
+  }
+
+  await refreshCompletedGitResult();
+
+  // 6b. Deterministic sensors, GATE plane. `fire_on: gate` fires
+  // once per existing declared deliverable as the stage opens its gate, so it
+  // runs HERE — after the reviewer loop has finished rewriting artifacts — and
+  // its verdict is therefore on the bytes the human will actually approve. The
+  // verdicts ride the stage result into the gate as findings; a blocking one does
+  // NOT fail a gated stage, because holding the gate with an override on the
+  // record is strictly better than a FAILED run the human has to rewind.
+  //
+  // Gated twice, exactly like every other release semantic: release mode (a
+  // verified closure, never an unpinned DynamoDB row a user hand-edited) AND the
+  // field actually authored (at least one sensor asks for the gate plane).
+  let gateSensorVerdicts = [];
+  let gateFindings = [];
+  if (methodologyRelease && withPlatformSensors(stage).some((s) => s.fireOn === 'gate')) {
+    let gatePlane = null;
+    // A gate plane that could not run is NOT a pass. Swallowing the error to null
+    // opened the gate with the sensor axis silently absent; the human now gets an
+    // INCONCLUSIVE advisory naming the reason, through the same finding builder the
+    // verdicts themselves go through.
+    let gatePlaneError = null;
+    try {
+      gatePlane = await runStageSensors({
+        stage,
+        stageInstanceId,
+        unitSlug,
+        sectionIndex,
+        executionId,
+        projectId,
+        intentId,
+        openGraph,
+        loadBlockScript: loadScript,
+        workspaceDir,
+        env,
+        spawnFn,
+        store,
+        publish,
+        planes: ['gate'],
+        changedFileProvenance,
+      });
+    } catch (error) {
+      gatePlaneError = error?.message ?? String(error);
+      logger.warn('gate sensor plane degraded', {
+        stageId,
+        executionId,
+        stageInstanceId,
+        msg: gatePlaneError,
+      });
+    }
+    gateSensorVerdicts = gatePlane?.verdicts ?? [];
+    const gateRow = await store.getStage(executionId, stageInstanceId).catch(() => null);
+    const gateAttempt = Number(gateRow?.attempt ?? priorStageRow?.attempt ?? 0);
+    const gateReceipts = await (
+      store.listReceipts?.(executionId, { stageInstanceId, attempt: gateAttempt }) ??
+      Promise.resolve([])
+    ).catch(() => []);
+    gateFindings = sensorGateFindings({
+      sensorVerdicts: [
+        ...gateSensorVerdicts,
+        ...(gatePlaneError
+          ? [
+              {
+                sensorId: 'gate-sensor-plane',
+                severity: 'advisory',
+                result: 'INCONCLUSIVE',
+                detail: { reason: gatePlaneError },
+              },
+            ]
+          : []),
+      ],
+      receipts: gateReceipts,
+      attempt: gateAttempt,
+    });
+    // The sensor axis is only auditable if its RESULT is durable on every gate
+    // pass, PASS included: "3 passed, 0 flagged" is the evidence that the plane
+    // ran at all, and without it a silently absent plane is indistinguishable
+    // from a clean one.
+    const passed = gateSensorVerdicts.filter((verdict) => verdict.result === 'PASS').length;
+    const flagged = gateSensorVerdicts.length - passed;
+    await store
+      .appendEvent({
+        executionId,
+        type: 'v2.sensor.gate',
+        stageInstanceId,
+        unitSlug,
+        sectionIndex,
+        actor: 'agentcore',
+        summary: `Gate sensors: ${passed} passed, ${flagged} flagged${
+          gatePlaneError ? ' (plane INCONCLUSIVE)' : ''
+        }`,
+        detail: {
+          passed,
+          flagged,
+          attempt: gateAttempt,
+          sensorIds: gateSensorVerdicts.map((verdict) => verdict.sensorId),
+          ...(gatePlaneError ? { error: gatePlaneError } : {}),
+        },
+      })
+      .catch(() => {});
+    // No human gate (including a unit lane) means no one can override, so
+    // upstream's own autonomous path applies: halt. FAILED + rewind is this platform's equivalent halt.
+    if (gatePlane?.held && !stageHasHumanGate({ stage, unitSlug })) {
+      return fail(stageInstanceId, 'sensor_blocked', gatePlane.held);
     }
   }
 
@@ -2827,6 +4859,31 @@ export const runStage = async (
   const commitSha =
     completedGitResult.results.find((gitChange) => gitChange.committed && gitChange.sha)?.sha ??
     null;
+  // Change control compares a stage's required inputs against the
+  // fingerprints recorded when their PRODUCER was approved. The orchestrator
+  // writes that record at the approval gate but has no Neptune access, so the
+  // container hands it the fingerprints of everything this stage leaves behind.
+  // Read-only and best-effort: an unreachable graph costs the next stage its
+  // comparison, never this stage its success.
+  //
+  // "Observed nothing" and "could not observe" are different facts and must not
+  // collapse into one absent field: an empty SUCCESSFUL read is the evidence that
+  // the stage produced no artifact, which is exactly what the required-output check
+  // exists to catch. An unreachable graph is reported on its own field instead.
+  let producedHeads = null;
+  let producedHeadsUnavailable = false;
+  if (stage.policy && openGraph) {
+    let gHeads = null;
+    try {
+      gHeads = await openGraph();
+      producedHeads = await readArtifactHeadHashes({ g: gHeads, intentId });
+    } catch {
+      producedHeads = null;
+      producedHeadsUnavailable = true;
+    } finally {
+      await closeGraphSource(gHeads);
+    }
+  }
   return {
     ok: true,
     state: 'SUCCEEDED',
@@ -2840,11 +4897,29 @@ export const runStage = async (
     verification:
       withPlatformSensors(stage).length > 0 ? 'Stage sensors passed' : 'Stage completed',
     reviewTargetCheck,
+    ...(reviewAdvisory ? { reviewAdvisory } : {}),
+    // Gate-precondition inputs. `ensembleEvidence` is what
+    // only this runner could observe — the declared topology and the evidence it
+    // actually gathered; the orchestrator re-reads the receipts itself before the
+    // gate opens and merges its findings with these. Omitted entirely when no
+    // ensemble ran, which is what keeps the gate prompt byte-identical.
+    ...(ensembleEvidence ? { ensembleEvidence } : {}),
+    // Every new field is omitted when empty: a legacy stage result must stay the
+    // exact object the orchestrator has always received.
+    ...(gateSensorVerdicts.length ? { gateSensorVerdicts } : {}),
+    ...(() => {
+      const findings = mergeFindings(stageFindings, gateFindings, changeControlFindings);
+      return findings.length ? { findings } : {};
+    })(),
+    ...(changedInputs.length ? { changedInputs } : {}),
+    ...(Array.isArray(producedHeads) ? { producedHeads } : {}),
+    ...(producedHeadsUnavailable ? { producedHeadsUnavailable: true } : {}),
   };
 };
 
 // Exposed for unit tests (pure helpers; the runStage flow is integration-tested).
 export const __test = {
+  postAgentSensorPass,
   mergeLearningRules,
   composeKnowledge,
   renderTeamKnowledge,
@@ -2857,5 +4932,13 @@ export const __test = {
   buildReviewerPrompt,
   renderReviewerReadScope,
   changedFileProvenanceFromGitResults,
+  runCheckpointLadder,
   SHARED_CONTRACT_ARTIFACTS,
+  changedApprovedInputs,
+  changeControlChoice,
+  changeControlGateId,
+  changeControlFingerprint,
+  isChangeControlGate,
+  renderChangedInputs,
+  CHANGE_CONTROL_OPTIONS,
 };

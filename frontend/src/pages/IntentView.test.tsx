@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Routes, Route } from 'react-router';
+import { formatTimelineTimestamp } from '@/lib/timeAgo';
 
 const yjsMock = vi.hoisted(() => ({ docs: new Map<string, unknown>() }));
 const projectCacheMock = vi.hoisted(() => ({
@@ -1029,11 +1030,20 @@ describe('IntentView', () => {
       ],
       sensorRuns: [
         {
-          sensorRunId: 'sr-1',
+          sensorRunId: 'sr-new',
           stageInstanceId: 'si-a',
           sensorId: 'reviewer:qa',
           result: 'PASS',
           detail: { verdict: 'READY', findings: 'Looks complete' },
+          timestamp: '2026-03-01T12:00:00Z',
+        },
+        {
+          sensorRunId: 'sr-old',
+          stageInstanceId: 'si-a',
+          sensorId: 'reviewer:qa',
+          result: 'FAIL',
+          detail: { verdict: 'NOT-READY', findings: 'Earlier finding' },
+          timestamp: '2026-02-01T12:00:00Z',
         },
       ],
       artifacts: [
@@ -1096,8 +1106,25 @@ describe('IntentView', () => {
       'aria-expanded',
       'false',
     );
+    expect(screen.getByRole('button', { name: /Reviewer Agent findings/i })).toHaveTextContent(
+      'READY',
+    );
     await userEvent.click(screen.getByRole('button', { name: /Reviewer Agent findings/i }));
+    const reviewerRunTriggers = screen.getAllByTestId(/^reviewer-run-trigger-/);
+    expect(reviewerRunTriggers.map((trigger) => trigger.dataset.testid)).toEqual([
+      'reviewer-run-trigger-sr-new',
+      'reviewer-run-trigger-sr-old',
+    ]);
+    expect(reviewerRunTriggers[0]).toHaveAttribute('aria-expanded', 'true');
+    expect(reviewerRunTriggers[1]).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByText(formatTimelineTimestamp('2026-03-01T12:00:00Z'))).toBeInTheDocument();
+    expect(screen.getByText(formatTimelineTimestamp('2026-02-01T12:00:00Z'))).toBeInTheDocument();
+    expect(screen.getAllByText('READY')).not.toHaveLength(0);
+    expect(screen.getByText('NOT-READY')).toBeInTheDocument();
     expect(screen.getByText('Looks complete')).toBeInTheDocument();
+    expect(screen.queryByText('Earlier finding')).not.toBeInTheDocument();
+    await userEvent.click(reviewerRunTriggers[1]);
+    expect(await screen.findByText('Earlier finding')).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'Approve stage' }));
     expect(answerGate).toHaveBeenCalledWith('p1', 'i1', 'eg-validation-si-a-0-run1', {
@@ -1158,7 +1185,7 @@ describe('IntentView', () => {
         .find((b) => !b.hasAttribute('aria-expanded') && b.textContent?.startsWith(label));
     expect(statCardButton('Artifacts')).toBeUndefined();
     expect(statCardButton('Identified items')).toBeUndefined();
-    expect(statCardButton('Reviewer findings')).toBeUndefined();
+    expect(statCardButton('Reviewer verdict')).toBeUndefined();
   });
 
   // Positive counterpart: when a category has data, its stat card is a button
@@ -1572,12 +1599,13 @@ describe('IntentView', () => {
     expect(await screen.findByText('Work products')).toBeInTheDocument();
     await userEvent.click(screen.getByText('Code'));
     expect(screen.getByText('owner/repo')).toBeInTheDocument();
-    expect(screen.getByText('PR #9')).toBeInTheDocument();
+    expect(screen.queryByText('PR #9')).not.toBeInTheDocument();
     const branchLink = screen.getByRole('link', { name: 'aidlc/i1' });
     expect(branchLink).toHaveAttribute('href', 'https://github.com/owner/repo/tree/aidlc/i1');
     expect(screen.getByText('main')).toBeInTheDocument();
     const link = screen.getByRole('link', { name: /open pr/i });
     expect(link).toHaveAttribute('href', 'https://github.com/owner/repo/pull/9');
+    expect(link).toHaveTextContent('Open PR #9');
   });
 
   it('shows the branch (name + link, no base) once code is pushed, before any PR', async () => {
@@ -1678,15 +1706,22 @@ describe('IntentView — WP7 construction UI', () => {
 
   it('maps approve/request-changes options to approved/rejected statuses and carries feedback', async () => {
     get.mockResolvedValue({
-      ...baseDetail({ status: 'WAITING', pendingHumanTaskId: 'eg-skeleton-s1-run1' }),
+      ...baseDetail({
+        status: 'WAITING',
+        pendingHumanTaskId: 'eg-skeleton-s1-run1',
+        gitProvider: 'bitbucket',
+        repos: ['acme/repo'],
+      }),
       gates: [
         {
           humanTaskId: 'eg-skeleton-s1-run1',
           stageInstanceId: null,
-          unitSlug: null,
+          unitSlug: 'auth',
+          sectionIndex: 1,
           kind: 'approval',
           status: 'pending',
-          prompt: 'Walking skeleton "auth" completed.',
+          prompt:
+            'Walking skeleton "auth" completed.\nReview generated code (branch aidlc/i1--s1-unit-auth).',
           options: ['approve', 'request-changes'],
           questions: null,
           answer: null,
@@ -1695,12 +1730,33 @@ describe('IntentView — WP7 construction UI', () => {
           createdAt: null,
         },
       ],
+      units: [
+        {
+          sectionIndex: 1,
+          slug: 'auth',
+          dependsOn: [],
+          state: 'MERGED',
+          batchIndex: 0,
+          branch: 'aidlc/i1--s1-unit-auth',
+          startedAt: null,
+          mergedAt: null,
+          failureReason: null,
+          blockedOn: null,
+          updatedAt: null,
+        },
+      ],
     });
     answerGate.mockResolvedValue({});
     renderAt();
     // Gates offering request-changes render the free-text feedback field; the
     // feedback rides the answer so the engine can revise the increment and
     // re-ask instead of failing the run.
+    const branchLink = await screen.findByRole('link', { name: 'aidlc/i1--s1-unit-auth' });
+    expect(branchLink).toHaveAttribute(
+      'href',
+      'https://bitbucket.org/acme/repo/src/aidlc/i1--s1-unit-auth',
+    );
+    expect(branchLink).toHaveAttribute('target', '_blank');
     const feedback = await screen.findByPlaceholderText(/What should change/);
     await userEvent.type(feedback, 'wire real auth');
     await userEvent.click(screen.getByRole('button', { name: 'request-changes' }));
@@ -1713,6 +1769,53 @@ describe('IntentView — WP7 construction UI', () => {
         status: 'rejected',
       }),
     );
+  });
+
+  it('shows plain branch text when a walking-skeleton branch URL cannot be built', async () => {
+    get.mockResolvedValue({
+      ...baseDetail({
+        status: 'WAITING',
+        pendingHumanTaskId: 'eg-skeleton-s1-run1',
+        gitProvider: null,
+      }),
+      gates: [
+        {
+          humanTaskId: 'eg-skeleton-s1-run1',
+          stageInstanceId: null,
+          unitSlug: 'auth',
+          sectionIndex: 1,
+          kind: 'approval',
+          status: 'pending',
+          prompt: 'Walking skeleton "auth" completed.',
+          options: ['approve'],
+          questions: null,
+          answer: null,
+          answeredBy: null,
+          answeredAt: null,
+          createdAt: null,
+        },
+      ],
+      units: [
+        {
+          sectionIndex: 1,
+          slug: 'auth',
+          dependsOn: [],
+          state: 'MERGED',
+          batchIndex: 0,
+          branch: 'aidlc/i1--s1-unit-auth',
+          startedAt: null,
+          mergedAt: null,
+          failureReason: null,
+          blockedOn: null,
+          updatedAt: null,
+        },
+      ],
+    });
+
+    renderAt();
+
+    expect(await screen.findByText('aidlc/i1--s1-unit-auth')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'aidlc/i1--s1-unit-auth' })).not.toBeInTheDocument();
   });
 });
 
@@ -2188,5 +2291,86 @@ describe('IntentView — provenance tree structure', () => {
     expect(screen.queryByRole('group', { name: /Filter/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /1 doc/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /\d+ item/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('IntentView — resume after a failed gate callback', () => {
+  const marker = { humanTaskId: 'h1', callbackId: 'cb-h1', answeredAt: null };
+
+  beforeEach(() => {
+    clearIntentCache();
+    get.mockReset();
+    graph.mockReset().mockResolvedValue({ nodes: [], edges: [] });
+    compiled.mockReset().mockResolvedValue({ graph: { nodes: [], edges: [] } });
+    workflowGet.mockReset().mockResolvedValue({ phases: [] });
+  });
+
+  const answered = (over: Record<string, unknown> = {}) => ({
+    humanTaskId: 'h1',
+    stageInstanceId: 'si-1',
+    unitSlug: null,
+    sectionIndex: null,
+    kind: 'question',
+    status: 'answered',
+    resumeAvailable: true,
+    prompt: null,
+    options: null,
+    questions: '[]',
+    answer: { ok: 1 },
+    answeredBy: 'u1',
+    answeredByName: 'U',
+    answeredAt: null,
+    createdAt: null,
+    ...over,
+  });
+
+  it('offers the resume while the intent waits on the answered gate', async () => {
+    get.mockResolvedValue({
+      ...baseDetail({ status: 'WAITING', pendingHumanTaskId: 'h1', resumeRequired: marker }),
+      gates: [answered()],
+    });
+    renderAt();
+
+    expect(
+      await screen.findByText('Your answer was saved but the run did not continue'),
+    ).toBeInTheDocument();
+  });
+
+  it('does not offer it once the intent is no longer waiting', async () => {
+    get.mockResolvedValue(baseDetail({ status: 'CANCELLED', resumeRequired: marker }));
+    renderAt();
+
+    expect(await screen.findByText('My intent')).toBeInTheDocument();
+    expect(
+      screen.queryByText('Your answer was saved but the run did not continue'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('offers the resume of a lane question while the intent keeps running', async () => {
+    get.mockResolvedValue({
+      ...baseDetail({
+        status: 'RUNNING',
+        resumeRequired: { ...marker, humanTaskId: 'h-lane', callbackId: 'cb-lane' },
+      }),
+      gates: [answered({ humanTaskId: 'h-lane', unitSlug: 'billing', sectionIndex: 1 })],
+    });
+    renderAt();
+
+    expect(
+      await screen.findByText('Your answer was saved but the run did not continue'),
+    ).toBeInTheDocument();
+  });
+
+  it('does not offer it when the server says no resume is owed', async () => {
+    get.mockResolvedValue({
+      ...baseDetail({ status: 'RUNNING', resumeRequired: marker }),
+      gates: [answered({ resumeAvailable: false })],
+    });
+    renderAt();
+
+    expect(await screen.findByText('My intent')).toBeInTheDocument();
+    expect(
+      screen.queryByText('Your answer was saved but the run did not continue'),
+    ).not.toBeInTheDocument();
   });
 });

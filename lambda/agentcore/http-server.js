@@ -44,6 +44,10 @@
 //       verifies + concludes, the agent only edits the conflicted files).
 //   { "command": "record-unit-pr", unitPrs:[...] } → best-effort Neptune
 //       projection for unit review PRs; DDB remains scheduling truth.
+//   { "command": "record-learning", projectId, intentId, executionId,
+//     stageInstanceId?, stageId?, learnings, recordedBy?, recordedByName? }
+//     → the learnings ritual: write a human-authored learning offered at an
+//       approval gate into the project rule stack. Never fails the run.
 //   { "command": "discussion-assist-start", ...discussion args }
 //     → accepts in ms, runs Quorum's one-shot discussion answer in a background
 //       job, then updates the pending DiscussionMessage and broadcasts it.
@@ -68,6 +72,7 @@ import { Logger } from '@aws-lambda-powertools/logger';
 import http from 'node:http';
 import { createProcessStore } from '../shared/v2-process-store.js';
 import { commandDefinition } from './command-registry.js';
+import { installProcessGroupShutdown } from './cli/spawn.js';
 
 const logger = new Logger({ persistentKeys: { component: 'agentcore' } });
 
@@ -86,6 +91,11 @@ export const createBusyTracker = () => {
     },
   };
 };
+
+export const createRecordLearningHandler =
+  ({ recordLearning, store, openGraph, broadcast }) =>
+  (payload) =>
+    recordLearning(payload, { store, openGraph, broadcast });
 
 // Dispatch one parsed invocation to the right command handler. PURE of HTTP —
 // returns { statusCode, body }. `handlers` = { initWs, runStage }; `busy` is the
@@ -218,6 +228,7 @@ const main = async () => {
   const { deriveArtifacts } = await import('./commands/derive-artifacts.js');
   const { createWorkflowCheckpoint } = await import('./commands/create-workflow-checkpoint.js');
   const { recordPr } = await import('./commands/record-pr.js');
+  const { recordLearning } = await import('./commands/record-learning.js');
   const { recordUnitPr } = await import('./commands/record-unit-pr.js');
   const { initLane, mergeLane, reconcileLane, refreshIntentWorkspace } =
     await import('./commands/lane.js');
@@ -308,6 +319,9 @@ const main = async () => {
     // Fan-in PR record: write the opened PR(s) into the graph (the orchestrator
     // has no Neptune access, so it forwards the structured PR data here).
     recordPr: (p) => recordPr(p, { store, openGraph, broadcast }),
+    // Learnings ritual: the human's gate answer becomes a durable
+    // project learning here, because the orchestrator has no Neptune access.
+    recordLearning: createRecordLearningHandler({ recordLearning, store, openGraph, broadcast }),
     recordUnitPr: (p) => recordUnitPr(p, { store, openGraph, broadcast }),
     // WP5 unit lanes: engine-owned lane git (docs/v2-parallel.md A3). init-lane
     // runs in the lane's own session; merge-lane in the intent session.
@@ -408,6 +422,14 @@ const main = async () => {
       deriveArtifacts: (q) => handlers.deriveArtifacts(q, context),
       env: context.env,
     });
+
+  // Shutdown policy, installed once for the whole container rather than lazily by
+  // the first persona session: a stop reaps the persona-session process groups
+  // (their children are not group leaders and would otherwise be orphaned) and
+  // then lets the signal take its default course. A container that never runs a
+  // persona stage therefore keeps exactly the disposition it had before persona
+  // sessions existed.
+  installProcessGroupShutdown();
 
   const server = createServer({
     handlers,

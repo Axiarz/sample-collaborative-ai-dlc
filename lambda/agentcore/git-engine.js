@@ -29,6 +29,7 @@ import path from 'node:path';
 import { buildCloneUrl } from '../shared/git-providers.js';
 import { NO_HOOKS_PATH, runGitCommand } from './git-runner.js';
 import { repoTargetDir } from './repo-paths.js';
+import { repoCheckoutPath } from '../shared/repo-validation.js';
 import {
   knownChangedFileProvenance,
   mapKnownChangedFiles,
@@ -690,7 +691,7 @@ export const pushBranch = async ({
 
 export const toWorkspaceRelative = (files = [], { url, multi }) => {
   if (!multi) return [...files];
-  const projectPrefix = `${url}/`;
+  const projectPrefix = `${repoCheckoutPath(url)}/`;
   return files.map((file) => (file.startsWith(projectPrefix) ? file : `${projectPrefix}${file}`));
 };
 

@@ -18,6 +18,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { LOOP_BACK_LIMIT } from './stage-loopback.js';
 import {
   META,
   executionMetaKey,
@@ -33,6 +34,7 @@ import {
   quorumEditKey,
   composeKey,
   trackerSyncKey,
+  receiptKey,
   executionPk,
   projectPk,
   projectStatusIndex,
@@ -60,6 +62,7 @@ import {
   buildQuorumEditRow,
   buildComposeRow,
   buildTrackerSyncRow,
+  buildReceiptRow,
   UNIT_STATES,
   UNIT_PR_STATES,
   FEEDBACK_STATES,
@@ -67,6 +70,7 @@ import {
   COMPOSE_STATES,
   TRACKER_SYNC_STATES,
   TRACKER_SYNC_TERMINAL_STATES,
+  RECEIPT_KINDS,
   CONSTRUCTION_AUTONOMY_MODES,
   ACTIVE_EXECUTION_STATUSES,
 } from './v2-process-keys.js';
@@ -192,6 +196,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     orchestratorStartedAt,
     orchestratorExpiresAt,
     rewindFromStageId,
+    resumeRequired,
     currentPhase,
     currentStage,
     pendingHumanTaskId,
@@ -204,6 +209,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     starterEmail,
     agentCli,
     credentialBinding,
+    mcpServersByTier,
     constructionAutonomyMode,
     projectType,
     // Per-intent skip overlay (stage-skip.js). Only the rewind endpoint writes
@@ -224,6 +230,10 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     pendingAttachmentUploads,
     pendingAttachmentDeletions,
     ifAttachmentRevision = null,
+    // Apply the write only while META's resume marker names this gate, so
+    // clearing a resolved marker never drops a newer one for another gate.
+    ifResumeRequiredFor = null,
+    ifDraftRevision = null,
   }) => {
     const ts = now();
     const sets = ['updatedAt = :ts'];
@@ -335,6 +345,14 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       sets.push('credentialBinding = :acb');
       values[':acb'] = credentialBinding;
     }
+    if (mcpServersByTier !== undefined) {
+      if (status !== 'CREATED' || !fromStatus) {
+        throw new Error('MCP settings can only be replaced during a conditional launch');
+      }
+      sets.push('mcpServersByTier = :mcp');
+      values[':mcp'] = mcpServersByTier;
+      removes.push('customMcpServers');
+    }
     if (orchestratorRunId !== undefined) {
       sets.push('orchestratorRunId = :orid');
       values[':orid'] = orchestratorRunId;
@@ -358,6 +376,14 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     if (rewindFromStageId !== undefined) {
       sets.push('rewindFromStageId = :rwf');
       values[':rwf'] = rewindFromStageId;
+    }
+    // Clearing REMOVEs the marker rather than writing null, so a run that never
+    // needed a resume keeps the row shape it always had.
+    if (resumeRequired === null) {
+      removes.push('resumeRequired');
+    } else if (resumeRequired !== undefined) {
+      sets.push('resumeRequired = :rsr');
+      values[':rsr'] = resumeRequired;
     }
     // The autonomy-ladder decision (docs/v2-parallel.md A2 rule 9), stamped by
     // the orchestrator when the human answers the ladder prompt. Validated at
@@ -450,6 +476,19 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       sets.push('pendingAttachmentDeletions = :pad');
       values[':pad'] = pendingAttachmentDeletions;
     }
+    if (ifDraftRevision !== null) {
+      if (!Number.isSafeInteger(ifDraftRevision) || ifDraftRevision < 0)
+        throw new Error('ifDraftRevision must be a non-negative integer');
+      sets.push('draftRevision = :nextDraftRevision');
+      values[':nextDraftRevision'] = ifDraftRevision + 1;
+    } else if (
+      [title, prompt, scope, composedGrid, skipStageIds].some((value) => value !== undefined)
+    ) {
+      // Composer/orchestrator changes invalidate a browser's preflight too.
+      sets.push('draftRevision = if_not_exists(draftRevision, :draftZero) + :draftOne');
+      values[':draftZero'] = 0;
+      values[':draftOne'] = 1;
+    }
     const params = {
       TableName: table(),
       Key: executionMetaKey(executionId),
@@ -468,11 +507,23 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       conditions.push('orchestratorRunId = :ifOrid');
       params.ExpressionAttributeValues[':ifOrid'] = ifOrchestratorRunId;
     }
+    if (ifResumeRequiredFor !== null) {
+      conditions.push('resumeRequired.humanTaskId = :ifRrh');
+      params.ExpressionAttributeValues[':ifRrh'] = ifResumeRequiredFor;
+    }
     if (ifAttachmentRevision !== null) {
       conditions.push(
         '(attribute_not_exists(attachmentRevision) OR attachmentRevision = :ifAttachmentRevision)',
       );
       params.ExpressionAttributeValues[':ifAttachmentRevision'] = ifAttachmentRevision;
+    }
+    if (ifDraftRevision !== null) {
+      conditions.push(
+        ifDraftRevision === 0
+          ? '(attribute_not_exists(draftRevision) OR draftRevision = :ifDraftRevision)'
+          : 'draftRevision = :ifDraftRevision',
+      );
+      values[':ifDraftRevision'] = ifDraftRevision;
     }
     if (conditions.length) params.ConditionExpression = conditions.join(' AND ');
     const { Attributes } = await ddb.send(new UpdateCommand(params));
@@ -488,9 +539,13 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     return item;
   };
 
-  const getStage = async (executionId, stageInstanceId) => {
+  const getStage = async (executionId, stageInstanceId, { consistentRead = false } = {}) => {
     const { Item } = await ddb.send(
-      new GetCommand({ TableName: table(), Key: stageKey(executionId, stageInstanceId) }),
+      new GetCommand({
+        TableName: table(),
+        Key: stageKey(executionId, stageInstanceId),
+        ...(consistentRead ? { ConsistentRead: true } : {}),
+      }),
     );
     return Item ?? null;
   };
@@ -625,7 +680,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     stageCallbackId,
     aidlcRepoRef,
   }) => {
-    const existing = await getStage(executionId, stageInstanceId);
+    const existing = await getStage(executionId, stageInstanceId, { consistentRead: true });
     const ts = now();
     // Fold the open park window into the accumulator. Guarded parses: an
     // unparsable timestamp contributes 0 rather than poisoning waitMs with NaN.
@@ -698,6 +753,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     actor,
     summary,
     payloadRef,
+    detail,
   }) => {
     const item = buildEventRow({
       executionId,
@@ -708,6 +764,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       actor,
       summary,
       payloadRef,
+      detail,
       now: now(),
       eventId: nextId(),
     });
@@ -735,6 +792,13 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     skipTargets,
     recomposeTargets,
     nextStageId,
+    findings,
+    detail,
+    learningsRitual,
+    loopBackTarget,
+    loopBackReason,
+    loopBackStatus,
+    loopBackNote,
     humanTaskId,
   }) => {
     const id = humanTaskId ?? nextId();
@@ -751,6 +815,13 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       skipTargets,
       recomposeTargets,
       nextStageId,
+      findings,
+      detail,
+      learningsRitual,
+      loopBackTarget,
+      loopBackReason,
+      loopBackStatus,
+      loopBackNote,
       now: now(),
     });
     await ddb.send(
@@ -815,53 +886,128 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     }
   };
 
-  const getHumanTask = async (executionId, humanTaskId) => {
+  const getHumanTask = async (executionId, humanTaskId, { consistentRead = false } = {}) => {
     const { Item } = await ddb.send(
-      new GetCommand({ TableName: table(), Key: humanTaskKey(executionId, humanTaskId) }),
+      new GetCommand({
+        TableName: table(),
+        Key: humanTaskKey(executionId, humanTaskId),
+        ...(consistentRead ? { ConsistentRead: true } : {}),
+      }),
     );
     return Item ?? null;
   };
 
-  // Resolve a pending human gate (CAS on status=pending so it can't be answered
-  // twice). `answer` is the structured answer payload.
-  const answerHumanTask = async ({
+  const markGateCallbackConsumed = async ({ executionId, humanTaskId, callbackId }) => {
+    if (!callbackId) return null;
+    try {
+      const { Attributes } = await ddb.send(
+        new UpdateCommand({
+          TableName: table(),
+          Key: humanTaskKey(executionId, humanTaskId),
+          ConditionExpression: 'callbackId = :cb AND attribute_not_exists(callbackConsumedAt)',
+          UpdateExpression: 'SET callbackConsumedAt = :ts',
+          ExpressionAttributeValues: { ':cb': callbackId, ':ts': now() },
+          ReturnValues: 'ALL_NEW',
+        }),
+      );
+      return Attributes ?? null;
+    } catch (error) {
+      if (error?.name === 'ConditionalCheckFailedException') return null;
+      throw error;
+    }
+  };
+
+  const humanTaskAnswerUpdate = ({
     executionId,
     humanTaskId,
     status,
     answer,
     answeredBy,
     answeredByName,
-  }) => {
-    const ts = now();
+    answeredAt,
+  }) => ({
+    TableName: table(),
+    Key: humanTaskKey(executionId, humanTaskId),
+    ConditionExpression: '#status = :pending',
+    UpdateExpression:
+      'SET #status = :status, answer = :answer, answeredBy = :by, answeredByName = :byName, answeredAt = :ts, GSI2SK = :g2sk',
+    ExpressionAttributeNames: { '#status': 'status' },
+    ExpressionAttributeValues: {
+      ':pending': 'pending',
+      ':status': status,
+      ':answer': answer ?? null,
+      ':by': answeredBy ?? null,
+      ':byName': answeredByName ?? null,
+      ':ts': answeredAt,
+      ':g2sk': executionTypeStateIndex({
+        executionId,
+        type: 'HUMAN',
+        state: status,
+        id: humanTaskId,
+      }).GSI2SK,
+    },
+  });
+
+  // Resolve a pending human gate (CAS on status=pending so it can't be answered
+  // twice). `answer` is the structured answer payload.
+  const answerHumanTask = async (input) => {
     try {
       const { Attributes } = await ddb.send(
         new UpdateCommand({
-          TableName: table(),
-          Key: humanTaskKey(executionId, humanTaskId),
-          ConditionExpression: '#status = :pending',
-          UpdateExpression:
-            'SET #status = :status, answer = :answer, answeredBy = :by, answeredByName = :byName, answeredAt = :ts, GSI2SK = :g2sk',
-          ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: {
-            ':pending': 'pending',
-            ':status': status,
-            ':answer': answer ?? null,
-            ':by': answeredBy ?? null,
-            ':byName': answeredByName ?? null,
-            ':ts': ts,
-            ':g2sk': executionTypeStateIndex({
-              executionId,
-              type: 'HUMAN',
-              state: status,
-              id: humanTaskId,
-            }).GSI2SK,
-          },
+          ...humanTaskAnswerUpdate({ ...input, answeredAt: now() }),
           ReturnValues: 'ALL_NEW',
         }),
       );
       return Attributes;
     } catch (e) {
       if (e?.name === 'ConditionalCheckFailedException') return null;
+      throw e;
+    }
+  };
+
+  // An answer with attached steering becomes visible as one atomic decision.
+  // This prevents the orchestrator from observing the answered gate and
+  // resuming before run-stage can see the course correction.
+  const answerHumanTaskWithSteering = async ({ steering, ...answerInput }) => {
+    const ts = now();
+    const steer = buildSteeringRow({
+      ...steering,
+      executionId: answerInput.executionId,
+      steerId: steering.steerId ?? `st-${nextId()}`,
+      now: ts,
+    });
+    try {
+      await ddb.send(
+        new TransactWriteCommand({
+          TransactItems: [
+            { Update: humanTaskAnswerUpdate({ ...answerInput, answeredAt: ts }) },
+            {
+              Put: {
+                TableName: table(),
+                Item: steer,
+                ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
+              },
+            },
+          ],
+        }),
+      );
+      return {
+        answered: {
+          ...answerInput,
+          answer: answerInput.answer ?? null,
+          answeredBy: answerInput.answeredBy ?? null,
+          answeredByName: answerInput.answeredByName ?? null,
+          answeredAt: ts,
+        },
+        steering: steer,
+      };
+    } catch (e) {
+      if (
+        e?.name === 'TransactionCanceledException' ||
+        e?.name === 'ConditionalCheckFailedException'
+      ) {
+        return null;
+      }
       throw e;
     }
   };
@@ -971,19 +1117,20 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     });
 
   // Only the not-yet-delivered steering rows, oldest first — what run-stage
-  // injects at its next entry. Uses GSI2 (TYPE#STEER#STATE#pending#). Paginated:
-  // a dropped page here would silently swallow a user's correction.
+  // injects at its next entry. Read the execution partition consistently so a
+  // just-committed answer + steering transaction is visible before early resume.
+  // Paginated: a dropped page here would silently swallow a user's correction.
   const listPendingSteering = async (executionId) => {
     const items = await queryAll(ddb, {
       TableName: table(),
-      IndexName: 'GSI2',
-      KeyConditionExpression: 'GSI2PK = :pk AND begins_with(GSI2SK, :p)',
+      KeyConditionExpression: 'pk = :pk AND begins_with(sk, :p)',
       ExpressionAttributeValues: {
         ':pk': executionPk(executionId),
-        ':p': 'TYPE#STEER#STATE#pending#',
+        ':p': 'STEER#',
       },
+      ConsistentRead: true,
     });
-    return items.toSorted(bySk);
+    return items.filter((item) => item.status === 'pending').toSorted(bySk);
   };
 
   // Flip a steering row pending → consumed (CAS) as it enters an agent
@@ -1061,63 +1208,210 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     }
   };
 
+  // Bounded-repair counters (checkpoint-ladder.md): a per-STAGE# ADD accumulator
+  // per checkpoint, enforcing at most one repair turn per checkpoint per attempt.
+  // Declared here (rather than beside `raiseStageCounter`, its other consumer) so
+  // `resetStageRow` can zero every counter this platform names without either
+  // function reaching past the other's definition. Adding a new bounded-repair
+  // counter (a new checkpoint stream) means adding its field name HERE — both
+  // the bump allowlist and the rewind/retry reset then cover it automatically.
+  const STAGE_COUNTER_FIELDS = ['summaryRepairAttempts', 'planApprovalRepairAttempts'];
+
   // Reset a stage row for a rewind/retry: back to PENDING with attempt+1,
   // conversation handle + terminal fields cleared. Plain retries preserve compact
   // commit refs until successful CodeFile projection; corrective rewinds clear
   // them because the prior implementation is intentionally being replaced.
   // A stage that never ran (no row yet) needs no reset — returns null. The prior
   // attempt's history stays in EVENT#/OUTPUT#.
+  //
+  // Every bounded-repair counter (STAGE_COUNTER_FIELDS) is zeroed here too: the
+  // repair ladder's cap is per ATTEMPT, and a stale non-zero counter surviving a
+  // rewind/retry would arrive at the new attempt already "used up", silently
+  // withholding the one repair turn the fresh attempt is entitled to.
+  // `loopBackId` marks a reset as part of ONE loop-back decision and is what makes
+  // the reset safe to replay: the read is consistent, the clean-PENDING
+  // short-circuit is skipped (a loop-back must bump the attempt even from a clean
+  // row), the write is conditional on the attempt it read, and the id is stamped on
+  // the row so a replay recognises its own earlier write instead of bumping again.
+  // `countsAgainstCap` additionally tallies the decision on META, which is the
+  // per-intent cap — true for the stage the run jumps TO (one tally per decision),
+  // false for the stage it jumps FROM, which needs the same guards and no second
+  // tally.
   const resetStageRow = async ({
     executionId,
     stageInstanceId,
     preservePendingCodeCommitRefs = false,
+    loopBackId = null,
+    countsAgainstCap = true,
   }) => {
-    const existing = await getStage(executionId, stageInstanceId);
+    const existing = await getStage(executionId, stageInstanceId, {
+      consistentRead: Boolean(loopBackId),
+    });
     if (!existing) return null;
+    // Replay of a reset this same decision already applied. Returned rather than
+    // re-applied so the attempt is bumped exactly once per loop-back.
+    if (loopBackId && existing.lastLoopBackId === loopBackId) {
+      // Consistent, like every other read on this path: the tally this replay is
+      // reporting was written by the transaction below, so an eventually
+      // consistent META could hand the caller a count from before its own write.
+      const meta = countsAgainstCap
+        ? await getExecution(executionId, { consistentRead: true })
+        : null;
+      return countsAgainstCap
+        ? { ...existing, loopBackCount: Number(meta?.loopBackCount ?? 0) }
+        : existing;
+    }
     // A previous rewind attempt may have reset this row before its caller
     // timed out. Treat a clean PENDING row as already reset so replay does not
     // inflate the attempt counter or duplicate reset events.
     if (
+      !loopBackId &&
       existing.state === 'PENDING' &&
       existing.startedAt == null &&
       existing.cliSessionId == null &&
       existing.runtimeError == null &&
-      (preservePendingCodeCommitRefs || existing.pendingCodeCommitRefs == null)
+      (preservePendingCodeCommitRefs || existing.pendingCodeCommitRefs == null) &&
+      STAGE_COUNTER_FIELDS.every((field) => Number(existing[field] ?? 0) === 0)
     ) {
       return null;
     }
     const ts = now();
-    const { Attributes } = await ddb.send(
+    const counterResets = STAGE_COUNTER_FIELDS.map((field) => `${field} = :zero`).join(', ');
+    const values = {
+      ':state': 'PENDING',
+      ':attempt': Number(existing.attempt ?? 0) + 1,
+      ':null': null,
+      ':zero': 0,
+      ':pendingCodeCommitRefs': preservePendingCodeCommitRefs
+        ? (existing.pendingCodeCommitRefs ?? null)
+        : null,
+      ':ts': ts,
+      ':g2sk': executionTypeStateIndex({
+        executionId,
+        type: 'STAGE',
+        state: 'PENDING',
+        id: stageInstanceId,
+      }).GSI2SK,
+    };
+    if (loopBackId) {
+      values[':oldAttempt'] = Number(existing.attempt ?? 0);
+      values[':loopBackId'] = loopBackId;
+    }
+    const stageUpdate = {
+      TableName: table(),
+      Key: stageKey(executionId, stageInstanceId),
+      UpdateExpression:
+        'SET #state = :state, attempt = :attempt, cli = :null, cliSessionId = :null, ' +
+        'runtimeError = :null, startedAt = :null, completedAt = :null, ' +
+        'parkedAt = :null, pendingHumanTaskId = :null, waitMs = :zero, ' +
+        'pendingCodeCommitRefs = :pendingCodeCommitRefs, ' +
+        `${loopBackId ? 'lastLoopBackId = :loopBackId, ' : ''}` +
+        `${counterResets}, updatedAt = :ts, GSI2SK = :g2sk`,
+      ExpressionAttributeNames: { '#state': 'state' },
+      ExpressionAttributeValues: values,
+      ...(loopBackId
+        ? {
+            ConditionExpression: 'attribute_exists(pk) AND attempt = :oldAttempt',
+            ...(countsAgainstCap ? {} : { ReturnValues: 'ALL_NEW' }),
+          }
+        : { ReturnValues: 'ALL_NEW' }),
+    };
+    if (!loopBackId) {
+      const { Attributes } = await ddb.send(new UpdateCommand(stageUpdate));
+      return Attributes;
+    }
+    // Guarded but not tallied: the attempt CAS alone, so a stale read cannot write
+    // an attempt another writer already used. A lost CAS returns null and the caller
+    // fails the loop-back closed rather than leaving this stage's earlier receipts
+    // reachable under the new attempt.
+    if (!countsAgainstCap) {
+      try {
+        const { Attributes } = await ddb.send(new UpdateCommand(stageUpdate));
+        return Attributes;
+      } catch (error) {
+        if (error?.name !== 'ConditionalCheckFailedException') throw error;
+        const row = await getStage(executionId, stageInstanceId, { consistentRead: true });
+        return row?.lastLoopBackId === loopBackId ? row : null;
+      }
+    }
+
+    try {
+      await ddb.send(
+        new TransactWriteCommand({
+          TransactItems: [
+            { Update: stageUpdate },
+            {
+              Update: {
+                TableName: table(),
+                Key: executionMetaKey(executionId),
+                UpdateExpression:
+                  'SET loopBackCount = if_not_exists(loopBackCount, :zero) + :one, ' +
+                  'loopBackIds = list_append(if_not_exists(loopBackIds, :empty), :newLoopBackIds), ' +
+                  'updatedAt = :ts',
+                ConditionExpression:
+                  'attribute_exists(pk) AND ' +
+                  '(attribute_not_exists(loopBackIds) OR NOT contains(loopBackIds, :loopBackId)) AND ' +
+                  '(attribute_not_exists(loopBackCount) OR loopBackCount < :limit)',
+                ExpressionAttributeValues: {
+                  ':zero': 0,
+                  ':one': 1,
+                  ':empty': [],
+                  ':newLoopBackIds': [loopBackId],
+                  ':loopBackId': loopBackId,
+                  ':limit': LOOP_BACK_LIMIT,
+                  ':ts': ts,
+                },
+              },
+            },
+          ],
+        }),
+      );
+    } catch (error) {
+      if (error?.name !== 'TransactionCanceledException') throw error;
+      const meta = await getExecution(executionId, { consistentRead: true });
+      if (!meta?.loopBackIds?.includes(loopBackId)) throw error;
+      const row = await getStage(executionId, stageInstanceId, { consistentRead: true });
+      return row ? { ...row, loopBackCount: Number(meta.loopBackCount ?? 0) } : row;
+    }
+    const [row, meta] = await Promise.all([
+      getStage(executionId, stageInstanceId, { consistentRead: true }),
+      getExecution(executionId, { consistentRead: true }),
+    ]);
+    return row ? { ...row, loopBackCount: Number(meta?.loopBackCount ?? 0) } : row;
+  };
+
+  // The loop-back decision whose artifact archive this stage instance completed.
+  // Stamped by the target's re-run AFTER the archive succeeded, so a retry that
+  // follows a partial archive re-archives (every write in
+  // `archiveArtifactsForStages` is replay-safe) instead of skipping and letting the
+  // new attempt overwrite a head that was never versioned.
+  const markLoopBackArchived = async ({ executionId, stageInstanceId, loopBackId }) => {
+    await ddb.send(
       new UpdateCommand({
         TableName: table(),
         Key: stageKey(executionId, stageInstanceId),
-        UpdateExpression:
-          'SET #state = :state, attempt = :attempt, cli = :null, cliSessionId = :null, ' +
-          'runtimeError = :null, startedAt = :null, completedAt = :null, ' +
-          'parkedAt = :null, pendingHumanTaskId = :null, waitMs = :zero, ' +
-          'pendingCodeCommitRefs = :pendingCodeCommitRefs, ' +
-          'updatedAt = :ts, GSI2SK = :g2sk',
-        ExpressionAttributeNames: { '#state': 'state' },
-        ExpressionAttributeValues: {
-          ':state': 'PENDING',
-          ':attempt': Number(existing.attempt ?? 0) + 1,
-          ':null': null,
-          ':zero': 0,
-          ':pendingCodeCommitRefs': preservePendingCodeCommitRefs
-            ? (existing.pendingCodeCommitRefs ?? null)
-            : null,
-          ':ts': ts,
-          ':g2sk': executionTypeStateIndex({
-            executionId,
-            type: 'STAGE',
-            state: 'PENDING',
-            id: stageInstanceId,
-          }).GSI2SK,
-        },
-        ReturnValues: 'ALL_NEW',
+        UpdateExpression: 'SET loopBackArchiveId = :loopBackId',
+        ConditionExpression: 'attribute_exists(pk)',
+        ExpressionAttributeValues: { ':loopBackId': loopBackId },
       }),
     );
-    return Attributes;
+  };
+
+  // The build-and-test agent's loop-back recommendation, kept on its STAGE# row
+  // until the validation gate reads it. `reason: null` clears it. A fresh run
+  // rebuilds the row (putStage), which drops it too.
+  const setLoopBackRecommendation = async ({ executionId, stageInstanceId, reason }) => {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: table(),
+        Key: stageKey(executionId, stageInstanceId),
+        UpdateExpression: reason
+          ? 'SET loopBackRecommendation = :reason'
+          : 'REMOVE loopBackRecommendation',
+        ConditionExpression: 'attribute_exists(pk)',
+        ...(reason ? { ExpressionAttributeValues: { ':reason': reason } } : {}),
+      }),
+    );
   };
 
   const recordMetric = async ({
@@ -1211,6 +1505,121 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     return rows
       .filter((r) => !stageInstanceId || r.stageInstanceId === stageInstanceId)
       .toSorted(bySk);
+  };
+
+  // Write one gate-precondition receipt. IDEMPOTENT by construction: the SK is
+  // deterministic and the write is conditional, so a replay (a retried gate
+  // answer, a re-driven durable step) returns the EXISTING row rather than
+  // failing or double-counting. Callers therefore never need to check first.
+  const putReceipt = async ({
+    executionId,
+    kind,
+    stageInstanceId,
+    attempt,
+    unitSlug = null,
+    sectionIndex = null,
+    ordinal = null,
+    round = null,
+    boundDigest = null,
+    choice = null,
+    decidedBy = null,
+    decidedByName = null,
+    humanTaskId = null,
+    detail = null,
+  }) => {
+    if (!RECEIPT_KINDS.includes(kind)) {
+      throw new Error(`putReceipt: unknown receipt kind "${kind}"`);
+    }
+    const item = buildReceiptRow({
+      executionId,
+      kind,
+      stageInstanceId,
+      attempt,
+      unitSlug,
+      sectionIndex,
+      ordinal,
+      round,
+      boundDigest,
+      choice,
+      decidedBy,
+      decidedByName,
+      humanTaskId,
+      detail,
+      now: now(),
+    });
+    try {
+      await ddb.send(
+        new PutCommand({
+          TableName: table(),
+          Item: item,
+          ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
+        }),
+      );
+      return item;
+    } catch (e) {
+      if (e?.name !== 'ConditionalCheckFailedException') throw e;
+      const { Item } = await ddb.send(
+        new GetCommand({ TableName: table(), Key: { pk: item.pk, sk: item.sk } }),
+      );
+      return Item ?? item;
+    }
+  };
+
+  const getReceipt = async (executionId, selector) => {
+    const { Item } = await ddb.send(
+      new GetCommand({ TableName: table(), Key: receiptKey(executionId, selector) }),
+    );
+    return Item ?? null;
+  };
+
+  // Every receipt for an execution, narrowed in memory. `attempt` is the
+  // invalidation filter: passing the STAGE# row's current attempt is what makes
+  // a prior attempt's receipts invisible after a rewind.
+  const listReceipts = async (
+    executionId,
+    { kind, stageInstanceId, attempt, consistentRead = false } = {},
+  ) => {
+    const rows = await queryAll(ddb, {
+      TableName: table(),
+      KeyConditionExpression: 'pk = :pk AND begins_with(sk, :p)',
+      ExpressionAttributeValues: { ':pk': executionPk(executionId), ':p': 'RECEIPT#' },
+      ...(consistentRead ? { ConsistentRead: true } : {}),
+    });
+    return rows
+      .filter((r) => kind == null || r.kind === kind)
+      .filter((r) => stageInstanceId == null || r.stageInstanceId === stageInstanceId)
+      .filter((r) => attempt == null || Number(r.attempt) === Number(attempt))
+      .toSorted(bySk);
+  };
+
+  // Raise a bounded-repair counter on the STAGE# row to `to`, but only while it
+  // is below it, and say whether this call raised it. The checkpoint ladder
+  // passes the validation revision + 1, so each revision of an attempt can claim
+  // exactly one repair turn: the cap must be persisted, not held in process
+  // memory, because the stage runner can be re-invoked (resume, redrive), and the
+  // conditional write means two concurrent claims cannot both succeed. The field
+  // is allowlisted (STAGE_COUNTER_FIELDS, declared beside resetStageRow above)
+  // because it is interpolated into the update expression.
+  const raiseStageCounter = async ({ executionId, stageInstanceId, field, to }) => {
+    if (!STAGE_COUNTER_FIELDS.includes(field)) {
+      throw new Error(`raiseStageCounter: unknown counter field "${field}"`);
+    }
+    try {
+      await ddb.send(
+        new UpdateCommand({
+          TableName: table(),
+          Key: stageKey(executionId, stageInstanceId),
+          UpdateExpression: 'SET #f = :to, updatedAt = :ts',
+          ConditionExpression: 'attribute_not_exists(#f) OR #f < :to',
+          ExpressionAttributeNames: { '#f': field },
+          ExpressionAttributeValues: { ':to': to, ':ts': now() },
+        }),
+      );
+      return true;
+    } catch (error) {
+      if (error?.name === 'ConditionalCheckFailedException') return false;
+      throw error;
+    }
   };
 
   // Append an agent output chunk for restore-on-reload. The sequence is an atomic
@@ -1445,11 +1854,12 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
   // fan-in reads this to decide whether repo work happened during the run
   // (v2.git.pushed / v2.git.push_failed) before trusting a "no changes"
   // comparison. Paginated — a dropped page could hide a push failure.
-  const listEvents = async (executionId) => {
+  const listEvents = async (executionId, { consistentRead = false } = {}) => {
     const items = await queryAll(ddb, {
       TableName: table(),
       KeyConditionExpression: 'pk = :pk AND begins_with(sk, :p)',
       ExpressionAttributeValues: { ':pk': executionPk(executionId), ':p': 'EVENT#' },
+      ...(consistentRead ? { ConsistentRead: true } : {}),
     });
     return items.toSorted(bySk);
   };
@@ -2416,6 +2826,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       metrics: records.filter((r) => r.sk.startsWith('METRIC#')),
       graphReads: records.filter((r) => r.sk.startsWith('READ#')),
       sensorRuns: records.filter((r) => r.sk.startsWith('SENSOR#')),
+      receipts: records.filter((r) => r.sk.startsWith('RECEIPT#')),
       steering: records.filter((r) => r.sk.startsWith('STEER#')),
       outputs: records.filter((r) => r.sk.startsWith('OUTPUT#')),
       unitPlan: records.find((r) => r.sk === 'UNITPLAN') ?? null,
@@ -2430,7 +2841,8 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
 
   // Delete EVERY record for an execution — the whole EXEC#<id> partition
   // (META, STAGE#, EVENT#, HUMAN#, METRIC#, OUTPUT#, SENSOR#, STEER#,
-  // QEDIT#, UNITPLAN, UNIT#). Keys-only projection: OUTPUT# rows can be megabytes and
+  // RECEIPT#, QEDIT#, UNITPLAN, UNIT#). The query is prefix-free (pk only), so
+  // a new item family is covered the moment it is written — RECEIPT# included. Keys-only projection: OUTPUT# rows can be megabytes and
   // we only need pk/sk to delete them. BatchWrite in chunks of 25 (the API
   // maximum), retrying UnprocessedItems with backoff so a throttled batch
   // never silently leaves rows behind. Idempotent — deleting a missing key is
@@ -2485,8 +2897,10 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     listEvents,
     createHumanTask,
     getHumanTask,
+    markGateCallbackConsumed,
     setGateCallbackId,
     answerHumanTask,
+    answerHumanTaskWithSteering,
     supersedeHumanTask,
     markGateRevised,
     createSteering,
@@ -2495,10 +2909,16 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     markSteeringConsumed,
     supersedeSteering,
     resetStageRow,
+    markLoopBackArchived,
+    setLoopBackRecommendation,
     recordMetric,
     recordGraphRead,
     recordSensorRun,
     listSensorRuns,
+    putReceipt,
+    getReceipt,
+    listReceipts,
+    raiseStageCounter,
     appendOutput,
     getOutputs,
     listProjectExecutions,
