@@ -9,6 +9,9 @@ import {
 } from 'react';
 import type { Dispatch, ReactNode, SetStateAction } from 'react';
 import { useParams } from 'react-router';
+import { useNativeIntentAdapter, type NativeIntentAdapter } from './adapters/nativeIntent';
+import { useNativeActivity } from './adapters/nativeActivity';
+import { currentSessionEpoch } from '@/services/sessionExpiry';
 import {
   executionCapabilityReason,
   executionGateResponseReason,
@@ -103,7 +106,9 @@ interface OutputPane {
   live: IntentOutput[];
 }
 
-interface IntentContextValue {
+export interface IntentContextValue {
+  executionBackend?: 'platform' | 'native';
+  nativeWorkspace?: NativeIntentAdapter;
   projectId: string;
   intentId: string;
   detail: IntentDetail | null;
@@ -213,7 +218,40 @@ export function clearIntentCache() {
 
 const IntentContext = createContext<IntentContextValue | undefined>(undefined);
 
-export function IntentProvider({
+export function IntentProvider({ children, onAgentFocus, backend = 'platform' }: {
+  children: ReactNode; onAgentFocus?: () => void; backend?: 'platform' | 'native';
+}) {
+  const { projectId = '', intentId = '' } = useParams();
+  if (backend === 'native' && (!projectId || !intentId)) return <>{children}</>;
+  return backend === 'native' ? <NativeIntentAdapterProvider key={JSON.stringify([projectId,intentId,currentSessionEpoch()])} onAgentFocus={onAgentFocus}>{children}</NativeIntentAdapterProvider>
+    : <PlatformIntentAdapterProvider onAgentFocus={onAgentFocus}>{children}</PlatformIntentAdapterProvider>;
+}
+
+function NativeIntentAdapterProvider({children,onAgentFocus}: {children: ReactNode; onAgentFocus?: () => void}) {
+  const {projectId = '',intentId = ''} = useParams();
+  const nativeWorkspace = useNativeIntentAdapter(projectId,intentId);
+  const activity = useNativeActivity(nativeWorkspace);
+  const ensureOutputs = useCallback(() => { void activity.replay(); }, [activity.replay]);
+  const [agentFocus,setAgentFocus] = useState<AgentFocusRequest | null>(null);
+  const [selectedStageId,setSelectedStageId] = useState<string | null>(null);
+  const unsupported = async (): Promise<never> => { throw new Error('This action is not supported by native execution'); };
+  const value: IntentContextValue = {
+    executionBackend:'native', nativeWorkspace, projectId,intentId, detail:null,compiled:null,
+    loading:!nativeWorkspace.intent && !nativeWorkspace.error,error:nativeWorkspace.error,
+    workflowPhases:null,phaseNameOf:value=>value,initializationPhasePaths:new Set(),currentPhasePath:null,
+    stageRows:[],stageEdges:[],gates:[],pendingGates:[],steering:[],sensorsByStage:new Map(),artifactsByStage:new Map(),
+    outputRows:new Map([[INTENT_OUTPUT_KEY,activity.rows]]),
+    outputBuffers:new Map([[INTENT_OUTPUT_KEY,activity.rows.map(row=>row.content).join('')]]),
+    outputVersion:activity.rows.length,stageNameOf:()=> 'Agent activity',
+    ensureOutputs,outputPaneStatus:()=>activity.loading?'loading':'seeded',
+    selectedStageId,setSelectedStageId,agentFocus,focusOutput:()=> {setAgentFocus(previous=>({key:INTENT_OUTPUT_KEY,seq:(previous?.seq??0)+1}));onAgentFocus?.();},
+    previewArtifactId:null,previewItemId:null,previewSeq:0,openArtifactPreview:()=>{},openItemPreview:()=>{},
+    reload:nativeWorkspace.refresh,answerGate:unsupported,reviseGate:unsupported,cancelIntent:unsupported,deleteIntent:unsupported,rewindIntent:unsupported,
+  };
+  return <IntentContext.Provider value={value}>{children}</IntentContext.Provider>;
+}
+
+function PlatformIntentAdapterProvider({
   children,
   onAgentFocus,
 }: {
@@ -862,6 +900,7 @@ export function IntentProvider({
   return (
     <IntentContext.Provider
       value={{
+        executionBackend: 'platform',
         projectId,
         intentId,
         detail,

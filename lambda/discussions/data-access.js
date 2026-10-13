@@ -75,6 +75,9 @@ export const fetchProjectIdForIntent = async (g, intentId) => {
 // (which must first alias the root) share ONE definition of each anchor bind.
 const anchorSteps = (t, scope, entityType, entityId) => {
   const anchorLabel = scope.anchorLabels[entityType];
+  // Native threads all hang off the dedicated root, keyed by entity_id; their
+  // artifact revisions are verified against protected records, not the graph.
+  if (scope.kind === 'native') return t.has(scope.rootLabel, 'id', scope.rootId);
   if (scope.kind === 'intent') {
     if (entityType === 'intent' || scope.rootAnchorTypes?.includes(entityType)) {
       return t.has('Intent', 'id', scope.rootId);
@@ -146,6 +149,8 @@ export const findDiscussionByAnchor = async (
 // Self-anchored roots need only an id match; everything else must resolve via
 // the scoped anchorTraversal (which already applies scope/current-row guards).
 export const anchorExistsInScope = async (g, scope, entityType, entityId) => {
+  // Native artifact anchors are verified by the handler from protected records.
+  if (scope.kind === 'native') return entityType === 'intent' && entityId === scope.rootId;
   if (scope.kind === 'intent') {
     if (entityType === 'intent') return entityId === scope.rootId;
     if (scope.rootAnchorTypes?.includes(entityType)) return Boolean(entityId);
@@ -168,16 +173,34 @@ export const fetchAnchorTitle = async (
   return getVal(r.value, 'title') || getVal(r.value, 'name') || '';
 };
 
+// The native root is created lazily, under the native scope's execution-wide
+// creation guard, so concurrent first threads cannot create two roots.
+export const ensureNativeDiscussionRoot = async (g, scope, createdAt) => {
+  await g
+    .V()
+    .has(scope.rootLabel, 'id', scope.rootId)
+    .fold()
+    .coalesce(
+      __.unfold(),
+      __.addV(scope.rootLabel)
+        .property('id', scope.rootId)
+        .property('project_id', scope.projectId)
+        .property('native_execution_id', scope.executionId)
+        .property('created_at', createdAt),
+    )
+    .next();
+};
+
 export const createDiscussionVertex = async (
   g,
-  { id, scope, entityType, entityId, entityTitle, createdAt, sub, displayName },
+  { id, scope, entityType, entityId, entityTitle, createdAt, sub, displayName, anchorProps = {} },
 ) => {
   // The Discussion vertex carries the scope-root id under its scope-specific
   // property (sprint_id | intent_id) AND hangs off the root via HAS_DISCUSSION,
   // plus a DISCUSSES edge to the concrete anchor. Bind the root as 's', then
   // re-enter via anchorSteps to position on the anchor as 'a' — the SAME scoped
   // bind the reads use, so the DISCUSSES edge can never target the wrong vertex.
-  await anchorSteps(
+  let t = anchorSteps(
     g.V().has(scope.rootLabel, 'id', scope.rootId).as('s').V(),
     scope,
     entityType,
@@ -194,7 +217,9 @@ export const createDiscussionVertex = async (
     .property('created_at', createdAt)
     .property('created_by', sub)
     .property('created_by_name', displayName)
-    .property('last_message_at', createdAt)
+    .property('last_message_at', createdAt);
+  for (const [key, value] of Object.entries(anchorProps)) t = t.property(key, value);
+  await t
     .as('d')
     .addE('HAS_DISCUSSION')
     .from_('s')

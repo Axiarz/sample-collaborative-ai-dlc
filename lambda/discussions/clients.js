@@ -10,6 +10,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { BedrockAgentCoreClient } from '@aws-sdk/client-bedrock-agentcore';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { SSMClient } from '@aws-sdk/client-ssm';
+import { S3Client } from '@aws-sdk/client-s3';
 
 export const { cardinality, order, TextP, P } = gremlin.process;
 export const __ = gremlin.process.statics;
@@ -38,6 +39,9 @@ export const { query, close } = create(
 export const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 export const ssm = new SSMClient();
 export const agentcore = new BedrockAgentCoreClient({});
+// Native publication reads only; created on first use.
+let s3Client = null;
+export const s3 = () => (s3Client ??= new S3Client({}));
 
 export const locksTable = () => process.env.LOCKS_TABLE;
 export const readStateTable = () => process.env.READ_STATE_TABLE;

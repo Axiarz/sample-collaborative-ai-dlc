@@ -358,11 +358,15 @@ const main = async () => {
       activeJobs: stageJobs,
     })(p);
   const discussionJobs = new Map();
+  const { broadcastToNativeIntentChannel } = await import('../shared/ws-fanout.js');
   handlers.discussionAssistStart = (p, context) =>
     createDiscussionAssistStart({
       openGraph,
       store,
       broadcast,
+      // Native discussion threads fan out on the protected project-qualified
+      // native channel, never the platform intent:<id> channel.
+      broadcastNative: broadcastToNativeIntentChannel,
       availableClis: context.availableClis,
       env: context.env,
       mcpEntry,

@@ -73,6 +73,7 @@ tfplan*
 # A7 local annex-check run artifacts (generated per-run; contain local paths)
 lambda/agentcore/test/a7-prompt.txt
 lambda/agentcore/test/a7-mcp-config.json
-
-# Local native execution evidence and recoverable source snapshots
 .native-evidence/
+
+# Checkout-local short paths for Terraform Unix sockets
+.native-tmp/

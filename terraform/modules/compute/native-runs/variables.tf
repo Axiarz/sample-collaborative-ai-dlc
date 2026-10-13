@@ -39,3 +39,8 @@ variable "gitlab_redirect_uri" { type = string }
 variable "bitbucket_oauth_secret_name" { type = string }
 variable "bitbucket_oauth_secret_arn" { type = string }
 variable "agent_credential_metadata_function_arn" { type = string }
+
+variable "connections_table_name" { type = string }
+variable "connections_table_arn" { type = string }
+variable "websocket_endpoint" { type = string }
+variable "websocket_execution_arn" { type = string }

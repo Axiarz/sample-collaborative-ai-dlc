@@ -7,6 +7,7 @@ import {
   classifyNativeFirstWait,
   configureNativeClaudeSessionEnd,
   createNativeExecutor,
+  NATIVE_CODEX_MAX_THREADS,
   nativeExecutionInvocation,
   nativeFirstTurnPrompt,
 } from '../native/executor.js';
@@ -1054,7 +1055,22 @@ describe('native invocation and first-wait classification', () => {
       'question or approval that needs a person, present the complete proposal and questions ' +
       'in your normal assistant response, preserve any normal workflow artifacts, leave ' +
       'the native workflow waiting, and end this turn. The platform will show your response and files to ' +
-      'the user. Do not approve a gate, answer on behalf of the user, or continue past that wait.';
+      'the user. Do not approve a gate, answer on behalf of the user, or continue past that wait. ' +
+      // Task-3: the rendered question spec, so members can select exact options.
+      'Whenever you end a turn with a structured question or approval for the user, also write ' +
+      'the exact question spec you rendered as JSON to .native-control/pending-question.json in the project ' +
+      'directory, replacing any earlier file: {"version":1,"questions":[{"prompt":"...","header":"...",' +
+      '"multiSelect":false,"options":[{"label":"...","description":"..."}]}]}. Use the exact option ' +
+      'labels from the spec, without numbers, letters or "(Recommended)", and keep rendering the ' +
+      "question normally in your response. The user's reply will contain the exact selected " +
+      'label(s); record it with the workflow command that question requires.' +
+      // The stateless intake plan offer is answered through `next`, never `report`.
+      " If the question was the engine's plan offer made before any workflow state exists " +
+      '(no aidlc-state.md yet), then when the user replies, record their choice by re-running ' +
+      'the engine with the chosen plan in front of the original request text, passed unchanged ' +
+      'as one shell-safe argument: `aidlc engine orchestrate next compose <original request>` for ' +
+      'compose, or `aidlc engine orchestrate next --scope <plan> <original request>` for a named ' +
+      'plan. Do not use report for that answer.';
     expect(nativeFirstTurnPrompt({ harness, request })).toBe(`${marker} ${request}\n\n${annex}`);
   });
   it.each([undefined, null, '', 'CODEX', 'unknown', ['codex'], {}])(
@@ -1085,6 +1101,19 @@ describe('native invocation and first-wait classification', () => {
       if (harness === 'kiro') expect(invocation.args).toContain('--production');
     },
   );
+
+  it('bounds concurrent codex sub-agents on first turns and resumes only', () => {
+    const base = { prompt: 'p', model: 'configured-model', project: '/mnt/native/project' };
+    for (const nativeSessionId of [null, 'native-session']) {
+      const { args } = nativeExecutionInvocation({ ...base, harness: 'codex', nativeSessionId });
+      const at = args.indexOf(`agents.max_threads=${NATIVE_CODEX_MAX_THREADS}`);
+      expect(NATIVE_CODEX_MAX_THREADS).toBe(4);
+      expect(at).toBeGreaterThan(0);
+      expect(args[at - 1]).toBe('-c');
+    }
+    for (const harness of ['claude', 'kiro', 'opencode'])
+      expect(nativeExecutionInvocation({ ...base, harness }).args.join(' ')).not.toContain('max_threads');
+  });
 
   const asSnapshot = (files = nativeFiles) => ({
     files: Object.entries(files).map(([path, content]) => ({
@@ -1120,3 +1149,114 @@ describe('native invocation and first-wait classification', () => {
     );
   });
 });
+
+describe('native cold recovery', () => {
+  const CHECKPOINT = '9'.repeat(64);
+  // A first turn captures a checkpoint; a successor generation restores it on
+  // the same mount. Session capture/restore are injected; the executor's own
+  // directory replacement, machine projection and admission run for real.
+  const recoverable = async () => {
+    let captured;
+    const first = make({
+      ports: {
+        captureRecovery: vi.fn(async () => ({ metadata: { schemaVersion: 1 }, files: [] })),
+        publishRecovery: vi.fn(async (input) => {
+          captured = input;
+          return { sequence: input.sequence, id: CHECKPOINT, manifest: { sha256: CHECKPOINT } };
+        }),
+      },
+    });
+    await first.executor.start(first.request);
+    const head = await first.executor.settle();
+    expect(head.status).toBe('publication_ready');
+    const packages = join(root, 'packages');
+    const successor = make({
+      request: first.request,
+      ports: {
+        assertRecoveryAdmission: vi.fn(async () => {}),
+        loadRecovery: vi.fn(async () => ({
+          manifest: {
+            sequence: captured.sequence,
+            writerGeneration: captured.writerGeneration,
+            configurationSha256: captured.configurationSha256,
+            publicationId: captured.publicationId,
+            interactionId: captured.interactionId,
+            nativeSessionId: captured.nativeSessionId,
+            harness: captured.harness,
+            imageDigest: captured.imageDigest,
+            packageId: captured.packageId,
+            continuation: captured.continuation,
+            filesystem: captured.filesystem,
+          },
+          files: [],
+        })),
+        prepareRecovery: vi.fn(async () => ({
+          package: {
+            directory: packages,
+            binaryPath: join(packages, 'aidlc'),
+            version: '2.9.0',
+            packageId: captured.packageId,
+          },
+        })),
+        restoreRecovery: vi.fn(async ({ project, nativeSessionId, harness }) => {
+          // The restored project carries its committed pin, not the machine registry.
+          await fs.writeFile(join(project, '.aidlc-version'), '2.9.0\n');
+          return { restored: true, nativeSessionId, harness };
+        }),
+      },
+    });
+    const input = {
+      ...first.request,
+      command: 'native-recover',
+      writerGeneration: 2,
+      recoveryId: randomUUID(),
+      sequence: head.sequence,
+      checkpoint: { sequence: head.sequence, id: CHECKPOINT },
+      publication: head.receipt,
+      interaction: head.interaction,
+    };
+    return { ...successor, input, packages };
+  };
+
+  it('re-registers the restored project pin with the rebuilt machine projection', async () => {
+    const { executor, input, ports, packages } = await recoverable();
+    await executor.recover(input);
+    expect(await executor.settle()).toMatchObject({
+      status: 'recovery_ready',
+      recoveryId: input.recoveryId,
+      checkpointId: CHECKPOINT,
+    });
+    const commands = ports.commandRunner.mock.calls.map(([call]) => call);
+    expect(commands.map(({ command, args }) => [command, args])).toEqual([
+      [join(packages, 'aidlc'), ['use', '2.9.0', '--from', packages, '--offline', '--json']],
+      [
+        join(root, 'machine/bin/aidlc'),
+        ['config', '--pin', '2.9.0', '--project-dir', join(root, 'project'), '--from', packages, '--offline', '--json'],
+      ],
+    ]);
+    // Both run against the rebuilt machine data, offline, never with model credentials.
+    for (const { env: commandEnv } of commands) {
+      expect(commandEnv).toMatchObject({
+        AIDLC_INSTALL_ROOT: join(root, 'machine/data'),
+        AIDLC_BIN_DIR: join(root, 'machine/bin'),
+        AIDLC_PROJECT_DIR: join(root, 'project'),
+        AIDLC_OFFLINE: '1',
+      });
+      expect(Object.keys(commandEnv).filter((key) => /TOKEN|SECRET|KEY/.test(key))).toEqual([]);
+    }
+  });
+
+  it('does not report a recovered owner when the pin cannot be re-registered', async () => {
+    const { executor, input, ports } = await recoverable();
+    ports.commandRunner.mockImplementation(async ({ args }) =>
+      args[0] === 'config' ? { ...cleanCommand, exitCode: 1 } : cleanCommand,
+    );
+    await executor.recover(input);
+    expect(await executor.settle()).toMatchObject({
+      status: 'stopped_needs_review',
+      code: 'native_execution_recovery_failed',
+      recoveryFailureCode: 'native_execution_initialization_failed',
+    });
+  });
+});
+

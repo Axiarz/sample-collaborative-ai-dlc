@@ -15,6 +15,7 @@ import { projectsService } from '@/services/projects';
 import type { AgentCli, Member } from '@/services/projects';
 import { realtimeService } from '@/services/realtime';
 import { useAuth } from '@/contexts/AuthContext';
+import { useNativeCollaborationDigest } from '@/lib/nativeCollaboration';
 import { MentionToasts } from './MentionToasts';
 import type { MentionToast } from './MentionToasts';
 
@@ -34,6 +35,9 @@ export interface OpenDiscussionArgs {
   entityId?: string;
   /** Display fallback while the thread loads. */
   entityTitle?: string;
+  /** Native artifact threads: the publication containing the exact revision. */
+  publicationId?: string;
+  publicationSequence?: number;
 }
 
 interface DiscussionContextValue {
@@ -82,10 +86,13 @@ const RELOAD_DEBOUNCE_MS = 600;
 export function DiscussionProvider({
   children,
   onDiscussionOpen,
+  backend = 'platform',
 }: {
   children: ReactNode;
   /** Called whenever a thread opens — the shell uses it to show the activity panel. */
   onDiscussionOpen?: () => void;
+  /** Native routes use protected native ownership and their own API paths. */
+  backend?: 'platform' | 'native';
 }) {
   const {
     sprintId = '',
@@ -98,11 +105,19 @@ export function DiscussionProvider({
   }>();
   // Derive the discussion scope from the route: sprint pages carry sprintId;
   // the intent page carries projectId + intentId.
+  const digest = useNativeCollaborationDigest(
+    backend === 'native' ? projectId : null,
+    backend === 'native' ? intentId : null,
+  );
   const scope = useMemo<DiscussionScope | null>(() => {
+    if (backend === 'native') {
+      // Never fall back to the platform intent scope for a native route.
+      return intentId && projectId && digest ? { kind: 'native', projectId, intentId, digest } : null;
+    }
     if (sprintId) return { kind: 'sprint', sprintId };
     if (intentId && projectId) return { kind: 'intent', projectId, intentId };
     return null;
-  }, [sprintId, intentId, projectId]);
+  }, [backend, digest, sprintId, intentId, projectId]);
   const { user } = useAuth();
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -240,6 +255,8 @@ export function DiscussionProvider({
           entityType: args.entityType,
           entityId: args.entityId,
           entityTitle: args.entityTitle,
+          ...(args.publicationId ? { publicationId: args.publicationId } : {}),
+          ...(args.publicationSequence ? { publicationSequence: args.publicationSequence } : {}),
         })
         .then((d) => {
           setDiscussion(d);

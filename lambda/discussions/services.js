@@ -8,11 +8,17 @@ import {
 import { GetCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { GetParameterCommand } from '@aws-sdk/client-ssm';
 import { InvokeAgentRuntimeCommand } from '@aws-sdk/client-bedrock-agentcore';
+import { createHash } from 'node:crypto';
 import { Logger } from '@aws-lambda-powertools/logger';
 import { isTokenLive } from '../shared/realtime-token.js';
 import { runtimeTargetInput } from '../shared/runtime-target.js';
 import { fetchMembershipRole } from '../shared/trackers.js';
-import { agentcore, ddb, ssm, query } from './clients.js';
+import { nativeRuntimeBindingKey } from '../shared/native-runtime-binding.js';
+import { resolveNativeCollaborationAccess } from '../shared/native-realtime-ownership.js';
+import { fetchWorkflowSourceMembership } from '../shared/workflow-source-membership.js';
+import { agentcore, ddb, ssm, s3, query } from './clients.js';
+import { createNativePublications } from '../shared/native-publication.js';
+import { createNativeArtifactRevisions } from '../shared/native-artifact-revision.js';
 import { fetchProjectIdForSprint, fetchProjectIdForIntent } from './data-access.js';
 
 const logger = new Logger({ persistentKeys: { component: 'discussions' } });
@@ -24,6 +30,12 @@ const logger = new Logger({ persistentKeys: { component: 'discussions' } });
 export const authorizeScope = async (scope, sub, res) => {
   if (!sub) return { res: res(401, { error: 'Unauthorized' }) };
   if (!scope) return { res: res(404, { error: 'Not found' }) };
+  if (scope.kind === 'native') return authorizeNativeScope(scope, sub, res);
+  // A platform route must never reach a protected native execution through the
+  // path-project fallback below (native IDs are only unique per project).
+  if (scope.kind === 'intent' && scope.projectId && (await nativeRecordExists(scope))) {
+    return { res: res(404, { error: scope.notFoundError }) };
+  }
   const projectId =
     scope.kind === 'intent'
       ? // The intent path carries projectId from the route, but verify the Intent
@@ -37,11 +49,74 @@ export const authorizeScope = async (scope, sub, res) => {
   return { projectId, role };
 };
 
+const nativeTable = () => process.env.NATIVE_RUNTIME_BINDINGS_TABLE || '';
+
+const nativeRecordExists = async (scope) => {
+  if (!nativeTable()) return false;
+  let key;
+  try {
+    key = nativeRuntimeBindingKey({ projectId: scope.projectId, executionId: scope.rootId });
+  } catch {
+    return false;
+  }
+  for (const sk of ['EXECUTION', 'RUNTIME']) {
+    const { Item } = await ddb.send(
+      new GetCommand({ TableName: nativeTable(), Key: { ...key, sk }, ConsistentRead: true }),
+    );
+    if (Item) return true;
+  }
+  return false;
+};
+
+// Native threads: current membership snapshot plus the protected binding. The
+// resolved `native` access (binding + execution rows) is returned for anchor
+// verification and Quorum context; it never confers execution authority.
+const authorizeNativeScope = async (scope, sub, res) => {
+  let access;
+  try {
+    access = await resolveNativeCollaborationAccess({
+      ddb,
+      nativeTable: nativeTable(),
+      projectId: scope.projectId,
+      executionId: scope.executionId,
+      membership: () => query((g) => fetchWorkflowSourceMembership(g, scope.projectId, sub)),
+    });
+  } catch (err) {
+    if (err?.code === 'WORKFLOW_SOURCE_FORBIDDEN') {
+      return { res: res(403, { error: 'Not a project member' }) };
+    }
+    throw err;
+  }
+  if (access.status === 403) return { res: res(403, { error: 'Not a project member' }) };
+  if (access.status !== 200) return { res: res(404, { error: scope.notFoundError }) };
+  return { projectId: scope.projectId, role: access.member.role, native: access };
+};
+
 // Back-compat shim: the sprint-scoped callers still pass a bare sprintId.
 export const authorizeSprint = async (sprintId, sub, res) => {
   if (!sprintId) return { res: res(404, { error: 'Sprint not found' }) };
   const { sprintScope } = await import('./scope.js');
   return authorizeScope(sprintScope(sprintId), sub, res);
+};
+
+// Verified native revision reads (discussion anchors and Quorum context),
+// constructed lazily: platform-only deployments never configure the bucket.
+let revisions = null;
+export const nativeArtifactRevisions = () => {
+  if (revisions) return revisions;
+  revisions = createNativeArtifactRevisions({
+    ddb,
+    nativeTable: nativeTable(),
+    publications: createNativePublications({
+      s3: s3(),
+      bucket: process.env.NATIVE_EXECUTION_PUBLICATION_BUCKET,
+      accountId: process.env.NATIVE_RUNTIME_ACCOUNT_ID,
+    }),
+  });
+  return revisions;
+};
+export const resetNativeArtifactRevisionsForTest = () => {
+  revisions = null;
 };
 
 // ─── WebSocket fanout (server-driven) ───
@@ -169,4 +244,26 @@ export const invokeDiscussionAssist = async ({ intentId, payload }) => {
   return text ? JSON.parse(text) : {};
 };
 
-export { discussionSessionIdFor };
+// Native Quorum is advisory: it runs in the shared platform discussion runtime,
+// never in the isolated native writer, and receives only the verified context
+// in its payload. Native records never select this target.
+const nativeDiscussionSessionIdFor = (rootId, discussionId) =>
+  `aidlc-discuss-native-${createHash('sha256').update(JSON.stringify([rootId, discussionId])).digest('hex')}`;
+
+export const invokeNativeDiscussionAssist = async ({ scope, payload }) => {
+  const agentRuntimeArn = process.env.AGENTCORE_RUNTIME_ARN || '';
+  if (!agentRuntimeArn) throw new Error('AGENTCORE_RUNTIME_ARN is not configured');
+  const res = await agentcore.send(
+    new InvokeAgentRuntimeCommand({
+      agentRuntimeArn,
+      runtimeSessionId: nativeDiscussionSessionIdFor(scope.rootId, payload.discussionId),
+      contentType: 'application/json',
+      accept: 'application/json',
+      payload: Buffer.from(JSON.stringify(payload)),
+    }),
+  );
+  const text = res.response ? await res.response.transformToString() : '';
+  return text ? JSON.parse(text) : {};
+};
+
+export { discussionSessionIdFor, nativeDiscussionSessionIdFor };

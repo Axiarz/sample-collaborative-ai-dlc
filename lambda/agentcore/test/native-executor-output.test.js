@@ -211,6 +211,15 @@ describe('bounded completed native turn output', () => {
     ],
     ['failed turn', () => [...codex().slice(0, -1), { type: 'turn.failed' }]],
     [
+      'failed turn after an error notice',
+      () => [
+        ...codex().slice(0, -1),
+        { type: 'error', message: 'unexpected status 500' },
+        { type: 'turn.failed', error: { message: 'unexpected status 500' } },
+      ],
+    ],
+    ['interrupted turn after an error notice', () => [...codex().slice(0, -1), { type: 'error', message: 'stream closed' }]],
+    [
       'unfinished message',
       () => [
         codex()[0],
@@ -222,6 +231,20 @@ describe('bounded completed native turn output', () => {
     ['overlong answer', () => codex('x'.repeat(65537))],
     ['duplicate completed item', () => [...codex().slice(0, -1), codex()[2], codex()[3]]],
   ])('rejects %s', (_name, events) => expect(() => collect(events())).toThrow());
+  it('keeps a codex turn that completed after a retried stream error notice', () => {
+    // Exact live shape (codex 0.145, 5 October 2026): a retried disconnect is
+    // reported as `error`, then the turn continues and completes normally.
+    const [started, turn, message, completed] = codex('Which plan should I use?');
+    const notice = {
+      type: 'error',
+      message:
+        'Reconnecting... 1/5 (stream disconnected before completion: The server had an error while processing your request. Sorry about that!)',
+    };
+    expect(collect([started, turn, notice, message, completed])).toEqual({
+      nativeSessionId: session,
+      messages: [{ type: 'text', text: 'Which plan should I use?' }],
+    });
+  });
   it('rejects expected session mismatch, credentials, incomplete JSON and malformed UTF-8', () => {
     expect(() => collect(codex(), { nativeSessionId: 'wrong' })).toThrow();
     expect(() => collect(codex('TOKEN'), { forbiddenBytes: ['TOKEN'] })).toThrow(

@@ -17,10 +17,16 @@ locals {
   logs_arn    = "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:/aws/bedrock-agentcore/runtimes/native_*"
   source_path = abspath("${path.module}/../../../../lambda/native-runtime-control")
   shared_path = abspath("${path.module}/../../../../lambda/shared")
-  source_hash = sha256(join("", [
+  activity_path = abspath("${path.module}/../../../../lambda/agentcore")
+  source_hash = sha256(join("", concat([
     for f in sort(fileset(local.shared_path, "**/*.{js,mjs,cjs,json}")) :
     filesha256("${local.shared_path}/${f}")
-  ]))
+  ], [
+    # The trusted activity store shares the runtime's output privacy boundary,
+    # which imports the existing CLI normalizers. Include transitive inputs.
+    for f in concat(["native/activity.js", "output-normalizer.js"], sort(tolist(fileset(local.activity_path, "cli/*.js")))) :
+    filesha256("${local.activity_path}/${f}")
+  ])))
   lambda_trust = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -459,15 +465,8 @@ module "api" {
   lambda_role            = aws_iam_role.api.arn
   vpc_subnet_ids         = var.api_subnet_ids
   vpc_security_group_ids = var.api_security_group_ids
-  source_path = [{
-    path     = local.source_path
-    patterns = ["!.build/.*"]
-    commands = [
-      "cd ../.. && npm run build:api -w native-runtime-control",
-      ":zip lambda/native-runtime-control/.build/api"
-    ]
-  }]
-  hash_extra = sha256("${local.source_hash}:${filesha256("${path.module}/../../../../package-lock.json")}")
+  create_package         = false
+  local_existing_package = module.packages["api"].local_filename
   environment_variables = merge(local.base_environment, local.execution_environment, {
     NEPTUNE_ENDPOINT                   = var.neptune_endpoint
     WORKFLOW_SOURCE_BINDINGS_TABLE     = var.workflow_source_bindings_table_name
@@ -492,15 +491,8 @@ module "worker" {
   timeout       = 90
   create_role   = false
   lambda_role   = aws_iam_role.worker.arn
-  source_path = [{
-    path     = local.source_path
-    patterns = ["!.build/.*"]
-    commands = [
-      "cd ../.. && npm run build:worker -w native-runtime-control",
-      ":zip lambda/native-runtime-control/.build/worker"
-    ]
-  }]
-  hash_extra                        = sha256("${local.source_hash}:${filesha256("${path.module}/../../../../package-lock.json")}")
+  create_package         = false
+  local_existing_package = module.packages["worker"].local_filename
   environment_variables             = local.base_environment
   cloudwatch_logs_retention_in_days = 7
   depends_on = [

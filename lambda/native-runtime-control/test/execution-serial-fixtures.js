@@ -89,6 +89,7 @@ export const serialFixture = () => {
       messages: [
         { type: 'text', text: options.text ?? `Question ${sequence}: what should change?` },
       ],
+      ...(options.pendingInput ? { pendingInput: options.pendingInput } : {}),
     });
     const body = await interactions.read(identity, interactionReceipt);
     return { receipt, interactionReceipt, body };

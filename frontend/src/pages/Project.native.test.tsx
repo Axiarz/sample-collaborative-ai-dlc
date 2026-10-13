@@ -123,8 +123,9 @@ describe('Space native discovery', () => {
     expect(mocks.nativeGet).toHaveBeenCalledWith('p1', 'same');
     expect(screen.queryByText('Platform detail route')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Start agent' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Answer question' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
+    // Answers and approvals appear only as the real structured question for a turn.
+    expect(screen.queryByRole('button', { name: 'Answer question' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Edit artifacts' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Create unit PR' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Delete intent' })).toBeDisabled();

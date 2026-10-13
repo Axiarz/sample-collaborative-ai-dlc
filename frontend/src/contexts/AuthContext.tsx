@@ -31,6 +31,10 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+// For presence labels in surfaces that also render outside the signed-in shell
+// (isolated previews/tests). Never use this for an authorization decision.
+export const useOptionalAuth = () => useContext(AuthContext) ?? null;
+
 export const useAuth = () => {
   const context = useContext(AuthContext);
   if (context === undefined) {

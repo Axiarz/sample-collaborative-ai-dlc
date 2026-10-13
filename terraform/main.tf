@@ -355,6 +355,7 @@ module "neptune" {
 
 # Lambda CRUD Functions
 module "lambda" {
+  native_preparation_enabled = var.enable_native_preparation
   source = "./modules/api/lambda"
 
   project_name                = var.project_name

@@ -1966,12 +1966,29 @@ resource "aws_iam_role_policy_attachment" "discussions_vpc" {
   policy_arn = "arn:${local.partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
+locals {
+  # Same convention as modules/compute/native-runs (local.name + "-pub-" +
+  # account/region digest). Named, not referenced, to avoid a module cycle,
+  # exactly like the native-runs table name used below.
+  native_publication_bucket_name = "${var.project_name}-native-runs-${var.environment}-pub-${substr(sha256("${data.aws_caller_identity.current.account_id}:${data.aws_region.current.region}"), 0, 8)}"
+}
+
 resource "aws_iam_role_policy" "discussions" {
   name = "neptune-doc-secret-locks-fanout"
   role = aws_iam_role.discussions.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      { Effect = "Allow", Action = ["dynamodb:GetItem"], Resource = "arn:${data.aws_partition.current.partition}:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.project_name}-native-runs-${var.environment}" },
+      {
+        # Task-2 native discussion anchors and Quorum context: read exact,
+        # version-pinned committed publication objects only. Recovery
+        # checkpoints and the control prefix are separate prefixes and excluded.
+        Sid      = "ReadCommittedNativePublicationRevisions"
+        Effect   = "Allow"
+        Action   = ["s3:GetObjectVersion"]
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${local.native_publication_bucket_name}/native-executions/*"
+      },
       local.neptune_statement,
       {
         Effect = "Allow"
@@ -2064,6 +2081,9 @@ module "discussions_lambda" {
     LOCKS_TABLE                         = var.discussion_locks_table_name
     READ_STATE_TABLE                    = var.discussion_read_state_table_name
     V2_PROCESS_TABLE                    = var.v2_executions_table_name
+    NATIVE_RUNTIME_BINDINGS_TABLE        = var.native_preparation_enabled ? "${var.project_name}-native-runs-${var.environment}" : ""
+    NATIVE_EXECUTION_PUBLICATION_BUCKET = var.native_preparation_enabled ? local.native_publication_bucket_name : ""
+    NATIVE_RUNTIME_ACCOUNT_ID           = data.aws_caller_identity.current.account_id
     CONNECTIONS_TABLE                   = var.connections_table_name
     WEBSOCKET_ENDPOINT                  = var.websocket_api_endpoint_https
     AGENTCORE_RUNTIME_ARN               = var.agentcore_runtime_arn
@@ -2373,6 +2393,12 @@ resource "aws_iam_role_policy" "intents" {
     Statement = [
       local.neptune_statement,
       {
+        Sid      = "ReadProtectedNativeRealtimeOwner"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem"]
+        Resource = "arn:${data.aws_partition.current.partition}:dynamodb:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:table/${var.project_name}-native-runs-${var.environment}"
+      },
+      {
         # v2 process table: read/write execution state + GSI1 list. Delete /
         # BatchWrite drain the whole EXEC#<id> partition on intent delete.
         Effect = "Allow"
@@ -2599,6 +2625,7 @@ module "intents_lambda" {
     NEPTUNE_ENDPOINT            = var.neptune_endpoint
     ENVIRONMENT                 = var.environment
     CORS_ALLOWED_ORIGINS        = var.cors_allowed_origins
+    NATIVE_RUNTIME_BINDINGS_TABLE = var.native_preparation_enabled ? "${var.project_name}-native-runs-${var.environment}" : ""
     V2_PROCESS_TABLE            = var.v2_executions_table_name
     BLOCKS_TABLE                = var.blocks_table_name
     REALTIME_SECRET_PARAM       = var.realtime_doc_secret_param_name

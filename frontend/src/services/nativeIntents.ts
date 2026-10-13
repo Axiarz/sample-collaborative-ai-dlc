@@ -1,6 +1,8 @@
+import { canonicalJson, nativePendingInput, type NativePendingInput } from '@/lib/nativePendingInput';
+import type { StructuredAnswer } from './questions';
 import { api } from './api';
 import type { WorkflowPackageHarness } from './workflowSources';
-import type { IntentGraphEdge, IntentGraphNode } from './intents';
+import type { IntentGraphEdge, IntentGraphNode, IntentOutput } from './intents';
 
 const executionStatuses = [
   'REQUESTED',
@@ -36,6 +38,7 @@ export interface NativeRecoveryRequest {
 }
 
 export interface NativeExecution {
+  imageStatus?: 'current' | 'retained' | 'revoked' | 'unapproved' | 'unavailable';
   status: (typeof executionStatuses)[number];
   attemptId: string;
   epoch: number;
@@ -66,6 +69,8 @@ export interface NativeInteractionView {
   harness: WorkflowPackageHarness;
   publicationId: string;
   messages: { type: 'text'; text: string }[];
+  /** Task-3: the structured question this turn presented, or null for free text. */
+  pendingInput?: NativePendingInput | null;
   contentSha256: string;
   createdAt: string;
   response?: NativeUserReply | null;
@@ -92,6 +97,8 @@ export interface NativeReplyRequest {
   interactionId: string;
   contentSha256: string;
   text: string;
+  /** The member's structured selection; text is its canonical rendering. */
+  selection?: StructuredAnswer;
 }
 
 export const NATIVE_REPLY_MAX_BYTES = 16 * 1024;
@@ -333,6 +340,7 @@ function execution(value: unknown): NativeExecution | null {
   }
   return {
     status: value.status as NativeExecution['status'],
+    ...(value.imageStatus !== undefined ? { imageStatus: ['current','retained','revoked','unapproved','unavailable'].includes(String(value.imageStatus)) ? value.imageStatus as NativeExecution['imageStatus'] : 'unavailable' as const } : {}),
     attemptId: value.attemptId,
     epoch: Number(value.epoch),
     startedAt: value.startedAt,
@@ -421,9 +429,19 @@ async function interaction(value: unknown): Promise<NativeInteractionView> {
     },
   );
   if (!messages.some((message) => message.text.trim())) throw invalidInteraction();
-  // The server hashes canonical JSON, sorting each message's keys. Verify the
-  // displayed bytes before binding a reply to this content digest.
-  const canonical = JSON.stringify(messages.map(({ text, type }) => ({ text, type })));
+  let pendingInput: NativePendingInput | null = null;
+  if (value.pendingInput != null) {
+    try {
+      pendingInput = nativePendingInput(value.pendingInput);
+    } catch {
+      throw invalidInteraction();
+    }
+  }
+  // The server hashes canonical JSON (sorted keys); v2 covers the presented
+  // question too. Verify the displayed bytes and options before binding a reply.
+  const canonical = pendingInput
+    ? canonicalJson({ messages, pendingInput })
+    : JSON.stringify(messages.map(({ text, type }) => ({ text, type })));
   const hash = Array.from(
     new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(canonical))),
   )
@@ -443,6 +461,7 @@ async function interaction(value: unknown): Promise<NativeInteractionView> {
     harness: value.harness as WorkflowPackageHarness,
     publicationId: value.publicationId,
     messages,
+    pendingInput,
     contentSha256: value.contentSha256,
     createdAt: value.createdAt,
     ...(response !== undefined ? { response } : {}),
@@ -608,6 +627,12 @@ const itemPath = (projectId: string, intentId: string) =>
   `${path(projectId)}/${encodeURIComponent(intentId)}`;
 
 export const nativeIntentsService = {
+  async outputs(projectId: string, intentId: string, afterSeq = 0): Promise<{outputs: IntentOutput[]; nextAfter: number | null}> {
+    const value = await api.get<{outputs: IntentOutput[]; nextAfter: number | null}>(`${path(projectId)}/${encodeURIComponent(intentId)}/outputs?afterSeq=${afterSeq}`);
+    if (!record(value) || !Array.isArray(value.outputs) || value.outputs.some(row => !record(row) || !Number.isSafeInteger(row.seq) || row.seq <= afterSeq || typeof row.content !== 'string') ||
+      (value.nextAfter !== null && (!Number.isSafeInteger(value.nextAfter) || value.nextAfter <= afterSeq))) throw new Error('Invalid native output history');
+    return value;
+  },
   async list(projectId: string, cursor: string | null = null): Promise<NativeIntentPage> {
     if (!validId(projectId) || (cursor !== null && !validCursor(cursor))) {
       throw new Error('The native intent list request is invalid.');
@@ -719,6 +744,7 @@ export const nativeIntentsService = {
       interactionId: request.interactionId,
       contentSha256: request.contentSha256,
       text: request.text,
+      ...(request.selection ? { selection: request.selection } : {}),
     });
     if (
       !record(value) ||

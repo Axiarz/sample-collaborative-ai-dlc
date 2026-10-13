@@ -26,6 +26,8 @@ interface Props {
   onAutoSave?: (draftAnswer: StructuredAnswer) => Promise<void>;
   onFocus?: () => void;
   onBlur?: () => void;
+  /** Offer a question-anchored discussion (platform). Native threads anchor runs and artifacts. */
+  discussable?: boolean;
 }
 
 export default function QuestionEditor({
@@ -37,6 +39,7 @@ export default function QuestionEditor({
   onAutoSave,
   onFocus,
   onBlur,
+  discussable = true,
 }: Props) {
   const {
     selections,
@@ -139,7 +142,7 @@ export default function QuestionEditor({
             }}
             onBlur={onBlur}
             trailing={
-              qIdx === 0 ? (
+              qIdx === 0 && discussable ? (
                 <DiscussButton
                   entityType="question"
                   entityId={question.id}

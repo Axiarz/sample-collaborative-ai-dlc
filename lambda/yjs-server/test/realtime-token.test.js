@@ -23,6 +23,8 @@ const SPRINT_ID = '0f8fad5b-d9cb-469f-a165-70867728950e';
 const PROJECT_ID = '7c9e6679-7425-40de-944b-e07fc1f90ae7';
 const ARTIFACT_ID = 'a3bb189e-8bf9-3888-9912-ace4e6543002';
 const INTENT_ID = 'b1e0f2a4-1c3d-4e5f-8a9b-0c1d2e3f4a5b';
+const DIGEST = 'd'.repeat(64);
+const INTERACTION = 'e'.repeat(64);
 
 // Inventory: every doc-name format in the codebase → expected scope.
 // Sources (grep-verified):
@@ -67,6 +69,20 @@ const YJS_DOC_VECTORS = [
   [`intent-sq-not-a-uuid`, null],
   [`evil-${SPRINT_ID}`, null],
   [SPRINT_ID, null],
+  // Native collaboration docs (project/execution digest-keyed). Discussions
+  // need the execution-wide collab scope; reply drafts need their exact
+  // revision scope. Anything not exactly shaped is denied.
+  [`native-discussion-${DIGEST}-disc-${INTENT_ID}`, `native-collab:${DIGEST}`],
+  [`native-reply-${DIGEST}-${INTERACTION}-2`, `native-reply:${DIGEST}:${INTERACTION}:2`],
+  [`native-answer-${DIGEST}-${INTERACTION}-2`, `native-answer:${DIGEST}:${INTERACTION}:2`],
+  [`native-answer-${DIGEST}-${INTERACTION}-0`, null],
+  [`native-reply-${DIGEST}-${INTERACTION}-0`, null],
+  [`native-reply-${DIGEST}-${INTERACTION}-02`, null],
+  [`native-reply-${DIGEST}-${INTERACTION}`, null],
+  [`native-reply-${DIGEST.toUpperCase()}-${INTERACTION}-2`, null],
+  [`native-discussion-${DIGEST}-disc-${INTENT_ID}-extra`, null],
+  [`native-discussion-${DIGEST}`, null],
+  [`native-intent-${PROJECT_ID}-${INTENT_ID}-artifact`, null],
 ];
 
 const CHANNEL_VECTORS = [

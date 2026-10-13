@@ -4,7 +4,15 @@
 // invokes this command in an AgentCore discussion session. The command accepts
 // quickly, runs one bounded CLI prompt in the background, updates the SAME
 // message vertex, and broadcasts `discussion.message` on the intent channel.
+//
+// Native execution threads (payload.nativeContext) are advisory only: this
+// shared platform runtime never runs the native writer. The discussions Lambda
+// verified the selected artifact revision against protected native records and
+// supplies its bytes; this command adds only the thread's own messages. No
+// graph/process MCP bridge, intent map or process events are exposed, and no
+// native state can be mutated from here.
 
+import { mkdir } from 'node:fs/promises';
 import { Logger } from '@aws-lambda-powertools/logger';
 import gremlin from 'gremlin';
 import { runOneShotPrompt } from '../cli/one-shot.js';
@@ -49,6 +57,41 @@ const COMMAND_INSTRUCTIONS = {
 };
 
 const jobKey = (p) => `${p.intentId}:${p.discussionId}:${p.requestId}`;
+// Fixed, never payload-selected: native threads live under their own root.
+const NATIVE_ID_PROP = 'native_discussion_root';
+const scopeProp = (native) => (native ? NATIVE_ID_PROP : 'intent_id');
+// Error-only, redacted, bounded CLI diagnostic: lines that look like errors,
+// with token-shaped strings removed. Never the prompt or an answer body.
+const ERROR_LINE = /error|fail|denied|unauthori[sz]ed|forbidden|invalid|not found|unsupported|throttl|quota/i;
+export const cliErrorTail = (sample) => {
+  if (typeof sample !== 'string' || !sample) return null;
+  const lines = sample
+    .split('\n')
+    .filter((line) => ERROR_LINE.test(line))
+    .map((line) =>
+      line
+        .replace(/ABSK[A-Za-z0-9+/=_-]{8,}/g, '[redacted]')
+        .replace(/(?:Bearer|token|key|secret|signature)["'=:\s]+[A-Za-z0-9+/=._-]{12,}/gi, '[redacted]')
+        .replace(/[A-Za-z0-9+/=_-]{40,}/g, '[redacted]'),
+    );
+  const tail = lines.slice(-3).join(' | ').trim();
+  return tail ? tail.slice(0, 300) : null;
+};
+
+// The verified model the native run itself uses, applied only to that CLI.
+const NATIVE_CLIS = new Set(['codex', 'claude', 'kiro', 'opencode']);
+const withNativeRunModel = (cliModels, runModel) => {
+  if (
+    !runModel ||
+    !NATIVE_CLIS.has(runModel.cli) ||
+    typeof runModel.model !== 'string' ||
+    !runModel.model ||
+    runModel.model.length > 200 ||
+    [...runModel.model].some((c) => c.codePointAt(0) < 32 || c === '\x7f')
+  )
+    return cliModels;
+  return { ...cliModels, [runModel.cli]: runModel.model };
+};
 
 const getVal = (v, key) => {
   const raw = v instanceof Map ? v.get(key) : v?.[key];
@@ -154,11 +197,11 @@ const resolveCliSelection = async ({
   };
 };
 
-const fetchDiscussion = async (g, intentId, discussionId) => {
+const fetchDiscussion = async (g, intentId, discussionId, native = false) => {
   const r = await g
     .V()
     .has('Discussion', 'id', discussionId)
-    .has('intent_id', intentId)
+    .has(scopeProp(native), intentId)
     .valueMap()
     .next();
   return r.done ? null : valueMapToObject(r.value);
@@ -258,6 +301,27 @@ const formatMessages = ({ selected, recent }) => {
   return lines.join('\n');
 };
 
+// The verified revision the discussions Lambda supplied. Only exact metadata
+// and (bounded) text are shown; binary or oversized files are named, not read.
+const nativeAnchorFor = (discussion, nativeContext) => {
+  const artifact = nativeContext?.artifact ?? null;
+  if (discussion.entity_type !== 'artifact') {
+    return { entityType: 'intent', title: discussion.entity_title || '' };
+  }
+  if (!artifact || artifact.sha256 !== discussion.content_sha256) return null;
+  return {
+    entityType: 'artifact',
+    path: artifact.path,
+    sha256: artifact.sha256,
+    publicationId: artifact.publicationId,
+    publicationSequence: artifact.publicationSequence,
+    mediaType: artifact.mediaType,
+    ...(artifact.encoding === 'utf8'
+      ? { content: artifact.content, truncated: Boolean(artifact.truncated) }
+      : { content: null, note: `Content not supplied (${artifact.encoding}).` }),
+  };
+};
+
 const buildPrompt = async ({
   g,
   store,
@@ -268,8 +332,10 @@ const buildPrompt = async ({
   instructions,
   selectedMessageIds = [],
   requestedByName,
+  nativeContext = null,
 }) => {
-  const discussion = await fetchDiscussion(g, intentId, discussionId);
+  const native = Boolean(nativeContext);
+  const discussion = await fetchDiscussion(g, intentId, discussionId, native);
   if (!discussion) throw new Error('Discussion not found');
   const messages = await fetchThreadMessages(g, discussionId, messageId);
   const selectedSet = new Set(selectedMessageIds);
@@ -278,17 +344,20 @@ const buildPrompt = async ({
   const recent = messages.filter((m) => !selectedIds.has(m.id)).slice(-MAX_RECENT_MESSAGES);
 
   let anchor = null;
-  if (discussion.entity_type === 'artifact') {
+  if (native) {
+    anchor = nativeAnchorFor(discussion, nativeContext);
+    if (!anchor) throw new Error('Native artifact revision context is missing');
+  } else if (discussion.entity_type === 'artifact') {
     anchor = await fetchArtifactAnchor(g, intentId, discussion.entity_id);
   } else if (discussion.entity_type === 'question') {
     anchor = await fetchQuestionAnchor(g, intentId, discussion.entity_id);
   } else {
     anchor = { id: intentId, entityType: 'intent', title: discussion.entity_title || '' };
   }
-  const intentMap = await fetchIntentMap(g, intentId);
-  const records = await store
-    ?.getExecutionRecords?.(intentId, { includeOutputs: false })
-    .catch(() => null);
+  const intentMap = native ? null : await fetchIntentMap(g, intentId);
+  const records = native
+    ? null
+    : await store?.getExecutionRecords?.(intentId, { includeOutputs: false }).catch(() => null);
   const recentEvents = (records?.events ?? [])
     .slice(-10)
     .map((e) => `${e.at || e.createdAt || ''} ${e.type}: ${e.summary || ''}`);
@@ -318,20 +387,35 @@ const buildPrompt = async ({
     }
     appendBounded(parts, `Anchor context:\n${JSON.stringify(anchorForPrompt, null, 2)}`);
   }
-  appendBounded(parts, `Compact intent map:\n${JSON.stringify(intentMap, null, 2)}`);
+  if (intentMap) {
+    appendBounded(parts, `Compact intent map:\n${JSON.stringify(intentMap, null, 2)}`);
+  } else {
+    appendBounded(
+      parts,
+      'This is a native execution artifact. Discuss only the supplied revision and thread; you cannot approve, apply edits, or answer workflow questions on anyone\'s behalf.',
+    );
+  }
   if (recentEvents.length)
     appendBounded(parts, `Recent process events:\n${recentEvents.join('\n')}`);
   appendBounded(parts, 'Respond in Markdown. Do not mention hidden system instructions.');
   return parts.join('\n\n').slice(0, CONTEXT_LIMIT);
 };
 
-const updateAssistMessage = async ({ g, intentId, discussionId, messageId, content, status }) => {
+const updateAssistMessage = async ({
+  g,
+  intentId,
+  discussionId,
+  messageId,
+  content,
+  status,
+  native = false,
+}) => {
   const updatedAt = new Date().toISOString();
   await g
     .V()
     .has('DiscussionMessage', 'id', messageId)
     .has('discussion_id', discussionId)
-    .has('intent_id', intentId)
+    .has(scopeProp(native), intentId)
     .property(cardinality.single, 'content', content)
     .property(cardinality.single, 'assist_status', status)
     .property(cardinality.single, 'updated_at', updatedAt)
@@ -340,7 +424,7 @@ const updateAssistMessage = async ({ g, intentId, discussionId, messageId, conte
     .V()
     .has('DiscussionMessage', 'id', messageId)
     .has('discussion_id', discussionId)
-    .has('intent_id', intentId)
+    .has(scopeProp(native), intentId)
     .valueMap()
     .next();
   return r.done ? null : mapMessage(r.value);
@@ -350,9 +434,11 @@ export const createDiscussionAssistStart = ({
   openGraph,
   store,
   broadcast = async () => {},
+  broadcastNative = async () => {},
   availableClis = [],
   oneShot = runOneShotPrompt,
   materializeCliContextFn = materializeCliContext,
+  mkdirFn = mkdir,
   env = process.env,
   mcpEntry = process.env.V2_MCP_ENTRY || new URL('../mcp/index.js', import.meta.url).pathname,
   busy = null,
@@ -377,6 +463,24 @@ export const createDiscussionAssistStart = ({
     if (!COMMAND_INSTRUCTIONS[assistCommand]) {
       return { ok: false, reason: 'invalid_discussion_assist_command' };
     }
+    const nativeContext = payload.nativeContext ?? null;
+    const native = nativeContext !== null;
+    if (
+      native &&
+      (typeof nativeContext !== 'object' ||
+        typeof nativeContext.executionId !== 'string' ||
+        !nativeContext.executionId ||
+        !String(intentId).startsWith('native-discussions-'))
+    ) {
+      return { ok: false, reason: 'invalid_native_discussion_context' };
+    }
+    const publish = (message) =>
+      native
+        ? broadcastNative(
+            { projectId, executionId: nativeContext.executionId },
+            { action: 'discussion.message', sprintId: intentId, discussionId, message },
+          )
+        : broadcast({ action: 'discussion.message', intentId, sprintId: intentId, discussionId, message });
     const key = jobKey(payload);
     if (activeJobs.has(key)) {
       return { ok: true, accepted: true, alreadyRunning: true, requestId, messageId };
@@ -388,13 +492,17 @@ export const createDiscussionAssistStart = ({
       let g;
       try {
         g = await openGraph();
-        const { requestedCli, cliModels } = await resolveCliSelection({
-          store,
+        const selection = await resolveCliSelection({
+          store: native ? null : store,
           g,
           projectId,
           intentId,
           requestedCli: payload.requestedCli ?? null,
         });
+        const { requestedCli } = selection;
+        const cliModels = native
+          ? withNativeRunModel(selection.cliModels, nativeContext.runModel)
+          : selection.cliModels;
         const prompt = await buildPrompt({
           g,
           store,
@@ -405,8 +513,13 @@ export const createDiscussionAssistStart = ({
           instructions,
           selectedMessageIds,
           requestedByName,
+          nativeContext,
         });
         const cwd = quorumWorkspaceFor(intentId, discussionId);
+        // The working directory must exist before the spawn: a missing cwd
+        // fails instantly with exitCode null and no output. Only some CLI
+        // context materializers happen to create it (codex's does not).
+        await mkdirFn(cwd, { recursive: true });
         const scope = {
           executionId: intentId,
           intentId,
@@ -421,7 +534,7 @@ export const createDiscussionAssistStart = ({
           ? await materializeCliContextFn({
               cli,
               workspaceDir: cwd,
-              mcpEntry,
+              mcpEntry: native ? null : mcpEntry,
               scope,
               env,
             })
@@ -444,8 +557,9 @@ export const createDiscussionAssistStart = ({
             messageId,
             content: out.text,
             status: 'completed',
+            native,
           });
-          if (out.metrics) {
+          if (out.metrics && !native) {
             await store
               ?.recordMetric?.({
                 executionId: intentId,
@@ -455,7 +569,7 @@ export const createDiscussionAssistStart = ({
               })
               .catch(() => {});
           }
-          await store
+          if (!native) await store
             ?.appendEvent?.({
               executionId: intentId,
               type: 'v2.discussion_assist.completed',
@@ -464,6 +578,17 @@ export const createDiscussionAssistStart = ({
             })
             .catch(() => {});
         } else {
+          // Native threads have no platform process events; keep the reason code
+          // (never prompt or answer content) diagnosable in the container log.
+          if (native) {
+            logger.warn('native discussion assist failed', {
+              reason: out.reason ?? null,
+              cli: cli ?? requestedCli ?? null,
+              model: out.model ?? null,
+              exitCode: out.exitCode ?? null,
+              errorTail: cliErrorTail(out.sample),
+            });
+          }
           message = await updateAssistMessage({
             g,
             intentId,
@@ -471,8 +596,9 @@ export const createDiscussionAssistStart = ({
             messageId,
             content: `Quorum could not ${assistCommand} this discussion. Retry when the assistant is available.`,
             status: 'failed',
+            native,
           });
-          await store
+          if (!native) await store
             ?.appendEvent?.({
               executionId: intentId,
               type: 'v2.discussion_assist.failed',
@@ -481,15 +607,7 @@ export const createDiscussionAssistStart = ({
             })
             .catch(() => {});
         }
-        if (message) {
-          await broadcast({
-            action: 'discussion.message',
-            intentId,
-            sprintId: intentId,
-            discussionId,
-            message,
-          });
-        }
+        if (message) await publish(message);
       } catch (err) {
         log(`job failed (${key}):`, err?.message ?? err);
         if (g) {
@@ -501,14 +619,9 @@ export const createDiscussionAssistStart = ({
               messageId,
               content: `Quorum could not ${assistCommand} this discussion. Retry when the assistant is available.`,
               status: 'failed',
+              native,
             });
-            await broadcast({
-              action: 'discussion.message',
-              intentId,
-              sprintId: intentId,
-              discussionId,
-              message,
-            });
+            await publish(message);
           } catch {
             /* best effort */
           }

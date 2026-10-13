@@ -182,7 +182,7 @@ export function AppHeader({
       {/* Right: theme + activity toggle + user */}
       <ThemeToggle />
 
-      {!inNative && (params.sprintId || params.intentId) && (
+      {(params.sprintId || params.intentId) && (
         <Tooltip>
           <TooltipTrigger asChild>
             <Button

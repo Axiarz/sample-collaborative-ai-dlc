@@ -16,6 +16,7 @@ import { loadNativePackage } from './package-loader.js';
 import { runNativeCommand } from './command-runner.js';
 import { withGitCredential } from '../git-auth.js';
 import { isValidRepoPath } from '../../shared/repo-validation.js';
+import { recordNativeBoundary } from '../../shared/native-lifecycle.js';
 
 const fail = (code) => {
   throw Object.assign(new Error(code), { code });
@@ -226,6 +227,7 @@ export const createNativeExecutionPorts = ({
         workRoot: join(root, 'package-downloads'),
         materialize,
       });
+      recordNativeBoundary(dispatch, 'packageVerificationStarted');
       const loaded = await archive.restore({
         projectId: dispatch.projectId,
         sourceId: candidate.sourceId,
@@ -261,6 +263,8 @@ export const createNativeExecutionPorts = ({
       } catch {
         fail('native_execution_package_invalid');
       }
+      recordNativeBoundary(dispatch, 'packageVerificationCompleted');
+      recordNativeBoundary(dispatch, 'checkoutStarted');
       const baseEnv = {
         HOME: home,
         PATH: '/usr/local/bin:/usr/bin:/bin',
@@ -404,6 +408,7 @@ export const createNativeExecutionPorts = ({
         await exclude.close();
       }
       await recheck();
+      recordNativeBoundary(dispatch, 'checkoutCompleted');
       return {
         package: {
           directory: loaded.directory,
@@ -485,8 +490,10 @@ export const createNativeExecutionPorts = ({
         checkpointId: payload.checkpoint?.id,
         signal,
       });
+      recordNativeBoundary(payload, 'checkpointVerificationStarted');
       const loaded = await recoveryStorage().readFiles(executionScope(payload), payload.checkpoint);
       checkAbort(signal);
+      recordNativeBoundary(payload, 'checkpointVerificationCompleted');
       return loaded;
     },
     async prepareRecovery({ payload, root, project, home, signal }) {

@@ -11,6 +11,8 @@
 // the v1 test suite passes unchanged. The INTENT scope is the additive v2 path:
 // threads anchor on the Intent vertex and on the artifacts it CONTAINS.
 
+import { nativeCollaborationDigest, nativeIntentChannel } from '../shared/native-realtime.js';
+
 // Per-scope entity-type → anchor vertex label.
 export const SPRINT_ANCHOR_LABELS = {
   sprint: 'Sprint',
@@ -82,11 +84,50 @@ export const intentScope = (intentId, projectId) => ({
   notFoundError: 'Intent not found',
 });
 
+// Native execution threads hang off a dedicated root that only this Lambda
+// writes: the publication graph is a replaceable projection and its CONTAINS
+// edges move between revisions. Every native type anchors on that root and is
+// keyed by entityId. An artifact entityId is one verified revision
+// (`<fileId>:<sha256>`); ownership comes from protected native records.
+export const NATIVE_ANCHOR_LABELS = {
+  intent: 'NativeDiscussionRoot',
+  artifact: 'NativeDiscussionRoot',
+};
+
+export const nativeScope = (projectId, executionId) => {
+  const identity = { projectId, executionId };
+  let digest;
+  try {
+    digest = nativeCollaborationDigest(identity);
+  } catch {
+    return null;
+  }
+  return {
+    kind: 'native',
+    rootLabel: 'NativeDiscussionRoot',
+    rootId: `native-discussions-${digest}`,
+    idProp: 'native_discussion_root',
+    channel: nativeIntentChannel(identity),
+    anchorLabels: NATIVE_ANCHOR_LABELS,
+    entityTypes: Object.keys(NATIVE_ANCHOR_LABELS),
+    selfTypes: ['intent'],
+    rootAnchorTypes: ['artifact'],
+    timeline: false,
+    projectId,
+    executionId,
+    notFoundError: 'Intent not found',
+  };
+};
+
 // Resolve the scope descriptor from the request path parameters. Returns null
 // for an unrecognized shape (handlers turn that into a 404). Pure — no I/O.
-export const resolveScope = (pathParameters = {}) => {
+export const resolveScope = (pathParameters = {}, resource = '') => {
   const { sprintId, intentId, projectId } = pathParameters || {};
   if (sprintId) return sprintScope(sprintId);
+  // Native routes are distinct API resources; never infer native from an ID.
+  if (intentId && /\/native-intents\//.test(resource || '')) {
+    return projectId ? nativeScope(projectId, intentId) : null;
+  }
   if (intentId) return intentScope(intentId, projectId || null);
   return null;
 };

@@ -158,6 +158,15 @@ describe('native controller diagnostic privacy boundary', () => {
     s.assertPrivate();
   });
 
+  it.each(['invalid', 'failed', 'incomplete', 'terminal', 'session', 'credential', 'limit'])(
+    'reports the harness output failure code native_execution_output_%s',
+    (suffix) => {
+      const s = sinks();
+      s.diagnostics({ phase: 'status', stage: 'report', code: 'REPORT_OBSERVED', runtimeCode: `native_execution_output_${suffix}` });
+      expect(s.events()[0]).toMatchObject({ runtimeCode: `native_execution_output_${suffix}` });
+    },
+  );
+
   it('never coerces untrusted values or evaluates diagnostic getters', () => {
     const s = sinks();
     const getter = vi.fn(() => {

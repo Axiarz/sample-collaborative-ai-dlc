@@ -17,6 +17,7 @@ const FILE = `${ITEM}/files/{fileId}`;
 const GRAPH = `${ITEM}/graph`;
 const INTERACTION = `${ITEM}/interaction`;
 const RESPONSE = `${ITEM}/response`;
+const OUTPUTS = `${ITEM}/outputs`;
 const ERRORS = {
   NATIVE_PREPARATION_INVALID: [400, 'Invalid native preparation request'],
   NATIVE_PREPARATION_CONFLICT: [409, 'Native intent changed or its immutable request conflicts'],
@@ -54,6 +55,8 @@ const ERRORS = {
   NATIVE_EXECUTION_NOT_READY: [409, 'Prepare the native workspace before starting'],
   NATIVE_EXECUTION_LEASE_LOST: [409, 'Native execution ownership changed; refresh its status'],
   NATIVE_EXECUTION_CANCELLED: [409, 'Native execution was cancelled'],
+  NATIVE_EXECUTION_IMAGE_REVOKED: [409, 'The runtime image for this execution was revoked'],
+  NATIVE_EXECUTION_IMAGE_UNAPPROVED: [409, 'The runtime image is no longer approved'],
   NATIVE_EXECUTION_CONFIG_INVALID: [409, 'Native execution configuration is invalid'],
   NATIVE_EXECUTION_CONFIG_UNAVAILABLE: [503, 'Native execution configuration is unavailable'],
   NATIVE_EXECUTION_CONFIG_NOT_READY: [409, 'Prepare the native workspace before starting'],
@@ -141,12 +144,15 @@ const validMembership = (value) =>
       ![...value[key]].some((character) => character.codePointAt(0) < 32 || character === '\x7f'),
   );
 
+// Task-3: an optional structured selection. Its meaning is validated against
+// the committed interaction by the execution API, not here.
 const validReply = (value) =>
   record(value) &&
-  Object.keys(value).length === 4 &&
+  Object.keys(value).length === (Object.hasOwn(value, 'selection') ? 5 : 4) &&
   ['requestId', 'interactionId', 'contentSha256', 'text'].every((key) =>
     Object.hasOwn(value, key),
   ) &&
+  (!Object.hasOwn(value, 'selection') || record(value.selection)) &&
   matches(value.requestId, UUID_V4) &&
   matches(value.interactionId, /^[a-f0-9]{64}$/) &&
   matches(value.contentSha256, /^[a-f0-9]{64}$/) &&
@@ -193,6 +199,7 @@ export const createNativeRuntimeApi =
         GRAPH,
         INTERACTION,
         RESPONSE,
+        OUTPUTS,
       ].includes(event?.resource)
     )
       return reply(response, 404, 'NOT_FOUND', 'Route not found');
@@ -233,7 +240,8 @@ export const createNativeRuntimeApi =
     )
       return invalid();
     const { projectId, intentId } = params;
-    const suffix = preparation
+    const outputRead = event.resource === OUTPUTS;
+    const suffix = outputRead ? '/outputs' : preparation
       ? '/prepare'
       : start
         ? '/start'
@@ -267,7 +275,17 @@ export const createNativeRuntimeApi =
       );
     let input;
     try {
-      const listing = nativeListQuery(event, { collection, projectId });
+      let after = 0;
+      if (outputRead) {
+        const single = event.queryStringParameters ?? {};
+        const multi = event.multiValueQueryStringParameters ?? {};
+        if (!record(single) || !record(multi) || Object.keys(single).some(k => k !== 'afterSeq') ||
+          Object.entries(multi).some(([k,v]) => k !== 'afterSeq' || !Array.isArray(v) || v.length !== 1 || (single[k] !== undefined && single[k] !== v[0]))) return invalid();
+        const raw = single.afterSeq ?? multi.afterSeq?.[0] ?? '0';
+        if (typeof raw !== 'string' || !/^(0|[1-9][0-9]{0,15})$/.test(raw) || !Number.isSafeInteger(Number(raw))) return invalid();
+        after = Number(raw);
+      }
+      const listing = outputRead ? null : nativeListQuery(event, { collection, projectId });
       if (collection && event.httpMethod === 'POST') {
         if (typeof event.body !== 'string') return invalid();
         if (Buffer.byteLength(event.body) > 96 * 1024)
@@ -386,13 +404,20 @@ export const createNativeRuntimeApi =
       let row = await store.get(identity);
       if (!row) fail('NOT_FOUND');
       await recheck(row);
+      if (outputRead) {
+        if (!execution?.outputs) return response(200, { outputs: [], nextAfter: null });
+        return response(200, await execution.outputs(row, after, recheck));
+      }
       if (start || cancel || userResponse || recover) {
         if (!execution)
           return reply(response, 503, 'NATIVE_EXECUTION_DISABLED', 'Native execution is disabled');
         const details = start
           ? await execution.start(row, actorId, input.requestId, recheck)
           : userResponse
-            ? await execution.respond(row, actorId, input, recheck)
+            ? await execution.respond(row, actorId, input, recheck, {
+                membershipId: before.membershipId,
+                projectIdentity: before.projectIdentity,
+              })
             : recover
               ? await execution.recover(row, input, recheck)
               : await execution.cancel(row, recheck);

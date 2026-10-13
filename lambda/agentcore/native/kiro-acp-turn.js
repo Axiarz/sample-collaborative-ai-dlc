@@ -27,6 +27,7 @@ export const createKiroAcpTurn = ({
   priorAssistantSha256 = null,
   production = false,
   historyMode = 'all',
+  onActivity = () => {},
 }) => {
   if (
     !validText(project, 4096) ||
@@ -106,6 +107,11 @@ export const createKiroAcpTurn = ({
       fail('native_kiro_acp_session_update_mismatch');
     if (!expectedId) newUpdateId = params.sessionId;
     const { sessionUpdate, content } = params.update;
+    if (report.protocolPhase === 'prompt' && ['tool_call','tool_call_update'].includes(sessionUpdate)) {
+      const update = params.update;
+      return onActivity({ content: `Running tool ${update.kind ?? 'tool'}\n${JSON.stringify({ input: update.rawInput, output: update.rawOutput, content: update.content, locations: update.locations })}`,
+        display: { type: 'tool', level: update.status === 'failed' ? 'error' : 'info', title: typeof update.title === 'string' ? update.title : 'Agent tool activity' } });
+    }
     if (content?.type !== 'text' || typeof content.text !== 'string') return;
     if (report.protocolPhase === 'load') {
       const replayAppend = (before, value) => {
@@ -135,6 +141,7 @@ export const createKiroAcpTurn = ({
       }
     } else if (report.protocolPhase === 'prompt' && sessionUpdate === 'agent_message_chunk') {
       report.text = append(report.text, content.text);
+      return onActivity({ content: content.text, display: { type: 'message', level: 'info' } });
     }
   };
   const onPermission = (params) => {
@@ -270,6 +277,10 @@ const run = async () => {
       }
     : await resolveKiroPromptEvidence({ project: values.project, prompt: values.prompt });
   const turn = createKiroAcpTurn({
+    onActivity: event => new Promise((resolve, reject) => process.stdout.write(
+      `${JSON.stringify({ schemaVersion: 1, transport: 'kiro-acp-activity', event })}\n`,
+      error => error ? reject(error) : resolve(),
+    )),
     project: values.project,
     prompt: values.prompt,
     sessionId: values['resume-id'] ?? null,

@@ -75,7 +75,7 @@ it('native breadcrumb stays on native status even if platform context has the sa
   expect(within(crumbs).getByText('Workspace ready')).toBeInTheDocument();
   expect(within(crumbs).queryByText('Work')).not.toBeInTheDocument();
   expect(within(crumbs).queryByText('Platform title')).not.toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: 'Toggle activity panel' })).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Toggle activity panel' })).toBeInTheDocument();
   fireEvent.click(within(crumbs).getByRole('button', { name: 'Protected native' }));
   expect(screen.getByTestId('path')).toHaveTextContent('/space/p1/native-intent/same');
 });

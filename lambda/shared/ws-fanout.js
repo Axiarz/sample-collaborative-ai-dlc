@@ -11,6 +11,7 @@ import {
   PostToConnectionCommand,
 } from '@aws-sdk/client-apigatewaymanagementapi';
 import { isTokenLive } from './realtime-token.js';
+import { nativeIntentChannel } from './native-realtime.js';
 import { Logger } from '@aws-lambda-powertools/logger';
 
 const logger = new Logger({ persistentKeys: { component: 'ws-fanout' } });
@@ -25,10 +26,10 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
  * @param {string} intentId
  * @param {object} payload — must carry `action` (the client routing key)
  */
-const broadcastToIntentChannel = async (intentId, payload) => {
+const broadcastToChannel = async (documentId, payload) => {
   const connectionsTable = process.env.CONNECTIONS_TABLE;
   const websocketEndpoint = process.env.WEBSOCKET_ENDPOINT;
-  if (!connectionsTable || !websocketEndpoint || !intentId) return;
+  if (!connectionsTable || !websocketEndpoint || !documentId) return;
   try {
     // Drain LastEvaluatedKey: a Query page caps at 1MB, and truncation would
     // silently stop broadcasting to connections past the first page.
@@ -40,7 +41,7 @@ const broadcastToIntentChannel = async (intentId, payload) => {
           TableName: connectionsTable,
           IndexName: 'DocumentIdIndex',
           KeyConditionExpression: 'documentId = :docId',
-          ExpressionAttributeValues: { ':docId': `intent:${intentId}` },
+          ExpressionAttributeValues: { ':docId': documentId },
           ExclusiveStartKey,
         }),
       );
@@ -64,5 +65,9 @@ const broadcastToIntentChannel = async (intentId, payload) => {
   }
 };
 
-export { broadcastToIntentChannel };
+const broadcastToIntentChannel = (intentId, payload) =>
+  intentId ? broadcastToChannel(`intent:${intentId}`, payload) : Promise.resolve();
+const broadcastToNativeIntentChannel = (scope, payload) =>
+  broadcastToChannel(nativeIntentChannel(scope), payload);
+export { broadcastToIntentChannel, broadcastToNativeIntentChannel };
 export default { broadcastToIntentChannel };

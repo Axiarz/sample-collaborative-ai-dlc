@@ -14,6 +14,7 @@ import {
   readNativeCodeBinding,
 } from './execution-config.js';
 import { ID, UUID_V4, matches } from './store.js';
+import { createNativeRuntimeImagePolicy } from './runtime-images.js';
 import {
   isNativeSourceBranch,
   isNativeSourceCommit,
@@ -28,6 +29,7 @@ const CODES = Object.freeze({
   FORBIDDEN: 'NATIVE_EXECUTION_CREDENTIALS_FORBIDDEN',
   MODEL_UNAVAILABLE: 'NATIVE_EXECUTION_MODEL_CREDENTIAL_UNAVAILABLE',
   SOURCE_CHANGED: 'NATIVE_EXECUTION_SOURCE_CREDENTIAL_CHANGED',
+  IMAGE_REVOKED: 'NATIVE_EXECUTION_CREDENTIALS_IMAGE_REVOKED',
 });
 class CredentialDenial extends Error {
   constructor(suffix) {
@@ -107,7 +109,6 @@ const authorizeExecution = (row, payload, deployment) => {
     !matches(row.bindingId, UUID_V4) ||
     !matches(row.startedBy, ID) ||
     !matches(row.runtimeSessionId, UUID_V4) ||
-    !same(config.image, deployment.image) ||
     config.accountId !== deployment.accountId ||
     config.packageBucket !== deployment.packageBucket ||
     config.publicationBucket !== deployment.publicationBucket ||
@@ -128,6 +129,22 @@ const authorizeExecution = (row, payload, deployment) => {
       (!isNativeSourceBranch(row.sourceBranch) || !isNativeSourceCommit(row.sourceCommit)))
   )
     fail('CHANGED');
+};
+// The pinned image must still be the deployment image, or an exact retained
+// image for a resumable run. Revocation blocks renewal even for the current pin.
+const authorizeImage = async (policy, row, deployment) => {
+  let decision;
+  try {
+    decision = await policy.decide({
+      image: nativeExecutionConfiguration(row.configuration).image,
+      row,
+      deployment,
+    });
+  } catch {
+    fail('UNAVAILABLE');
+  }
+  if (decision.status === 'revoked') fail('IMAGE_REVOKED');
+  if (!['current', 'retained'].includes(decision.status)) fail('CHANGED');
 };
 const authorizePreparation = (draft, execution) => {
   if (
@@ -179,6 +196,7 @@ export const createNativeExecutionCredentials =
     secrets,
     env = process.env,
     getMembershipSnapshot,
+    imagePolicy,
   }) =>
   async (payload) => {
     try {
@@ -193,8 +211,12 @@ export const createNativeExecutionCredentials =
       )
         fail('UNAVAILABLE');
       const deployment = nativeExecutionDeployment(env);
+      const images =
+        imagePolicy ??
+        createNativeRuntimeImagePolicy({ ddb, tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE, env });
       const execution = structuredClone(await executionStore.get(scope));
       authorizeExecution(execution, payload, deployment);
+      await authorizeImage(images, execution, deployment);
       if (nativeTurnSequence(execution) > 1) {
         const response = await executionStore.response?.(
           execution,
@@ -321,6 +343,8 @@ export const createNativeExecutionCredentials =
       const currentExecution = structuredClone(await executionStore.get(scope));
       authorizeExecution(currentExecution, payload, deployment);
       if (!same(currentExecution, execution)) fail('CHANGED');
+      // A revocation written during the slow provider path still wins.
+      await authorizeImage(images, currentExecution, deployment);
       // Never return refresh closures, committer/provider bodies, secret paths,
       // connection rows, requests or configuration objects. The dispatcher uses
       // Git credentials only for its trusted checkout child, not harness env.

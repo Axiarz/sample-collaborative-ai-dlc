@@ -35,7 +35,7 @@ resource "aws_api_gateway_resource" "native_intent_prepare" {
 }
 
 resource "aws_api_gateway_resource" "native_execution_action" {
-  for_each    = var.native_preparation_enabled && var.native_execution_enabled ? toset(["start", "cancel", "recover", "publication", "files", "graph", "interaction", "response"]) : toset([])
+  for_each    = var.native_preparation_enabled && var.native_execution_enabled ? toset(["start", "cancel", "recover", "publication", "files", "graph", "interaction", "response", "outputs"]) : toset([])
   rest_api_id = aws_api_gateway_rest_api.main.id
   parent_id   = aws_api_gateway_resource.native_intent[0].id
   path_part   = each.value
@@ -60,6 +60,10 @@ locals {
     recover = {
       method = "POST", resource_id = aws_api_gateway_resource.native_execution_action["recover"].id,
       path   = "api/projects/*/native-intents/*/recover", item = true
+    }
+    outputs = {
+      method = "GET", resource_id = aws_api_gateway_resource.native_execution_action["outputs"].id,
+      path = "api/projects/*/native-intents/*/outputs", item = true
     }
     publication = {
       method = "GET", resource_id = aws_api_gateway_resource.native_execution_action["publication"].id,

@@ -51,6 +51,30 @@ const setup = (input = {}, handlers = {}) => {
 };
 
 describe('native Kiro ACP turn', () => {
+  it('makes assistant and tool ACP updates available before the prompt resolves', async () => {
+    const activity = [];
+    let release;
+    const heldPrompt = new Promise(resolve => { release = resolve; });
+    let promptStarted;
+    const started = new Promise(resolve => { promptStarted = resolve; });
+    const { turn, client } = setup({production:true,onActivity: async value => { activity.push(value); }}, {
+      'session/prompt': async (_params,current) => {
+        await current.onUpdate(update('I am reading the source.'));
+        await current.onUpdate({sessionId:'session-A',update:{sessionUpdate:'tool_call',title:'Read source',kind:'read',status:'in_progress',rawInput:{path:'src/game.js'}}});
+        promptStarted();
+        await heldPrompt;
+        return {stopReason:'end_turn'};
+      },
+    });
+    let complete = false;
+    const running = turn.execute(client).then(value => { complete = true; return value; });
+    await started;
+    expect(complete).toBe(false);
+    expect(activity.map(value=>value.display.type)).toEqual(['message','tool']);
+    expect(activity[0].content).toBe('I am reading the source.');
+    release();
+    expect(await running).toMatchObject({ok:true,text:'I am reading the source.'});
+  });
   it('verifies the latest prior turn for third and later production replies without replaying old messages', async () => {
     const { turn, client } = setup(
       {

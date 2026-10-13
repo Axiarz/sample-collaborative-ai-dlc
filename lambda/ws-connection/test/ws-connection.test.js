@@ -80,6 +80,20 @@ describe('ws-connection handler', () => {
   });
 
   describe('$connect (doc-token enforcement)', () => {
+    it('isolates project-qualified native channels from colliding native and platform IDs', async () => {
+      ddbMock.on(PutItemCommand).resolves({});
+      const handler = await loadHandler();
+      const id = SPRINT_ID;
+      const channel = `native-intent:${PROJECT_ID}:${id}`;
+      const other = `native-intent:${SPRINT_ID}:${id}`;
+      const token = mintToken({ scopes: [channel] }).token;
+      expect((await handler(connectEvent({ docToken: token, queryStringParameters: { documentId: channel } }))).statusCode).toBe(200);
+      for (const forbidden of [other, `intent:${id}`])
+        expect((await handler(connectEvent({ docToken: token, queryStringParameters: { documentId: forbidden } }))).statusCode).toBe(403);
+      expect(ddbMock).toHaveReceivedCommandTimes(PutItemCommand, 1);
+      expect(ddbMock.commandCalls(PutItemCommand)[0].args[0].input.Item.documentId).toEqual({ S: channel });
+    });
+
     it('writes a connection row with tokenExp for a valid token and returns 200', async () => {
       ddbMock.on(PutItemCommand).resolves({});
       const now = 1_700_000_000_000;

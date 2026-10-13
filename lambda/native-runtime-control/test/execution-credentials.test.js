@@ -36,6 +36,7 @@ const fixture = async () => {
     NATIVE_EXECUTION_PUBLICATION_BUCKET: 'native-publications-dev',
     NATIVE_PACKAGES_BUCKET: 'native-packages-dev',
     SOURCE_CONTROL_BINDINGS_TABLE: 'app-bindings',
+    NATIVE_RUNTIME_BINDINGS_TABLE: 'native-bindings',
     AGENT_SETTINGS_SSM_PREFIX: '/aidlc/dev',
   };
   const binding = prepareBinding({
@@ -134,6 +135,12 @@ const fixture = async () => {
     send: vi.fn(async (command) => {
       expect(command).toBeInstanceOf(GetCommand);
       expect(command.input.ConsistentRead).toBe(true);
+      if (command.input.TableName === 'native-bindings') {
+        expect(command.input.Key.sk).toBe('REVOCATION');
+        await state.revocationHook?.(command.input.Key);
+        const item = state.revocations?.[command.input.Key.pk];
+        return item ? { Item: structuredClone(item) } : {};
+      }
       if (command.input.TableName === 'app-bindings') {
         expect(command.input.Key).toEqual({
           projectId: PROJECT,
@@ -285,6 +292,91 @@ describe('controller-only native credential facade', () => {
       code: 'NATIVE_EXECUTION_CREDENTIALS_CHANGED',
     });
     expect(f.ssm.send).not.toHaveBeenCalled();
+  });
+
+  describe('protected runtime image policy', () => {
+    const OLD = {
+      uri: `123456789012.dkr.ecr.us-east-1.amazonaws.com/agentcore@sha256:${'a'.repeat(64)}`,
+      digest: `sha256:${'a'.repeat(64)}`,
+    };
+    const pinOld = (f) => {
+      f.state.row.configuration.image = structuredClone(OLD);
+      f.state.row.target.imageDigest = OLD.digest;
+      f.state.row.target.runtimeVersion = '3';
+    };
+    const revoke = (f, digest) => {
+      f.state.revocations = {
+        [`NATIVE_RUNTIME_IMAGE#${digest}`]: {
+          pk: `NATIVE_RUNTIME_IMAGE#${digest}`,
+          sk: 'REVOCATION',
+          schemaVersion: 1,
+          digest,
+          revokedAt: 1_790_000_000_000,
+          revokedBy: 'operator',
+          reasonCode: 'vulnerable_image',
+        },
+      };
+    };
+
+    it('renews a resumable reply with its retained older pin after a deployment', async () => {
+      const f = await continuation();
+      pinOld(f);
+      const result = await f.invoke();
+      expect(result.ok).toBe(true);
+      expect(result.model).toEqual({ provider: 'bedrock', value: MODEL });
+    });
+
+    it('does not follow a pin into another repository', async () => {
+      const f = await continuation();
+      pinOld(f);
+      f.state.row.configuration.image = {
+        uri: `123456789012.dkr.ecr.us-east-1.amazonaws.com/other@${OLD.digest}`,
+        digest: OLD.digest,
+      };
+      expect(await f.invoke()).toMatchObject({
+        ok: false,
+        code: 'NATIVE_EXECUTION_CREDENTIALS_CHANGED',
+      });
+      expect(f.ssm.send).not.toHaveBeenCalled();
+      expect(spies.git).not.toHaveBeenCalled();
+    });
+
+    it.each(['current', 'retained'])('blocks renewal after revoking the %s pin', async (kind) => {
+      const f = await continuation();
+      if (kind === 'retained') pinOld(f);
+      revoke(f, kind === 'retained' ? OLD.digest : IMAGE.digest);
+      expect(await f.invoke()).toEqual({
+        ok: false,
+        code: 'NATIVE_EXECUTION_CREDENTIALS_IMAGE_REVOKED',
+      });
+      expect(f.ssm.send).not.toHaveBeenCalled();
+      expect(spies.git).not.toHaveBeenCalled();
+    });
+
+    it('withholds resolved secrets when a revocation lands during the slow provider path', async () => {
+      const f = await continuation();
+      pinOld(f);
+      f.state.modelHook = (name) => {
+        if (f.ssm.send.mock.calls.length === 1) revoke(f, OLD.digest);
+        return name;
+      };
+      const result = await f.invoke();
+      expect(result).toEqual({ ok: false, code: 'NATIVE_EXECUTION_CREDENTIALS_IMAGE_REVOKED' });
+      expect(JSON.stringify(result)).not.toContain(MODEL);
+      expect(JSON.stringify(result)).not.toContain(GIT);
+    });
+
+    it('fails closed when revocation state is unavailable', async () => {
+      const f = await continuation();
+      f.state.revocationHook = () => {
+        throw new Error('throttled');
+      };
+      expect(await f.invoke()).toEqual({
+        ok: false,
+        code: 'NATIVE_EXECUTION_CREDENTIALS_UNAVAILABLE',
+      });
+      expect(f.ssm.send).not.toHaveBeenCalled();
+    });
   });
 
   it('returns only the pinned model/source credentials and safe scope IDs', async () => {

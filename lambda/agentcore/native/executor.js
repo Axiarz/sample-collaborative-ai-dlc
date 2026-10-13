@@ -8,11 +8,17 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getDriver } from '../cli/drivers.js';
 import { nativeInteractionReceipt } from '../../shared/native-interaction.js';
+import {
+  buildNativePendingInput,
+  NATIVE_PENDING_INPUT_LIMITS,
+} from '../../shared/native-pending-input.js';
 import { NATIVE_RECOVERY_LIMITS } from '../../shared/native-recovery-checkpoint.js';
 import { createNativeTurnOutput } from './turn-output.js';
 import { resolveKiroPromptEvidence } from './kiro-prompt.js';
 import { kiroAssistantHash } from './kiro-acp-turn.js';
 import { runNativeCommand } from './command-runner.js';
+import { recordNativeBoundary } from '../../shared/native-lifecycle.js';
+import { createNativeActivityLog, readNativeActivitySpool, NATIVE_ACTIVITY_CAPABILITY } from './activity.js';
 import {
   captureNativeInitializationBaseline,
   inspectNativeInitialization,
@@ -78,9 +84,113 @@ export const nativeFirstTurnPrompt = ({ harness, request } = {}) => {
     'question or approval that needs a person, present the complete proposal and questions ' +
     'in your normal assistant response, preserve any normal workflow artifacts, leave ' +
     'the native workflow waiting, and end this turn. The platform will show your response and files to ' +
-    'the user. Do not approve a gate, answer on behalf of the user, or continue past that wait.'
+    'the user. Do not approve a gate, answer on behalf of the user, or continue past that wait. ' +
+    NATIVE_PENDING_SPEC_INSTRUCTION +
+    NATIVE_INTAKE_ANSWER_INSTRUCTION
   );
 };
+
+// The pinned engine's intake plan offer is a bare `ask` emitted before any
+// workflow state exists, so `report --user-input` cannot record it. The engine
+// contract (aidlc-orchestrate.ts Branch 8) is to re-run `next` with the choice:
+// `next compose` reaches the composer (Branch 4c), `--scope` creation (9a).
+const NATIVE_INTAKE_ANSWER_INSTRUCTION =
+  ' If the question was the engine\'s plan offer made before any workflow state exists ' +
+  '(no aidlc-state.md yet), then when the user replies, record their choice by re-running ' +
+  'the engine with the chosen plan in front of the original request text, passed unchanged ' +
+  'as one shell-safe argument: `aidlc engine orchestrate next compose <original request>` for ' +
+  'compose, or `aidlc engine orchestrate next --scope <plan> <original request>` for a named ' +
+  'plan. Do not use report for that answer.';
+
+// Task-3 structured questions. The workflow renders each human question from a
+// `question` spec; the platform asks for that same spec so members can select
+// options instead of typing numbers. The file is display data only: options are
+// validated against the visible response, and the member's reply is still the
+// only answer. It lives in a reserved, unpublished project directory.
+export const NATIVE_PENDING_SPEC_PATH = '.native-control/pending-question.json';
+const NATIVE_PENDING_SPEC_INSTRUCTION =
+  'Whenever you end a turn with a structured question or approval for the user, also write ' +
+  `the exact question spec you rendered as JSON to ${NATIVE_PENDING_SPEC_PATH} in the project ` +
+  'directory, replacing any earlier file: {"version":1,"questions":[{"prompt":"...","header":"...",' +
+  '"multiSelect":false,"options":[{"label":"...","description":"..."}]}]}. Use the exact option ' +
+  'labels from the spec, without numbers, letters or "(Recommended)", and keep rendering the ' +
+  'question normally in your response. The user\'s reply will contain the exact selected ' +
+  'label(s); record it with the workflow command that question requires.';
+
+/** Stage held at an engine approval gate ([?]) in this snapshot, or null. */
+export const nativeGateFromSnapshot = (snapshot) => {
+  try {
+    const files = new Map(snapshot.files.map((file) => [file.path, file]));
+    const read = (path) => {
+      const file = files.get(path);
+      if (!file) throw new Error('missing');
+      return new TextDecoder('utf-8', { fatal: true }).decode(file.content);
+    };
+    const space = read('aidlc/active-space').trim();
+    if (!segment(space)) return null;
+    const intent = read(`aidlc/spaces/${space}/intents/active-intent`).trim();
+    if (!segment(intent)) return null;
+    const state = read(`aidlc/spaces/${space}/intents/${intent}/aidlc-state.md`);
+    const stages = [...state.matchAll(/^- \*\*Current Stage\*\*:\s*([a-z][a-z0-9-]*)[ \t]*$/gm)];
+    if (stages.length !== 1) return null;
+    const stage = stages[0][1];
+    const held = state.split(/\r?\n/).filter((line) => line.startsWith(`- [?] ${stage} `) || line === `- [?] ${stage}`);
+    return held.length === 1 ? { stage } : null;
+  } catch {
+    return null;
+  }
+};
+
+// The reserved spec directory must be a real directory inside the project; the
+// file is read without following links, bounded, and removed after each read.
+const pendingSpecDirectory = async (project) => {
+  const dir = join(project, '.native-control');
+  try {
+    const stat = await fs.lstat(dir);
+    if (!stat.isDirectory()) {
+      await fs.rm(dir, { force: true });
+      await fs.mkdir(dir, { mode: 0o700 });
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    await fs.mkdir(dir, { mode: 0o700 });
+  }
+  return dir;
+};
+export const clearNativePendingSpec = async (project) => {
+  const dir = await pendingSpecDirectory(project);
+  await fs.rm(join(dir, 'pending-question.json'), { force: true });
+};
+export const readNativePendingSpec = async (project) => {
+  const dir = join(project, '.native-control');
+  let realDirectory = false;
+  try {
+    realDirectory = (await fs.lstat(dir)).isDirectory();
+  } catch {
+    return null;
+  }
+  // Never read or remove anything through a link out of the project.
+  if (!realDirectory) return null;
+  const file = join(dir, 'pending-question.json');
+  try {
+    const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > NATIVE_PENDING_INPUT_LIMITS.specBytes) return null;
+      return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await handle.readFile()));
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  } finally {
+    // rm removes a file or a link entry itself, never a link target.
+    if ((await fs.lstat(dir).catch(() => null))?.isDirectory())
+      await fs.rm(file, { force: true }).catch(() => {});
+  }
+};
+
+export const NATIVE_CODEX_MAX_THREADS = 4;
 
 /** Native projected hooks/config are used; no platform MCP or probe prompts. */
 export const nativeExecutionInvocation = ({
@@ -107,6 +217,11 @@ export const nativeExecutionInvocation = ({
         'features.default_mode_request_user_input=false',
         '-c',
         'tools.experimental_request_user_input.enabled=false',
+        // Each Codex tool call starts five concurrent aidlc hook processes
+        // (~140-250 MB each); bound concurrent sub-agents so a stage cannot
+        // exhaust the runtime's memory (aidlc-workflows#2066).
+        '-c',
+        `agents.max_threads=${NATIVE_CODEX_MAX_THREADS}`,
         '-c',
         'model_provider="amazon-bedrock"',
         '-c',
@@ -529,7 +644,16 @@ export const createNativeExecutor = ({
     if (replace) await fs.rename(temp, path);
     await syncDirectory(ownerDirectory);
   };
-  const report = () => structuredClone({ ...current.report, recovered: false });
+  const activityLog = () => {
+    current.report.activityProtocol = NATIVE_ACTIVITY_CAPABILITY;
+    return current.activity ??= createNativeActivityLog({ writerGeneration: current.writerGeneration, spoolDirectory: join(ownerDirectory, 'activity') });
+  };
+  const timing = (boundary) => {
+    current.report.timings ??= {};
+    current.report.timings[boundary] = Date.now();
+    recordNativeBoundary(current.identity, boundary, current.report.timings[boundary], {sequence:current.report.sequence,writerGeneration:current.writerGeneration});
+  };
+  const report = () => structuredClone({ ...current.report, recovered: false, capabilities: [NATIVE_ACTIVITY_CAPABILITY] });
   const persist = () => writeJson(join(ownerDirectory, 'status.json'), current.report, true);
   const checkpoint = async (status, extra = {}) => {
     current.report = { ...current.report, ...extra, status, updatedAt: Date.now() };
@@ -558,6 +682,7 @@ export const createNativeExecutor = ({
     // Keep the next spawn in this continuation: adding an await here would
     // reopen a local scheduling gap after the latest cancellation observation.
     checkCancelled();
+    if (model) timing('harnessLaunched');
     const result = await commandRunner(options);
     if (result.cleanupComplete !== true) {
       poisoned = true;
@@ -576,12 +701,17 @@ export const createNativeExecutor = ({
   };
   const execute = async (payload) => {
     current.executing = true;
+    current.report.timings = { accepted: current.report.updatedAt };
+    recordNativeBoundary(current.identity, 'accepted', current.report.updatedAt, {sequence:current.report.sequence,writerGeneration:current.writerGeneration});
+    let activityTurn;
     try {
+      timing('preparationStarted');
       const signal = current.controller.signal;
       const continuing = payload.command === 'native-continue';
       const prepared = continuing
         ? await prepareContinuation({ payload, signal })
         : await prepare({ payload, root, project, home: current.home, signal });
+      timing('preparationCompleted');
       checkCancelled();
       await checkDirectories();
       const pkg = continuing ? current.package : prepared?.package;
@@ -633,6 +763,10 @@ export const createNativeExecutor = ({
         ),
         ...(prepared.forbiddenBytes ?? []),
       ];
+      activityTurn = activityLog().turn({ sequence: current.report.sequence,
+        harness: configuration.harness, forbiddenBytes, signal });
+      activityTurn.lifecycle({ title: 'Preparing native harness' });
+      timing('installationStarted');
       // Kept only in the hot owner for subsequent credential leak checks.
       // Never serialize these values into local status, messages or Git.
       current.forbiddenBytes = [...new Set(forbiddenBytes)];
@@ -712,6 +846,9 @@ export const createNativeExecutor = ({
         if (configuration.harness === 'claude') await configureNativeClaudeSessionEnd(project);
         current.package = structuredClone(pkg);
       }
+      timing('installationCompleted');
+      // A spec from an earlier turn must never describe this turn's question.
+      await clearNativePendingSpec(project);
       const beforeFiles = (await snapshot({ project, signal, forbiddenBytes })).files.map(fileRef);
       const modelEnv = {
         ...auth,
@@ -740,6 +877,7 @@ export const createNativeExecutor = ({
         forbiddenBytes,
       });
       await checkpoint('running', { packageId: pkg.packageId });
+      activityTurn.lifecycle({ title: 'Agent started' });
       const result = await run(
         {
           ...nativeExecutionInvocation({
@@ -751,14 +889,25 @@ export const createNativeExecutor = ({
             promptEvidence: current.promptEvidence,
             priorAssistantSha256: current.priorAssistantSha256,
           }),
-          onStdoutChunk: output.write,
+          onStdoutChunk: (chunk) => {
+            if (!current.report.timings.firstOutput) timing('firstOutput');
+            output.write(chunk);
+            return activityTurn.write(chunk);
+          },
         },
         modelEnv,
         true,
       );
+      timing('harnessCompleted');
       const completed = output.finish();
       await checkDirectories();
+      const renderedSpec = await readNativePendingSpec(project);
       const files = await snapshot({ project, signal, forbiddenBytes });
+      const pendingInput = buildNativePendingInput({
+        gate: nativeGateFromSnapshot(files),
+        spec: renderedSpec,
+        messagesText: completed.messages.map((message) => message.text).join('\n'),
+      });
       const nativeSessionId = completed.nativeSessionId;
       let outcome = classifyNativeFirstWait({
         snapshot: files,
@@ -775,6 +924,7 @@ export const createNativeExecutor = ({
       const publicationOutcome =
         outcome.kind === 'waiting_for_input' ? 'WAITING_FOR_INPUT' : 'STOPPED';
       const questionPath = outcome.evidence?.questions[0]?.path ?? null;
+      timing('publicationStarted');
       const uploaded = await publish({
         identity: current.identity,
         sequence: current.report.sequence,
@@ -790,6 +940,7 @@ export const createNativeExecutor = ({
         signal,
       });
       checkCancelled();
+      timing('publicationCompleted');
       const publication = uploaded?.receipt;
       if (
         uploaded?.uploaded !== true ||
@@ -837,6 +988,7 @@ export const createNativeExecutor = ({
           nativeSessionId,
           publicationId: receipt.id,
           messages: completed.messages,
+          pendingInput,
           signal,
         }),
         current.identity,
@@ -869,6 +1021,7 @@ export const createNativeExecutor = ({
         });
         await checkDirectories();
         checkCancelled();
+        timing('checkpointUploadStarted');
         recoveryCheckpoint = await publishRecovery({
           identity: current.identity,
           writerGeneration: current.writerGeneration,
@@ -893,6 +1046,7 @@ export const createNativeExecutor = ({
           recoveryCheckpoint.manifest?.sha256 !== recoveryCheckpoint.id
         )
           fail('native_execution_recovery_unconfirmed');
+        timing('checkpointUploadCompleted');
       }
       await checkpoint('publication_ready', {
         outcome: publicationOutcome,
@@ -934,6 +1088,7 @@ export const createNativeExecutor = ({
         }
       }
     } finally {
+      activityTurn?.close({ failed: !['publication_ready', 'recovery_ready'].includes(current.report.status) });
       current.executing = false;
     }
   };
@@ -1020,6 +1175,7 @@ export const createNativeExecutor = ({
           ...identity,
           writerGeneration,
           status: 'publication_ready',
+          ...(saved.activityProtocol === NATIVE_ACTIVITY_CAPABILITY ? { capabilities: [NATIVE_ACTIVITY_CAPABILITY] } : {}),
           nativeSessionId: saved.nativeSessionId,
           outcome: saved.outcome,
           receipt: saved.receipt,
@@ -1378,7 +1534,9 @@ export const createNativeExecutor = ({
         current.executing = true;
         try {
           const signal = controller.signal;
+          timing('checkpointDownloadStarted');
           const loaded = await loadRecovery({ payload: input, signal });
+          timing('checkpointDownloadCompleted');
           checkCancelled();
           const { manifest, files } = loaded ?? {};
           if (
@@ -1422,6 +1580,7 @@ export const createNativeExecutor = ({
             current.home,
             join(bindingHome, `${identity.attemptId}-before-writer-${writerGeneration}`),
           );
+          timing('filesystemRestoreStarted');
           const restored = await restoreRecovery({
             project,
             home: current.home,
@@ -1432,6 +1591,7 @@ export const createNativeExecutor = ({
             signal,
             limits: RECOVERY_CAPTURE_LIMITS,
           });
+          timing('filesystemRestoreCompleted');
           if (
             restored?.restored !== true ||
             restored.nativeSessionId !== manifest.nativeSessionId ||
@@ -1460,21 +1620,42 @@ export const createNativeExecutor = ({
           current.package = structuredClone(pkg);
           // Reinstall the machine projection from verified pinned package
           // bytes. The restored project/session data is not reinitialized.
+          const machineEnv = {
+            HOME: current.home,
+            TMPDIR: '/tmp',
+            PATH: HOST_PATH,
+            LANG: 'C.UTF-8',
+            AIDLC_INSTALL_ROOT: join(root, 'machine/data'),
+            AIDLC_BIN_DIR: join(root, 'machine/bin'),
+            AIDLC_PROJECT_DIR: project,
+            AIDLC_OFFLINE: '1',
+          };
           await run(
             {
               command: pkg.binaryPath,
               args: ['use', pkg.version, '--from', pkg.directory, '--offline', '--json'],
             },
+            machineEnv,
+          );
+          // The project pin is only honored when the machine pin registry
+          // (machine/data/pins.json, rebuilt above) lists this project. Re-pin
+          // the restored project; it rewrites only its own identical pin files.
+          await run(
             {
-              HOME: current.home,
-              TMPDIR: '/tmp',
-              PATH: HOST_PATH,
-              LANG: 'C.UTF-8',
-              AIDLC_INSTALL_ROOT: join(root, 'machine/data'),
-              AIDLC_BIN_DIR: join(root, 'machine/bin'),
-              AIDLC_PROJECT_DIR: project,
-              AIDLC_OFFLINE: '1',
+              command: join(root, 'machine/bin/aidlc'),
+              args: [
+                'config',
+                '--pin',
+                pkg.version,
+                '--project-dir',
+                project,
+                '--from',
+                pkg.directory,
+                '--offline',
+                '--json',
+              ],
             },
+            machineEnv,
           );
           await admission();
           await checkDirectories();
@@ -1573,7 +1754,22 @@ export const createNativeExecutor = ({
     // execute owns persistence, serialized after child cleanup; do not race it.
     return report();
   };
+  const activity = async (value) => {
+    const identity = validateIdentity(value);
+    const writerGeneration = generationOf(value);
+    if (!Number.isSafeInteger(value.after) || value.after < 0) fail('native_execution_request_invalid');
+    if (current) {
+      if (!sameIdentity(current.identity, identity) || current.writerGeneration !== writerGeneration)
+        fail('native_execution_owner_conflict');
+      return { ...identity, ...activityLog().pull(value.after) };
+    }
+    await readExisting(identity, writerGeneration);
+    const saved = readNativeActivitySpool({ spoolDirectory: join(directoryForGeneration(writerGeneration), 'activity'), writerGeneration, after: value.after });
+    if (!saved) fail('native_execution_local_record_unavailable');
+    return { ...identity, ...saved };
+  };
   return {
+    activity,
     start,
     continue: continueTurn,
     recover,

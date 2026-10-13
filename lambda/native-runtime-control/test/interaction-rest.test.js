@@ -65,6 +65,8 @@ describe('native assistant interaction REST boundary', () => {
         ACTOR,
         input(),
         expect.any(Function),
+        // The accepting membership snapshot is frozen with the answer.
+        { membershipId: MEMBERSHIP.membershipId, projectIdentity: MEMBERSHIP.projectIdentity },
       );
     },
   );

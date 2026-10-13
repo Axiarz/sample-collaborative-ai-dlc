@@ -6,23 +6,45 @@ import { useAutoSave } from './useAutoSave';
 import { generateColor } from '../utils/colors';
 import { seedYjsDocumentIfEmpty } from '../lib/yjsSeed';
 import type { RealtimeScopeTarget } from '../lib/realtimeToken';
+import { nativeAnswerDocument } from '../lib/nativeCollaboration';
 import type { StructuredAnswer, QuestionAnswer } from '../services/questions';
 
 // The collaboration scope a structured answer is keyed under. v1 sprints use
 // `{ kind: 'sprint', id }`; v2 intents use `{ kind: 'intent', id, projectId }`
 // (the realtime-token endpoint for an intent is project-scoped). The scope
 // decides both the Yjs doc-name prefix and the token target.
+// Native (task-3): the answer draft for exactly one awaited interaction/turn,
+// authorized by a revision-specific scope minted by the protected token route.
 export type CollabScope =
   | { kind: 'sprint'; id: string }
-  | { kind: 'intent'; id: string; projectId: string };
+  | { kind: 'intent'; id: string; projectId: string }
+  | {
+      kind: 'native';
+      id: string;
+      projectId: string;
+      digest: string;
+      interactionId: string;
+      sequence: number;
+    };
 
 const docPrefixFor = (scope: CollabScope, questionId: string): string =>
-  scope.kind === 'intent' ? `intent-sq-${scope.id}-${questionId}` : `sq-${scope.id}-${questionId}`;
+  scope.kind === 'native'
+    ? nativeAnswerDocument(scope.digest, { interactionId: scope.interactionId, sequence: scope.sequence })
+    : scope.kind === 'intent'
+      ? `intent-sq-${scope.id}-${questionId}`
+      : `sq-${scope.id}-${questionId}`;
 
 const scopeTargetFor = (scope: CollabScope): RealtimeScopeTarget =>
-  scope.kind === 'intent'
-    ? { intentId: scope.id, projectId: scope.projectId }
-    : { sprintId: scope.id };
+  scope.kind === 'native'
+    ? {
+        intentId: scope.id,
+        projectId: scope.projectId,
+        executionBackend: 'native',
+        document: { kind: 'answer', interactionId: scope.interactionId, sequence: scope.sequence },
+      }
+    : scope.kind === 'intent'
+      ? { intentId: scope.id, projectId: scope.projectId }
+      : { sprintId: scope.id };
 
 /**
  * Collaborative hook for structured question answering.

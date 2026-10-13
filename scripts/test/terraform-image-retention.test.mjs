@@ -8,7 +8,7 @@ import test from 'node:test';
 
 const inspector = fileURLToPath(new URL('../inspect-terraform-plan.mjs', import.meta.url));
 
-function inspect({ actions, before, after, address }) {
+function inspect({ actions, before, after, address, type = 'docker_registry_image' }) {
   const directory = mkdtempSync(join(tmpdir(), 'aidlc-image-retention-'));
   try {
     const plan = join(directory, 'plan.json');
@@ -19,7 +19,7 @@ function inspect({ actions, before, after, address }) {
           {
             address:
               address ?? 'module.agentcore.module.agentcore_image_build.docker_registry_image.this',
-            type: 'docker_registry_image',
+            type,
             change: { actions, before, after },
           },
         ],
@@ -86,4 +86,29 @@ test('allows the first retained build and an in-place retention update', () => {
     });
     assert.equal(result.status, 0, result.stderr);
   }
+});
+
+test('rejects destroying the runtime image repository that retained pins reference', () => {
+  for (const actions of [['delete'], ['delete', 'create'], ['create', 'delete']]) {
+    const result = inspect({
+      actions,
+      before: { name: 'collaborative-ai-dlc-agentcore-dev', force_delete: true },
+      after: actions.length > 1 ? { name: 'collaborative-ai-dlc-agentcore-dev' } : null,
+      address: 'module.agentcore.aws_ecr_repository.agentcore',
+      type: 'aws_ecr_repository',
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /aws_ecr_repository/);
+  }
+});
+
+test('allows an in-place update of the runtime image repository', () => {
+  const result = inspect({
+    actions: ['update'],
+    before: { name: 'collaborative-ai-dlc-agentcore-dev' },
+    after: { name: 'collaborative-ai-dlc-agentcore-dev' },
+    address: 'module.agentcore.aws_ecr_repository.agentcore',
+    type: 'aws_ecr_repository',
+  });
+  assert.equal(result.status, 0, result.stderr);
 });

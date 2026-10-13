@@ -157,7 +157,7 @@ describe('native-only HTTP on real loopback sockets', () => {
       import { registerHooks } from 'node:module';
       registerHooks({ resolve(specifier, context, next) {
         if (!specifier.startsWith('node:') &&
-          !['/runtime-server.js', '/workspace-check.js', '/efs-workspace.js'].some(name => specifier.endsWith(name)))
+          !['/runtime-server.js', '/workspace-check.js', '/efs-workspace.js', '/resource-telemetry.js', '/flight-recorder.js'].some(name => specifier.endsWith(name)))
           throw new Error('execution import attempted');
         return next(specifier, context);
       }});

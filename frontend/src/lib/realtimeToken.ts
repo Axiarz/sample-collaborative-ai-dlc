@@ -22,7 +22,21 @@ export type RealtimeScopeTarget =
   | { sprintId: string }
   | { projectId: string }
   // The intent token endpoint is project-scoped, so the target carries both ids.
-  | { intentId: string; projectId: string };
+  | {
+      intentId: string;
+      projectId: string;
+      executionBackend?: 'platform' | 'native';
+      // A native reply draft is revision-specific: its scope is minted only
+      // while that exact interaction/turn is awaiting a reply.
+      document?: NativeReplyDocumentTarget;
+    };
+
+export interface NativeReplyDocumentTarget {
+  // reply: free-text draft; answer: structured QuestionEditor draft (task-3).
+  kind: 'reply' | 'answer';
+  interactionId: string;
+  sequence: number;
+}
 
 // Refresh this many ms before the token actually expires so an in-flight
 // connect never presents an almost-dead token.
@@ -72,6 +86,8 @@ export function scopeTargetForYjsDoc(docName: string): RealtimeScopeTarget | nul
  * explicit `{ intentId, projectId }` target rather than relying on this.
  */
 export function scopeTargetForChannel(documentId: string): RealtimeScopeTarget | null {
+  const native = /^native-intent:([A-Za-z0-9][A-Za-z0-9_.-]{0,255}):([A-Za-z0-9][A-Za-z0-9_.-]{0,255})$/.exec(documentId);
+  if (native) return { projectId: native[1], intentId: native[2], executionBackend: 'native' };
   const sprint = SPRINT_CHANNEL_RE.exec(documentId);
   if (sprint) return { sprintId: sprint[1] };
   if (UUID_RE.test(documentId)) return { projectId: documentId };
@@ -89,7 +105,12 @@ const inflight = new Map<string, Promise<RealtimeToken>>();
 
 const cacheKey = (target: RealtimeScopeTarget): string => {
   if ('sprintId' in target) return `sprint:${target.sprintId}`;
-  if ('intentId' in target) return `intent:${target.intentId}`;
+  if ('intentId' in target) {
+    const base = `${target.executionBackend ?? 'platform'}:intent:${target.projectId}:${target.intentId}`;
+    return target.document
+      ? `${base}:${target.document.kind}:${target.document.interactionId}:${target.document.sequence}`
+      : base;
+  }
   return `project:${target.projectId}`;
 };
 
@@ -98,6 +119,13 @@ const tokenPath = (target: RealtimeScopeTarget): string => {
   if ('intentId' in target)
     return `/projects/${target.projectId}/intents/${target.intentId}/realtime-token`;
   return `/projects/${target.projectId}/realtime-token`;
+};
+
+const tokenBody = (target: RealtimeScopeTarget): Record<string, unknown> => {
+  if (!('intentId' in target) || target.executionBackend !== 'native') return {};
+  if (!target.document) return { executionBackend: 'native' };
+  const { kind, interactionId, sequence } = target.document;
+  return { executionBackend: 'native', document: { kind, interactionId, sequence } };
 };
 
 const isUsable = (token: RealtimeToken): boolean =>
@@ -116,7 +144,7 @@ export async function getRealtimeToken(target: RealtimeScopeTarget): Promise<Rea
   if (pending) return pending;
 
   const request = api
-    .post<RealtimeToken>(tokenPath(target), {})
+    .post<RealtimeToken>(tokenPath(target), tokenBody(target))
     .then((token) => {
       cache.set(key, token);
       return token;

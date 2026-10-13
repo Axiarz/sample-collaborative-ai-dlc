@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { canonicalJson } from './workflow-checkpoint.js';
 import { nativePublicationScope } from './native-publication.js';
+import { nativePendingInput } from './native-pending-input.js';
 
 const SHA = /^[a-f0-9]{64}$/;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
@@ -104,22 +105,30 @@ export const nativeInteractionReceipt = (value, identity) => {
   return structuredClone(value);
 };
 
+const BODY_FIELDS = [
+  'schemaVersion',
+  'scope',
+  'sequence',
+  'kind',
+  'harness',
+  'nativeSessionId',
+  'packageId',
+  'publicationId',
+  'createdAt',
+  'messages',
+  'contentSha256',
+];
+// v1: messages only. v2 (task-3): plus a structured pendingInput, and the
+// content hash covers both, so a reply bound to contentSha256 is bound to the
+// exact options the member was shown.
+export const nativeInteractionContentSha256 = (messages, pendingInput = undefined) =>
+  hash(canonicalJson(pendingInput === undefined ? messages : { messages, pendingInput }));
+
 const validate = (value, identity) => {
+  const v2 = object(value) && value.schemaVersion === 2;
   if (
-    !exact(value, [
-      'schemaVersion',
-      'scope',
-      'sequence',
-      'kind',
-      'harness',
-      'nativeSessionId',
-      'packageId',
-      'publicationId',
-      'createdAt',
-      'messages',
-      'contentSha256',
-    ]) ||
-    value.schemaVersion !== 1 ||
+    !exact(value, v2 ? [...BODY_FIELDS, 'pendingInput'] : BODY_FIELDS) ||
+    ![1, 2].includes(value.schemaVersion) ||
     canonicalJson(value.scope) !== canonicalJson(scopeOf(identity).scope) ||
     !sequence(value.sequence) ||
     value.kind !== 'assistant_turn' ||
@@ -132,7 +141,15 @@ const validate = (value, identity) => {
   )
     fail();
   const messages = nativeInteractionMessages(value.messages);
-  if (value.contentSha256 !== hash(canonicalJson(messages))) fail();
+  let pendingInput;
+  if (v2) {
+    try {
+      pendingInput = nativePendingInput(value.pendingInput);
+    } catch {
+      fail();
+    }
+  }
+  if (value.contentSha256 !== nativeInteractionContentSha256(messages, pendingInput)) fail();
   return structuredClone(value);
 };
 
@@ -159,12 +176,22 @@ export const createNativeInteractions = ({
       nativeSessionId,
       publicationId,
       messages,
+      pendingInput = null,
     }) {
       const { scope, prefix } = scopeOf(identity);
       const normalized = nativeInteractionMessages(messages);
+      // Free-text turns keep the exact v1 body; v2 only when structured input exists.
+      let input;
+      if (pendingInput !== null) {
+        try {
+          input = nativePendingInput(pendingInput);
+        } catch {
+          fail();
+        }
+      }
       const body = validate(
         {
-          schemaVersion: 1,
+          schemaVersion: input ? 2 : 1,
           scope,
           sequence: turnSequence,
           kind: 'assistant_turn',
@@ -174,7 +201,8 @@ export const createNativeInteractions = ({
           publicationId,
           createdAt: now(),
           messages: normalized,
-          contentSha256: hash(canonicalJson(normalized)),
+          contentSha256: nativeInteractionContentSha256(normalized, input),
+          ...(input ? { pendingInput: input } : {}),
         },
         identity,
       );
@@ -264,6 +292,7 @@ export const nativeInteractionView = (receipt, body) => ({
   harness: body.harness,
   publicationId: body.publicationId,
   messages: structuredClone(body.messages),
+  pendingInput: body.schemaVersion === 2 ? structuredClone(body.pendingInput) : null,
   contentSha256: body.contentSha256,
   createdAt: body.createdAt,
 });

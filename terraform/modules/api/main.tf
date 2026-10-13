@@ -47,6 +47,8 @@ resource "aws_api_gateway_deployment" "main" {
     aws_api_gateway_integration.source_control,
     aws_api_gateway_integration.workflow_sources,
     aws_api_gateway_integration.native_intents,
+    aws_api_gateway_integration.native_discussion,
+    module.cors_native_discussion,
     module.cors_native_intents,
     module.cors_native_intent,
     module.cors_native_intent_prepare,
@@ -348,6 +350,26 @@ resource "aws_api_gateway_deployment" "main" {
           aws_api_gateway_resource.native_intent_prepare[*].path_part
         )
         cors = filesha256("${path.module}/cors/main.tf")
+      },
+      # Task-2 native discussion routes (discussions Lambda).
+      {
+        methods = {
+          for key, method in aws_api_gateway_method.native_discussion : key => {
+            resource_id   = method.resource_id
+            http_method   = method.http_method
+            authorization = method.authorization
+            authorizer_id = method.authorizer_id
+          }
+        }
+        integrations = {
+          for key, integration in aws_api_gateway_integration.native_discussion : key => {
+            resource_id = integration.resource_id
+            http_method = integration.http_method
+            type        = integration.type
+            uri         = integration.uri
+          }
+        }
+        resources = local.native_discussion_cors_resources
       },
       aws_api_gateway_resource.workflow_source.id,
       aws_api_gateway_resource.workflow_source_packages.id,

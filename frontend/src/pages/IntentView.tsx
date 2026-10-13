@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { NativeWorkspaceView } from './NativeIntentPage';
 import { Navigate, useNavigate, useParams } from 'react-router';
 import {
   intentsService,
@@ -93,6 +94,11 @@ const errorMessage = (value: string) => {
 };
 
 export default function IntentView() {
+  const context = useIntent();
+  return context.executionBackend === 'native' && context.nativeWorkspace
+    ? <NativeWorkspaceView adapter={context.nativeWorkspace} /> : <PlatformIntentView />;
+}
+function PlatformIntentView() {
   const {
     projectId,
     intentId,

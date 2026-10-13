@@ -38,7 +38,7 @@ const NON_WORK_SUFFIXES = ['/graph', '/audit', '/compose', '/observability'];
 
 /** True when the given pathname represents a "work" route where the panel opens. */
 export function shouldDefaultOpen(pathname: string): boolean {
-  if (isNativeIntentRoute(pathname)) return false;
+  if (isNativeIntentRoute(pathname)) return !pathname.endsWith('/new');
   // Sprint routes are always work routes.
   if (/\/sprint\//.test(pathname)) return true;
   // Intent creation is a focused form, not an active intent workspace.
@@ -82,15 +82,15 @@ export function AppShell() {
   const inSprint = !!sprintId;
   // v2 intent pages get their own 3-tab activity panel (IntentActivityPanel),
   // mounted in the same slots as the sprint one and backed by IntentProvider.
-  const inIntent = !!intentId && !inNative;
+  const inIntent = !!intentId;
   const onProjectPage = !!projectId && !inSprint && !inIntent && !inNative;
   // Graph pages render a full-bleed canvas with their own toolbar: the shell's
   // content padding would float that toolbar mid-pane, so drop it there.
   const onGraphPage = !inNative && location.pathname.endsWith('/graph');
 
   useEffect(() => {
-    if (inIntent && intentId) setLastIntentSection(intentId, detectSection(location.pathname));
-  }, [inIntent, intentId, location.pathname]);
+    if (inIntent && !inNative && intentId) setLastIntentSection(intentId, detectSection(location.pathname));
+  }, [inIntent, inNative, intentId, location.pathname]);
 
   // Breakpoint (Tailwind lg): below it BOTH side panels render as NON-modal
   // overlays above the content instead of grid columns, so they stay usable
@@ -132,15 +132,15 @@ export function AppShell() {
   }, [location.pathname]);
 
   const showSidebar = !sidebarCollapsed;
-  const showActivity = !inNative && (inSprint || inIntent || onProjectPage) && activityPanelOpen;
+  const showActivity = (inSprint || inIntent || onProjectPage) && activityPanelOpen;
 
   const toggleSidebar = useCallback(() => setSidebarCollapsed((prev) => !prev), []);
   const toggleActivity = useCallback(() => {
-    if (!inNative) setActivityPanelOpen((prev) => !prev);
+    setActivityPanelOpen((prev) => !prev);
   }, [inNative]);
   // Opening a discussion pops the activity panel (the thread renders there).
   const showActivityPanel = useCallback(() => {
-    if (!inNative) setActivityPanelOpen(true);
+    setActivityPanelOpen(true);
   }, [inNative]);
 
   // Grid columns only contain panels that render INLINE at the current
@@ -155,8 +155,8 @@ export function AppShell() {
 
   return (
     <TooltipProvider delayDuration={200}>
-      {/* Native IDs must never reach the platform intent/discussion providers.
-          Platform pages and their activity panels continue to share providers. */}
+      {/* Native IDs must never reach the platform intent/discussion providers;
+          native routes mount their own native-scoped providers. */}
       <PlatformProviders native={inNative} onOpenActivity={showActivityPanel}>
         <div className="flex h-screen flex-col bg-background">
           {/* Header */}
@@ -165,7 +165,7 @@ export function AppShell() {
             onToggleActivity={toggleActivity}
             onOpenCommand={() => setCommandOpen(true)}
             sidebarCollapsed={sidebarCollapsed}
-            activityPanelOpen={!inNative && activityPanelOpen}
+            activityPanelOpen={activityPanelOpen}
           />
 
           {/* Main content area (relative: hosts the small-screen overlays,
@@ -277,7 +277,16 @@ function PlatformProviders({
   children: ReactNode;
   onOpenActivity: () => void;
 }) {
-  if (native) return <>{children}</>;
+  // Native routes get the native discussion scope (protected native ownership,
+  // native API paths and channel); never the platform intent scope.
+  if (native)
+    return (
+      <DiscussionProvider backend="native" onDiscussionOpen={onOpenActivity}>
+        <IntentProvider backend="native" onAgentFocus={onOpenActivity}>
+          {children}
+        </IntentProvider>
+      </DiscussionProvider>
+    );
   return (
     <DiscussionProvider onDiscussionOpen={onOpenActivity}>
       <IntentProvider onAgentFocus={onOpenActivity}>{children}</IntentProvider>

@@ -56,6 +56,7 @@ const FAILURE_CODES = [
   'native_execution_source_changed',
   'native_execution_runtime_mismatch',
   'native_execution_publication_invalid',
+  'native_execution_image_revoked',
 ];
 const MESSAGES = {
   INVALID: 'Invalid native execution record or request',
@@ -399,7 +400,13 @@ const responseText = (value) =>
   }) &&
   value.isWellFormed();
 export const nativeReplyRequest = (value) => {
-  shape(value, ['requestId', 'interactionId', 'contentSha256', 'text']);
+  shape(value, [
+    'requestId',
+    'interactionId',
+    'contentSha256',
+    'text',
+    ...(Object.hasOwn(value ?? {}, 'selection') ? ['selection'] : []),
+  ]);
   check(
     matches(value.requestId, UUID) &&
       matches(value.interactionId, SHA256) &&
@@ -430,6 +437,20 @@ const responseValue = (value) => {
       matches(value.textSha256, SHA256) &&
       timeValue(value.acceptedAt) &&
       ['pending', 'delivered'].includes(value.deliveryStatus),
+  );
+  return clone(value);
+};
+const responseMember = (value) => {
+  shape(value, ['membershipId', 'projectIdentity']);
+  check(
+    [value.membershipId, value.projectIdentity].every(
+      (part) =>
+        typeof part === 'string' &&
+        part.length > 0 &&
+        Buffer.byteLength(part) <= 512 &&
+        part.trim() === part &&
+        ![...part].some((c) => c.codePointAt(0) < 32 || c === '\x7f'),
+    ),
   );
   return clone(value);
 };
@@ -889,6 +910,9 @@ export const createNativeExecutionStore = ({
     }
   };
   const acceptedResponse = (value, row) => {
+    // Task-2 ledgers also freeze the accepting membership snapshot and the
+    // publication presented. Earlier accepted ledgers remain valid without them.
+    const attributed = Object.hasOwn(value ?? {}, 'member');
     shape(value, [
       'pk',
       'sk',
@@ -900,7 +924,13 @@ export const createNativeExecutionStore = ({
       'runtimeSessionId',
       ...RESPONSE_FIELDS,
       'text',
+      ...(attributed ? ['member', 'publicationId'] : []),
+      ...(Object.hasOwn(value ?? {}, 'selection') ? ['selection'] : []),
     ]);
+    if (attributed) {
+      responseMember(value.member);
+      check(matches(value.publicationId, SHA256));
+    }
     const fields = Object.fromEntries(RESPONSE_FIELDS.map((key) => [key, value[key]]));
     responseValue({ ...fields, deliveryStatus: 'pending' });
     check(
@@ -1109,7 +1139,16 @@ export const createNativeExecutionStore = ({
       return commit(row, unlease({ ...row }));
     },
     async respond(input) {
-      shape(input, ['projectId', 'executionId', 'bindingId', 'actorId', 'request']);
+      const attributed = Object.hasOwn(input ?? {}, 'member');
+      shape(input, [
+        'projectId',
+        'executionId',
+        'bindingId',
+        'actorId',
+        'request',
+        ...(attributed ? ['member'] : []),
+      ]);
+      const member = attributed ? responseMember(input.member) : null;
       const currentScope = identity({
         projectId: input.projectId,
         executionId: input.executionId,
@@ -1131,7 +1170,8 @@ export const createNativeExecutionStore = ({
             existing.actorId !== input.actorId ||
             existing.requestId !== request.requestId ||
             existing.contentSha256 !== request.contentSha256 ||
-            existing.text !== request.text
+            existing.text !== request.text ||
+            canonicalJson(existing.selection ?? null) !== canonicalJson(request.selection ?? null)
           )
             fail('CONFLICT');
           const latest = await get(currentScope);
@@ -1169,6 +1209,12 @@ export const createNativeExecutionStore = ({
           text: request.text,
           textSha256: sha(request.text),
           acceptedAt: clock(),
+          // The exact accepting member and presented publication, frozen with
+          // the answer. Authority is checked by the API before this commit.
+          ...(member ? { member, publicationId: row.interaction.publicationId } : {}),
+          // The structured selection the member submitted (validated by the API
+          // against the committed interaction); text remains the delivered reply.
+          ...(request.selection ? { selection: request.selection } : {}),
         };
         // Scope is nested in protected records, as it is on the execution row.
         delete response.projectId;

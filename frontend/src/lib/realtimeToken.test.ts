@@ -57,6 +57,28 @@ describe('getRealtimeToken builds the right token path per scope', () => {
     invalidateRealtimeToken({ intentId: UUID, projectId: PID });
   });
 
+  it('isolates native token cache and in-flight requests across projects and platform targets', async () => {
+    const native = { intentId: UUID, projectId: PID, executionBackend: 'native' as const };
+    const other = { ...native, projectId: UUID };
+    const platform = { intentId: UUID, projectId: PID };
+    const channel = `native-intent:${PID}:${UUID}`;
+    expect(scopeTargetForChannel(channel)).toEqual(native);
+    let release!: (value: { token: string; exp: number; scopes: string[] }) => void;
+    post.mockReturnValueOnce(new Promise(resolve => { release = resolve; }))
+      .mockResolvedValueOnce({ token: 'other', exp: Date.now() / 1000 + 600, scopes: [] })
+      .mockResolvedValueOnce({ token: 'platform', exp: Date.now() / 1000 + 600, scopes: [] });
+    const first = getRealtimeToken(native);
+    expect((await getRealtimeToken(other)).token).toBe('other');
+    expect((await getRealtimeToken(platform)).token).toBe('platform');
+    release({ token: 'native', exp: Date.now() / 1000 + 600, scopes: [channel] });
+    expect((await first).token).toBe('native');
+    expect((await getRealtimeToken(native)).token).toBe('native');
+    expect(post).toHaveBeenCalledTimes(3);
+    expect(post).toHaveBeenCalledWith(`/projects/${PID}/intents/${UUID}/realtime-token`, { executionBackend: 'native' });
+    expect(post).toHaveBeenCalledWith(`/projects/${UUID}/intents/${UUID}/realtime-token`, { executionBackend: 'native' });
+    [native, other, platform].forEach(invalidateRealtimeToken);
+  });
+
   it('sprint + project scopes use their own paths', async () => {
     await getRealtimeToken({ sprintId: UUID });
     expect(post).toHaveBeenCalledWith(`/sprints/${UUID}/realtime-token`, {});
@@ -71,5 +93,28 @@ describe('msUntilRefresh', () => {
   it('never returns negative', () => {
     expect(msUntilRefresh(0)).toBe(0);
     expect(msUntilRefresh(Math.floor(Date.now() / 1000) + 600)).toBeGreaterThan(0);
+  });
+});
+
+describe('revision-specific native reply draft tokens', () => {
+  beforeEach(() => {
+    post.mockReset();
+    post.mockResolvedValue({ token: 't', exp: Math.floor(Date.now() / 1000) + 600, scopes: [] });
+  });
+  it('requests exactly the interaction/turn and never shares a cache entry across revisions', async () => {
+    const base = { intentId: UUID, projectId: PID, executionBackend: 'native' as const };
+    const turn2 = { ...base, document: { kind: 'reply' as const, interactionId: 'a'.repeat(64), sequence: 2 } };
+    const turn3 = { ...base, document: { kind: 'reply' as const, interactionId: 'b'.repeat(64), sequence: 3 } };
+    await getRealtimeToken(turn2);
+    await getRealtimeToken(turn3);
+    await getRealtimeToken(base);
+    await getRealtimeToken(turn2);
+    expect(post).toHaveBeenCalledTimes(3);
+    expect(post).toHaveBeenNthCalledWith(1, `/projects/${PID}/intents/${UUID}/realtime-token`, {
+      executionBackend: 'native',
+      document: { kind: 'reply', interactionId: 'a'.repeat(64), sequence: 2 },
+    });
+    expect(post).toHaveBeenNthCalledWith(3, `/projects/${PID}/intents/${UUID}/realtime-token`, { executionBackend: 'native' });
+    [turn2, turn3, base].forEach(invalidateRealtimeToken);
   });
 });

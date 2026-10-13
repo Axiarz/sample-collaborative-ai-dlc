@@ -17,6 +17,9 @@ import { createNativeExecutionConfiguration } from './execution-config.js';
 import { createNativeExecutionApi } from './execution-api.js';
 import { createNativePublications } from '../shared/native-publication.js';
 import { createNativeInteractions } from '../shared/native-interaction.js';
+import { createNativeRuntimeImagePolicy } from './runtime-images.js';
+import { nativeExecutionDeployment } from './execution-config.js';
+import { createNativeActivityStore } from './activity-store.js';
 
 const defaultDdb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const defaultSqs = new SQSClient({});
@@ -110,6 +113,13 @@ export const createNativeRuntimeLambda =
           bucket: env.NATIVE_EXECUTION_PUBLICATION_BUCKET,
           accountId: env.NATIVE_RUNTIME_ACCOUNT_ID,
         }),
+        activity: createNativeActivityStore({ ddb, tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE }),
+        images: createNativeRuntimeImagePolicy({
+          ddb,
+          tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE,
+          env,
+        }),
+        deployment: () => nativeExecutionDeployment(env),
         authorizeSource: (draft, actorId) =>
           sources().getAuthorizedBinding({
             projectId: draft.projectId,
@@ -132,6 +142,7 @@ export const createNativeRuntimeLambda =
     const execution = env.NATIVE_EXECUTION_PUBLICATION_BUCKET
       ? {
           enabled: env.NATIVE_EXECUTION_ENABLED === 'true',
+          outputs: (...args) => executions().outputs(...args),
           status: (...args) => executions().status(...args),
           start: (...args) => executions().start(...args),
           cancel: (...args) => executions().cancel(...args),

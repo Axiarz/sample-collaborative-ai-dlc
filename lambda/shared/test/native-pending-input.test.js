@@ -1,0 +1,148 @@
+import { describe, expect, it } from 'vitest';
+import {
+  buildNativePendingInput,
+  nativeAnswerText,
+  nativePendingInput,
+  nativeSelection,
+} from '../native-pending-input.js';
+
+const planChoiceText = [
+  '**Plan Choice** — No ready-made plan clearly fits. How should I proceed?',
+  '1. **Compose** — Tailor a plan to this task (recommended)',
+  '2. **Express** — 9 of 33 stages',
+  '3. **Other** — Name another scope',
+].join('\n');
+const planSpec = {
+  version: 1,
+  questions: [
+    {
+      prompt: 'No ready-made plan clearly fits. How should I proceed?',
+      header: 'Plan Choice',
+      multiSelect: false,
+      options: [
+        { label: 'Compose (Recommended)', description: 'Tailor a plan to this task' },
+        { label: 'Express', description: '9 of 33 stages' },
+      ],
+    },
+  ],
+};
+
+describe('native pending input capture', () => {
+  it('captures the rendered question spec when every label was shown', () => {
+    const input = buildNativePendingInput({ spec: planSpec, messagesText: planChoiceText });
+    expect(input).toEqual({
+      schemaVersion: 1,
+      kind: 'choice',
+      source: 'rendered-question',
+      stage: null,
+      questions: [
+        {
+          id: 'q1',
+          prompt: 'No ready-made plan clearly fits. How should I proceed?',
+          header: 'Plan Choice',
+          multiSelect: false,
+          options: [
+            { label: 'Compose', description: 'Tailor a plan to this task' },
+            { label: 'Express', description: '9 of 33 stages' },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("captures AI-DLC 2.11.0's twelve-option plan offer and bounds the option count", () => {
+    const plans = ['compose', 'bugfix', 'classic', 'enterprise', 'express', 'feature', 'infra', 'mvp', 'poc', 'refactor', 'security-patch', 'workshop'];
+    const text = ['**Plan**', 'Which should I use?', ...plans.map((plan) => `- **${plan}**`)].join('\n');
+    const spec = (labels) => ({ version: 1, questions: [{ prompt: 'Which should I use?', header: 'Plan', options: labels.map((label) => ({ label })) }] });
+    expect(buildNativePendingInput({ spec: spec(plans), messagesText: text }).questions[0].options.map((option) => option.label)).toEqual(plans);
+    const many = Array.from({ length: 17 }, (_, index) => `plan-${index}`);
+    expect(buildNativePendingInput({ spec: spec(many), messagesText: many.join('\n') })).toBeNull();
+  });
+
+  it('never shows options the member was not shown, and tolerates no or bad specs', () => {
+    const invented = structuredClone(planSpec);
+    invented.questions[0].options.push({ label: 'Approve everything' });
+    expect(buildNativePendingInput({ spec: invented, messagesText: planChoiceText })).toBeNull();
+    expect(buildNativePendingInput({ spec: null, messagesText: planChoiceText })).toBeNull();
+    for (const bad of [{}, { version: 2, questions: [] }, { version: 1, questions: [{ prompt: 'x', options: [{ label: 'Only' }] }] }, { version: 1, questions: [{ prompt: 'x', extra: 1, options: [] }] }, 'text', []]) {
+      expect(buildNativePendingInput({ spec: bad, messagesText: planChoiceText })).toBeNull();
+    }
+  });
+
+  it('derives approval gates from engine state with protocol labels, whatever the spec says', () => {
+    const gate = { stage: 'requirements-analysis' };
+    const fixed = buildNativePendingInput({ gate, spec: null, messagesText: 'Ready for review.' });
+    expect(fixed).toMatchObject({ kind: 'approval', source: 'engine-gate', stage: 'requirements-analysis' });
+    expect(fixed.questions[0].options.map((o) => o.label)).toEqual(['Approve', 'Request Changes']);
+    const rendered = buildNativePendingInput({
+      gate,
+      spec: {
+        version: 1,
+        questions: [{ prompt: 'Requirements complete. How would you like to proceed?', header: 'Approval', options: [
+          { label: 'Approve', description: 'Continue to user stories' },
+          { label: 'Request Changes', description: 'Provide revision feedback' },
+          { label: 'Accept as-is', description: 'Proceed without further revision' },
+          { label: 'Skip review entirely', description: 'not a protocol option' },
+        ] }],
+      },
+      messagesText: 'Approve Request Changes Accept as-is Skip review entirely',
+    });
+    expect(rendered.questions[0].prompt).toBe('Requirements complete. How would you like to proceed?');
+    expect(rendered.questions[0].options.map((o) => o.label)).toEqual(['Approve', 'Request Changes', 'Accept as-is']);
+    expect(rendered.questions[0].options[0].description).toBe('Continue to user stories');
+  });
+
+  it('rejects approval inputs that drop a protocol label or invent one', () => {
+    const base = buildNativePendingInput({ gate: { stage: 'requirements-analysis' }, messagesText: '' });
+    const missing = structuredClone(base);
+    missing.questions[0].options = missing.questions[0].options.filter((o) => o.label !== 'Request Changes');
+    missing.questions[0].options.push({ label: 'Approve later', description: null });
+    expect(() => nativePendingInput(missing)).toThrow();
+    const multi = structuredClone(base);
+    multi.questions[0].multiSelect = true;
+    expect(() => nativePendingInput(multi)).toThrow();
+  });
+});
+
+describe('native answer rendering', () => {
+  const choice = buildNativePendingInput({ spec: planSpec, messagesText: planChoiceText });
+  const gate = buildNativePendingInput({ gate: { stage: 'requirements-analysis' }, messagesText: '' });
+  it('sends the bare exact label for one question, never a number', () => {
+    expect(nativeAnswerText(choice, { answers: [{ selectedOptions: [0] }] })).toBe('Compose');
+    expect(nativeAnswerText(gate, { answers: [{ selectedOptions: [0] }] })).toBe('Approve');
+  });
+  it('keeps request-changes feedback separate from the decision label', () => {
+    expect(
+      nativeAnswerText(gate, { answers: [{ selectedOptions: [1], freeText: 'Add offline support.' }] }),
+    ).toBe('Request Changes\n\nAdd offline support.');
+  });
+  it('sends free text alone for Other, and one line per question for batches', () => {
+    expect(nativeAnswerText(choice, { answers: [{ selectedOptions: [], freeText: 'Use the bugfix scope' }] })).toBe(
+      'Use the bugfix scope',
+    );
+    const batch = nativePendingInput({
+      schemaVersion: 1, kind: 'choice', source: 'rendered-question', stage: null,
+      questions: [
+        { id: 'q1', prompt: 'Which platforms?', header: 'Platforms', multiSelect: true, options: [{ label: 'Web', description: null }, { label: 'Mobile', description: null }, { label: 'Desktop', description: null }] },
+        { id: 'q2', prompt: 'Difficulty curve?\nPick one.', header: null, multiSelect: false, options: [{ label: 'Gentle', description: null }, { label: 'Steep', description: null }] },
+      ],
+    });
+    expect(
+      nativeAnswerText(batch, { answers: [{ selectedOptions: [2, 0] }, { selectedOptions: [1], freeText: 'but forgiving' }] }),
+    ).toBe('1. Platforms: Web, Desktop\n2. Difficulty curve?: Steep — but forgiving');
+  });
+  it('rejects selections that do not fit the presented question', () => {
+    for (const bad of [
+      { answers: [] },
+      { answers: [{ selectedOptions: [5] }] },
+      { answers: [{ selectedOptions: [0, 1] }] },
+      { answers: [{ selectedOptions: [0, 0] }] },
+      { answers: [{ selectedOptions: [] }] },
+      { answers: [{ selectedOptions: [0], extra: true }] },
+      { answers: [{ selectedOptions: [0], freeText: 'bad\u0007control' }] },
+      { answers: [{ selectedOptions: [0] }], approved: true },
+    ]) {
+      expect(() => nativeSelection(choice, bad)).toThrow();
+    }
+  });
+});

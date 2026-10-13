@@ -12,13 +12,16 @@ const state = vi.hoisted(() => ({
   discussions: vi.fn(),
   subscriptions: new Set<string>(),
 }));
+// Shared drafts: in-memory Yjs relay + textarea stand-in (see test/collaborationFakes).
+vi.mock('@/hooks/useYjsDocument', async () => await import('@/test/collaborationFakes'));
+vi.mock('@/components/CollaborativeTextarea', async () => await import('@/test/collaborationFakes'));
 vi.mock('@/services/intents', () => ({ intentsService: { get: state.get } }));
-vi.mock('@/services/nativeIntents', () => ({ nativeIntentsService: { get: state.nativeGet } }));
+vi.mock('@/services/nativeIntents', () => ({ nativeIntentsService: { get: state.nativeGet, outputs: async () => ({outputs:[],nextAfter:null}) } }));
 vi.mock('@/services/workflows', () => ({
   workflowsService: { compiled: state.compiled, get: async () => ({ phases: [] }) },
 }));
 vi.mock('@/services/realtime', () => ({
-  realtimeService: { onStatusChange: () => () => {} },
+  realtimeService: { onStatusChange: () => () => {}, connect: async () => {}, on: () => () => {} },
 }));
 vi.mock('@/hooks/useIntentEvents', () => ({
   useIntentEvents: (projectId: string, intentId: string) => {
@@ -33,8 +36,8 @@ vi.mock('@/hooks/useIntentEvents', () => ({
   },
 }));
 vi.mock('@/components/discussion', () => ({
-  DiscussionProvider: ({ children }: { children: ReactNode }) => {
-    state.discussions();
+  DiscussionProvider: ({ children, backend }: { children: ReactNode; backend?: string }) => {
+    state.discussions(backend ?? 'platform');
     return <>{children}</>;
   },
 }));
@@ -43,7 +46,7 @@ vi.mock('@/components/layout/AppHeader', () => ({
     const context = useIntentOptional();
     return (
       <header>
-        {context ? context.detail?.intent.title || 'Loading platform' : 'No platform context'}
+        {context?.executionBackend === 'native' ? 'Native context' : context ? context.detail?.intent.title || 'Loading platform' : 'No platform context'}
       </header>
     );
   },
@@ -56,7 +59,7 @@ vi.mock('@/components/layout/ActivityPanel', () => ({
   ActivityPanel: () => <p>Legacy activity</p>,
 }));
 vi.mock('@/components/layout/IntentActivityPanel', () => ({
-  IntentActivityPanel: () => <p>Platform activity</p>,
+  IntentActivityPanel: () => <p>{useIntentOptional()?.executionBackend === 'native' ? 'Native activity' : 'Platform activity'}</p>,
 }));
 vi.mock('@/hooks/useProjectsCache', () => ({ useProjectSprintsCache: () => ({ sprints: [] }) }));
 vi.mock('@/hooks/useMediaQuery', () => ({ useMediaQuery: () => true }));
@@ -129,14 +132,16 @@ beforeEach(() => {
     value: vi.fn(() => ({ matches: true })),
   });
 });
-it('native routes mount neither platform provider and fetch only the protected native detail', async () => {
+it('native routes mount the shared context with the native adapter and fetch only the protected native detail', async () => {
   renderShell(true);
   expect(await screen.findByText('Protected native prompt')).toBeInTheDocument();
-  expect(screen.getByText('No platform context')).toBeInTheDocument();
+  expect(screen.getByText('Native context')).toBeInTheDocument();
   expect(state.nativeGet).toHaveBeenCalledWith('p1', 'same');
   expect(state.get).not.toHaveBeenCalled();
   expect(state.compiled).not.toHaveBeenCalled();
-  expect(state.discussions).not.toHaveBeenCalled();
+  // Only the native-scoped discussion provider may mount on a native route.
+  expect(state.discussions).toHaveBeenCalledWith('native');
+  expect(state.discussions).not.toHaveBeenCalledWith('platform');
   expect(state.subscriptions.size).toBe(0);
 });
 it('drops loaded platform state and subscriptions on navigation to native with the same UUID', async () => {

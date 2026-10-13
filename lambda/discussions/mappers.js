@@ -40,7 +40,8 @@ export const mapDiscussion = (v, messageCount = undefined) => ({
   entityType: getVal(v, 'entity_type'),
   entityId: getVal(v, 'entity_id'),
   entityTitle: getVal(v, 'entity_title'),
-  sprintId: getVal(v, 'sprint_id') || getVal(v, 'intent_id'),
+  sprintId:
+    getVal(v, 'sprint_id') || getVal(v, 'intent_id') || getVal(v, 'native_discussion_root'),
   status: getVal(v, 'status') || 'open',
   resolvedBy: getVal(v, 'resolved_by') || undefined,
   resolvedByName: getVal(v, 'resolved_by_name') || undefined,
@@ -51,6 +52,18 @@ export const mapDiscussion = (v, messageCount = undefined) => ({
   createdBy: getVal(v, 'created_by'),
   createdByName: getVal(v, 'created_by_name'),
   lastMessageAt: getVal(v, 'last_message_at'),
+  ...(getVal(v, 'native_file_id')
+    ? {
+        // The exact verified revision a native artifact thread discusses.
+        revision: {
+          fileId: getVal(v, 'native_file_id'),
+          path: getVal(v, 'native_path'),
+          sha256: getVal(v, 'content_sha256'),
+          publicationId: getVal(v, 'publication_id'),
+          publicationSequence: Number(getVal(v, 'publication_sequence')),
+        },
+      }
+    : {}),
   ...(messageCount !== undefined ? { messageCount: Number(messageCount) } : {}),
 });
 
@@ -73,7 +86,8 @@ export const mapMessage = (v) => ({
   createdAt: getVal(v, 'created_at'),
   updatedAt: getVal(v, 'updated_at'),
   discussionId: getVal(v, 'discussion_id'),
-  sprintId: getVal(v, 'sprint_id') || getVal(v, 'intent_id'),
+  sprintId:
+    getVal(v, 'sprint_id') || getVal(v, 'intent_id') || getVal(v, 'native_discussion_root'),
 });
 
 // One total order everywhere: display order (createdAt, id),

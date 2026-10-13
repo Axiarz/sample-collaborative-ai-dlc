@@ -416,6 +416,8 @@ const claudeResultText = (result) => {
 export const createCliOutputSink = ({
   cli,
   emit,
+  retainState = true,
+  maxPendingTools = Infinity,
   onSession = () => {},
   onUsage = () => {},
   onError: handleError = () => {},
@@ -424,6 +426,7 @@ export const createCliOutputSink = ({
 
   if (cli === 'opencode') {
     const parser = createOpenCodeJsonlParser({
+      retainState,
       onSession,
       onUsage,
       onText(text) {
@@ -481,6 +484,7 @@ export const createCliOutputSink = ({
 
   if (cli === 'codex') {
     const parser = createCodexJsonlParser({
+      retainState,
       onSession,
       onUsage,
       onText(text) {
@@ -697,6 +701,10 @@ export const createCliOutputSink = ({
       if (event.type === 'assistant') {
         for (const part of parts) {
           if (part?.type !== 'tool_use' || !part.id) continue;
+          if (!pendingTools.has(part.id) && pendingTools.size >= maxPendingTools) {
+            emitEvent(emit, 'Pending tool metadata capacity reached', { type: 'raw', level: 'info' });
+            continue;
+          }
           pendingTools.set(part.id, {
             name: claudeToolName(part.name),
             input: part.input ?? {},

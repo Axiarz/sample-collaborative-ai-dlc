@@ -61,6 +61,8 @@ export function createKiroAcpClient({
     typeof input?.off !== 'function' ||
     typeof input?.listeners !== 'function' ||
     typeof input?.resume !== 'function' ||
+    typeof input?.pause !== 'function' ||
+    typeof input?.read !== 'function' ||
     typeof output?.on !== 'function' ||
     typeof output?.off !== 'function' ||
     typeof output?.listeners !== 'function' ||
@@ -92,9 +94,13 @@ export function createKiroAcpClient({
   let outputBytes = 0;
   let frame = Buffer.alloc(0);
   let frameLength = 0;
+  let chunk = Buffer.alloc(0);
+  let offset = 0;
+  let draining = false;
+  let updateBlocked = false;
 
   const listeners = [
-    [input, 'data', receive],
+    [input, 'readable', receive],
     [input, 'end', end],
     [input, 'close', end],
     [input, 'error', streamError],
@@ -126,6 +132,9 @@ export function createKiroAcpClient({
     serverRequests.clear();
     frame = Buffer.alloc(0);
     frameLength = 0;
+    chunk = Buffer.alloc(0);
+    offset = 0;
+    updateBlocked = false;
   }
 
   function streamError() {
@@ -135,6 +144,11 @@ export function createKiroAcpClient({
   function end() {
     if (terminal) return;
     inputEnded = true;
+    finishInput();
+  }
+
+  function finishInput() {
+    if (terminal || !inputEnded || updateBlocked || offset < chunk.length) return;
     if (frameLength) {
       stop(new KiroAcpError('TRUNCATED_FRAME'));
       return;
@@ -174,8 +188,9 @@ export function createKiroAcpClient({
     }
   }
 
-  // Synchronous callbacks run before responses. Async update callbacks also
-  // settle before the originating request; nested later requests can proceed.
+  // Update projection settles before the next update or final response. An
+  // asynchronous projection holds upstream reads, not an expanding job queue.
+  // Permission callbacks retain their separate bounded request handling.
   function call(callback, params, success, sequence = null) {
     if (callbacks.size >= limits.maxPendingRequests) throw new KiroAcpError('PENDING_LIMIT');
     let result;
@@ -194,7 +209,7 @@ export function createKiroAcpClient({
     });
     const job = {
       done,
-      timer: setTimeout(() => stop(new KiroAcpError('TIMEOUT')), limits.defaultTimeoutMs),
+      timer: sequence === null ? setTimeout(() => stop(new KiroAcpError('TIMEOUT')), limits.defaultTimeoutMs) : null,
     };
     callbacks.add(job);
     if (sequence !== null) updates.set(sequence, completion);
@@ -220,6 +235,7 @@ export function createKiroAcpClient({
         finish();
       },
     );
+    return completion;
   }
 
   function message(value) {
@@ -234,7 +250,7 @@ export function createKiroAcpClient({
         throw new KiroAcpError('INVALID_MESSAGE');
       const params = value.params ?? {};
       if (!own(value, 'id')) {
-        if (value.method === 'session/update') call(onUpdate, params, () => {}, ++updateSequence);
+        if (value.method === 'session/update') return call(onUpdate, params, () => {}, ++updateSequence);
         return;
       }
       if (!validId(value.id) || serverRequests.has(value.id))
@@ -284,7 +300,7 @@ export function createKiroAcpClient({
       item.scheduled = true;
       queueMicrotask(() => {
         if (terminal) return;
-        if (frameLength) {
+        if (frameLength || updateBlocked || offset < chunk.length || input.readableLength) {
           item.scheduled = false;
           return;
         }
@@ -300,7 +316,7 @@ export function createKiroAcpClient({
 
   function settleResponse(id, item) {
     if (terminal) return;
-    if (frameLength) {
+    if (frameLength || updateBlocked || offset < chunk.length || input.readableLength) {
       item.scheduled = false;
       return;
     }
@@ -319,7 +335,7 @@ export function createKiroAcpClient({
     } catch {
       throw new KiroAcpError('INVALID_JSON');
     }
-    message(value);
+    return message(value);
   }
 
   function append(bytes) {
@@ -338,38 +354,56 @@ export function createKiroAcpClient({
     frameLength += bytes.length;
   }
 
-  function receive(chunk) {
-    if (terminal) return;
+  function receive() {
+    if (terminal || draining || updateBlocked) return;
+    draining = true;
     try {
-      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      if (limits.maxInputBytes !== null) {
-        inputBytes += bytes.length;
-        if (inputBytes > limits.maxInputBytes) throw new KiroAcpError('INPUT_LIMIT');
-      }
-      let offset = 0;
-      while (offset < bytes.length) {
-        if (terminal) return;
-        const newline = bytes.indexOf(10, offset);
-        const last = newline === -1 ? bytes.length : newline;
-        const part = bytes.subarray(offset, last);
+      while (!terminal && !updateBlocked) {
+        if (offset === chunk.length) {
+          // Never retain an arbitrary producer chunk or concatenate a burst.
+          // Pull at most 64 KiB; the stream's high-water mark propagates pressure
+          // to the child pipe while a projection is pending.
+          chunk = input.read(Math.min(input.readableLength, 64 * 1024)) ?? Buffer.alloc(0);
+          offset = 0;
+          if (!chunk.length) break;
+          if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
+          if (limits.maxInputBytes !== null) {
+            inputBytes += chunk.length;
+            if (inputBytes > limits.maxInputBytes) throw new KiroAcpError('INPUT_LIMIT');
+          }
+        }
+        const newline = chunk.indexOf(10, offset);
+        const last = newline === -1 ? chunk.length : newline;
+        const part = chunk.subarray(offset, last);
+        offset = newline === -1 ? last : last + 1;
+        let completion;
         if (newline === -1 || frameLength) {
           append(part);
           if (newline !== -1) {
             const complete = frame.subarray(0, frameLength);
             frameLength = 0;
-            consume(complete);
+            completion = consume(complete);
           }
         } else {
           if (part.length > limits.maxFrameBytes) throw new KiroAcpError('FRAME_LIMIT');
-          consume(part);
+          completion = consume(part);
         }
-        offset = last + 1;
+        if (completion) {
+          updateBlocked = true;
+          void completion.then(() => {
+            updateBlocked = false;
+            receive();
+          });
+        }
       }
-      // Do not publish a final success before later frames in this chunk have
-      // been validated. A trailing partial frame must complete or reach EOF.
-      if (!frameLength) scheduleResponses();
+      // Responses cannot overtake queued, partial, or pressure-held updates,
+      // including later frames in the same producer write.
+      if (!frameLength && !updateBlocked && offset === chunk.length) scheduleResponses();
+      finishInput();
     } catch (error) {
       stop(error instanceof KiroAcpError ? error : new KiroAcpError('INVALID_MESSAGE'));
+    } finally {
+      draining = false;
     }
   }
 
@@ -410,6 +444,7 @@ export function createKiroAcpClient({
   }
 
   const dispose = () => stop(new KiroAcpError('CLOSED'));
+  input.pause();
   for (const [stream, event, listener] of listeners) stream.on(event, listener);
   if (input.readableEnded || input.destroyed || output.writableEnded || output.destroyed) end();
   return { request, notify, dispose, close: dispose };

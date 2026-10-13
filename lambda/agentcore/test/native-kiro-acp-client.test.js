@@ -1,4 +1,5 @@
 import { PassThrough, Writable } from 'node:stream';
+import { once } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createKiroAcpClient, KIRO_ACP_LIMITS } from '../native/kiro-acp-client.js';
 
@@ -18,7 +19,7 @@ const permission = (id = 'permission-1') => ({
 });
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const fixture = (options = {}) => {
-  const input = new PassThrough();
+  const input = options.input ?? new PassThrough();
   const output = new PassThrough();
   const sent = [];
   let buffered = '';
@@ -42,6 +43,113 @@ afterEach(() => {
 });
 
 describe('bounded Kiro ACP transport', () => {
+  it('serializes nine async updates in one burst, handles permission, then resolves the prompt', async () => {
+    const seen = [];
+    let active = 0;
+    let peak = 0;
+    const { client, input, sent } = fixture({
+      onUpdate: async params => {
+        peak = Math.max(peak, ++active);
+        await tick();
+        seen.push(params.update.text);
+        active--;
+      },
+    });
+    const prompt = client.request('session/prompt', {}, { timeoutMs: null });
+    const frames = Array.from({ length: 9 }, (_, i) => update(String(i)));
+    frames.splice(4, 0, permission());
+    input.end(frames.map(wire).join('') + wire(response(1, { stopReason: 'end_turn' })));
+    expect(await prompt).toEqual({ stopReason: 'end_turn' });
+    expect(seen).toEqual(Array.from({ length: 9 }, (_, i) => String(i)));
+    expect(peak).toBe(1);
+    expect(sent.find(packet => packet.id === 'permission-1')).toMatchObject({
+      result: { outcome: { outcome: 'cancelled' } },
+    });
+  });
+
+  it('propagates sustained projection pressure upstream and preserves all updates in order', async () => {
+    const input = new PassThrough({ highWaterMark: 1024 });
+    const releases = [];
+    const seen = [];
+    const { client } = fixture({
+      input, maxInputBytes: null, maxOutputBytes: null,
+      onUpdate: params => new Promise(resolve => {
+        seen.push(Number(params.update.text.slice(0, 3)));
+        releases.push(resolve);
+      }),
+    });
+    let produced = 0;
+    let settled = false;
+    const prompt = client.request('session/prompt', {}, { timeoutMs: null }).then(value => {
+      settled = true;
+      return value;
+    });
+    const producer = (async () => {
+      for (let i = 0; i < 100; i++) {
+        const accepted = input.write(wire(update(String(i).padStart(3, '0') + 'x'.repeat(1024))));
+        produced++;
+        if (!accepted) await once(input, 'drain');
+      }
+      input.end(wire(response(1, { stopReason: 'end_turn' })));
+    })();
+    await tick();
+    expect(seen).toEqual([0]);
+    expect(produced).toBeLessThan(100);
+    expect(input.readableLength).toBeLessThanOrEqual(input.readableHighWaterMark + 2048);
+    expect(settled).toBe(false);
+    for (let i = 0; i < 100; i++) {
+      expect(seen).toHaveLength(i + 1);
+      releases.shift()();
+      await tick();
+    }
+    await producer;
+    expect(await prompt).toEqual({ stopReason: 'end_turn' });
+    expect(seen).toEqual(Array.from({ length: 100 }, (_, i) => i));
+  });
+
+  it('releases a pressure-paused producer on cancellation without processing queued or late updates', async () => {
+    const input = new PassThrough({ highWaterMark: 1024 });
+    let release;
+    const onUpdate = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    const { client, sent } = fixture({ input, onUpdate, maxInputBytes: null });
+    const prompt = caught(client.request('session/prompt', {}, { timeoutMs: null }));
+    const producer = (async () => {
+      for (let i = 0; i < 100; i++) {
+        if (!input.write(wire(update('x'.repeat(1024))))) await once(input, 'drain');
+      }
+    })();
+    await tick();
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+    client.notify('session/cancel', { sessionId: 'A' });
+    client.dispose();
+    expect(await prompt).toMatchObject({ code: 'KIRO_ACP_CLOSED' });
+    await producer;
+    release();
+    await tick();
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+    expect(sent.filter(packet => packet.method === 'session/prompt')).toHaveLength(1);
+    expect(sent.at(-1)).toMatchObject({ method: 'session/cancel' });
+    expect(input.listenerCount('readable')).toBe(0);
+    expect(input.readableFlowing).toBe(true);
+  });
+
+  it('does not turn downstream pressure into a model-turn deadline', async () => {
+    vi.useFakeTimers();
+    let release;
+    const { client, input } = fixture({
+      defaultTimeoutMs: 5,
+      onUpdate: () => new Promise(resolve => { release = resolve; }),
+    });
+    let settled = false;
+    const prompt = client.request('session/prompt', {}, { timeoutMs: null }).then(() => { settled = true; });
+    input.write(wire(update('held')) + wire(response(1)));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(settled).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    release();
+    await prompt;
+  });
+
   it('supports a prompt without a deadline while retaining bounded transport requests', async () => {
     vi.useFakeTimers();
     const { client, send } = fixture();
@@ -69,6 +177,7 @@ describe('bounded Kiro ACP transport', () => {
     });
     const prompt = client.request('session/prompt', {}, { timeoutMs: null });
     for (let i = 0; i < 600; i++) send(update('x'.repeat(32 * 1024)));
+    await tick();
     expect(updates).toBe(600);
     send(response(1, { stopReason: 'end_turn' }));
     expect(await prompt).toEqual({ stopReason: 'end_turn' });
@@ -109,10 +218,11 @@ describe('bounded Kiro ACP transport', () => {
     expect(seen).toEqual(['Blue💡Lake']);
   });
 
-  it('defaults permission to cancelled and replies -32601 to unknown server requests', () => {
+  it('defaults permission to cancelled and replies -32601 to unknown server requests', async () => {
     const { sent, send } = fixture();
     send(permission());
     send({ jsonrpc: '2.0', id: 91, method: 'fs/read_text_file', params: {} });
+    await tick();
     expect(sent).toEqual([
       { jsonrpc: '2.0', id: 'permission-1', result: { outcome: { outcome: 'cancelled' } } },
       { jsonrpc: '2.0', id: 91, error: { code: -32601, message: 'Method not found' } },
@@ -449,6 +559,7 @@ describe('bounded Kiro ACP transport', () => {
     expect(output.destroyed).toBe(false);
     expect(output.writableEnded).toBe(false);
     expect(input.listenerCount('data')).toBe(0);
+    await tick();
     expect(input.readableFlowing).toBe(true);
     expect(() => {
       input.write('late non-JSON output\n');

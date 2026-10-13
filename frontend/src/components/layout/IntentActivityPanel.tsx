@@ -43,8 +43,8 @@ import type { IntentActivityEvent, IntentArtifact, IntentGraphNode } from '@/ser
 const FOLLOW_KEY = 'auto';
 
 export function IntentActivityPanel({ onClose }: { onClose: () => void }) {
-  const { detail, stageRows, agentFocus, previewSeq } = useIntent();
-  const [activeTab, setActiveTab] = useState('timeline');
+  const { detail, stageRows, agentFocus, previewSeq, executionBackend, nativeWorkspace, intentId } = useIntent();
+  const [activeTab, setActiveTab] = useState(executionBackend === 'native' ? 'agent' : 'timeline');
   const discussionsCtx = useDiscussions();
   const totalUnread = (discussionsCtx?.discussions ?? []).reduce(
     (sum, d) => sum + (d.unreadCount ?? 0),
@@ -72,12 +72,12 @@ export function IntentActivityPanel({ onClose }: { onClose: () => void }) {
   }, [previewSeq]);
 
   // Reset pinned selection when the intent changes.
-  const intentKey = detail?.intent.id ?? null;
+  const intentKey = intentId;
   useEffect(() => {
     setSelectedKey(FOLLOW_KEY);
   }, [intentKey]);
 
-  const running = stageRows.some((s) => s.state === 'RUNNING');
+  const running = stageRows.some((s) => s.state === 'RUNNING') || (executionBackend === 'native' && ['RUNNING','DISPATCHING','RECOVERING'].includes(nativeWorkspace?.intent?.execution?.status ?? ''));
   const events = detail?.events ?? [];
 
   return (
@@ -106,7 +106,8 @@ export function IntentActivityPanel({ onClose }: { onClose: () => void }) {
                   </Badge>
                 )}
               </TabsTrigger>
-              <TabsTrigger value="discussions" className="h-6 px-2 text-xs gap-1">
+              {/* Native threads use their own protected discussion scope. */}
+              <TabsTrigger disabled={!discussionsCtx?.scope} value="discussions" className="h-6 px-2 text-xs gap-1">
                 <MessageSquare className="h-3 w-3 shrink-0" />
                 Discuss
                 {totalUnread > 0 && (
@@ -115,7 +116,7 @@ export function IntentActivityPanel({ onClose }: { onClose: () => void }) {
                   </Badge>
                 )}
               </TabsTrigger>
-              <TabsTrigger value="preview" className="h-6 px-2 text-xs gap-1">
+              <TabsTrigger disabled={executionBackend === 'native'} value="preview" className="h-6 px-2 text-xs gap-1">
                 <Eye className="h-3 w-3 shrink-0" />
                 Preview
               </TabsTrigger>

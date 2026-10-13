@@ -1,5 +1,7 @@
 import http from 'node:http';
 import { createNativeWorkspaceCheck } from './workspace-check.js';
+import { startNativeResourceTelemetry } from './resource-telemetry.js';
+import { startNativeFlightRecorder } from './flight-recorder.js';
 
 export const NATIVE_RUNTIME_MAX_BODY = 256 * 1024;
 const IDENTITY = [
@@ -121,6 +123,7 @@ export const createNativeRuntimeServer = ({
   };
   let startRequests = 0;
   let busy = false;
+  const isBusy = () => busy || startRequests > 0 || executor?.isBusy() === true;
   const server = http.createServer(async (request, response) => {
     const send = (status, body) => {
       if (response.destroyed || response.writableEnded) return;
@@ -128,9 +131,7 @@ export const createNativeRuntimeServer = ({
       response.end(JSON.stringify(body));
     };
     if (request.method === 'GET' && request.url === '/ping') {
-      return send(200, {
-        status: busy || startRequests > 0 || executor?.isBusy() ? 'HealthyBusy' : 'Healthy',
-      });
+      return send(200, { status: isBusy() ? 'HealthyBusy' : 'Healthy' });
     }
     if (request.method !== 'POST' || request.url !== '/invocations') {
       return send(404, { ok: false, code: 'not_found' });
@@ -147,6 +148,7 @@ export const createNativeRuntimeServer = ({
         'native-continue',
         'native-recover',
         'native-status',
+        'native-activity',
         'native-cancel',
       ].includes(payload.command)
     ) {
@@ -160,7 +162,7 @@ export const createNativeRuntimeServer = ({
         starting
           ? payload.schemaVersion !== 1
           : Object.keys(payload).some(
-              (key) => !['command', 'writerGeneration', ...IDENTITY].includes(key),
+              (key) => !['command', 'writerGeneration', ...(payload.command === 'native-activity' ? ['after'] : []), ...IDENTITY].includes(key),
             )
       )
         return send(400, { ok: false, code: 'native_execution_request_invalid' });
@@ -181,7 +183,7 @@ export const createNativeRuntimeServer = ({
               : 'continue'
           : payload.command === 'native-status'
             ? 'status'
-            : 'cancel';
+            : payload.command === 'native-activity' ? 'activity' : 'cancel';
         if (typeof active[method] !== 'function')
           return send(409, { ok: false, code: 'native_execution_recovery_failed' });
         return send(200, await active[method](payload));
@@ -209,6 +211,7 @@ export const createNativeRuntimeServer = ({
   server.requestTimeout = 30_000;
   server.headersTimeout = 15_000;
   server.maxHeadersCount = 32;
+  server.isNativeBusy = isBusy;
   return server;
 };
 
@@ -218,5 +221,7 @@ export const startNativeRuntimeServer = async () => {
     server.once('error', reject);
     server.listen(8080, '0.0.0.0', resolve);
   });
+  const flight = startNativeFlightRecorder({ isBusy: server.isNativeBusy });
+  startNativeResourceTelemetry({ isBusy: server.isNativeBusy, window: flight.window });
   return server;
 };

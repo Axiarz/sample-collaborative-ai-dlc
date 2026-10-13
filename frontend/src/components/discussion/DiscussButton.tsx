@@ -18,7 +18,14 @@ interface Props extends OpenDiscussionArgs {
   className?: string;
 }
 
-export function DiscussButton({ entityType, entityId, entityTitle, className }: Props) {
+export function DiscussButton({
+  entityType,
+  entityId,
+  entityTitle,
+  publicationId,
+  publicationSequence,
+  className,
+}: Props) {
   const discussions = useDiscussions();
   if (!discussions) return null;
 
@@ -45,7 +52,13 @@ export function DiscussButton({ entityType, entityId, entityTitle, className }: 
             if (thread) {
               discussions.openDiscussionById(thread.id);
             } else {
-              discussions.openDiscussion({ entityType, entityId, entityTitle });
+              discussions.openDiscussion({
+                entityType,
+                entityId,
+                entityTitle,
+                publicationId,
+                publicationSequence,
+              });
             }
           }}
           aria-label={label}

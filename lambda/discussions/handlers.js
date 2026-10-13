@@ -7,6 +7,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { PutCommand, GetCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
 import { Logger } from '@aws-lambda-powertools/logger';
 import { signRealtimeToken } from '../shared/realtime-token.js';
+import { resolveNativeAwareIntentProject } from '../shared/native-realtime-ownership.js';
+import { nativeCollaborationScope, nativeIntentChannel } from '../shared/native-realtime.js';
 import { fetchMembershipRole } from '../shared/trackers.js';
 import { credentialProviderForCli } from '../shared/agent-credentials.js';
 import { resolveEffectiveCredentialBindingsViaBroker } from '../shared/agent-credential-metadata.js';
@@ -51,6 +53,7 @@ import {
   anchorExistsInScope,
   fetchAnchorTitle,
   createDiscussionVertex,
+  ensureNativeDiscussionRoot,
   fetchDiscussionInScope,
   fetchMessageInDiscussion,
   fetchMessageByRequestId,
@@ -65,7 +68,10 @@ import {
   broadcastToUser,
   getSecret,
   invokeDiscussionAssist,
+  invokeNativeDiscussionAssist,
+  nativeArtifactRevisions,
 } from './services.js';
+import { parseNativeArtifactRevisionId } from '../shared/native-artifact-revision.js';
 import { resolveScope } from './scope.js';
 
 const logger = new Logger({ persistentKeys: { component: 'discussions' } });
@@ -74,6 +80,8 @@ const ASSIST_COMMANDS = new Set(['summarize', 'explain', 'brainstorm', 'ask']);
 const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{8,160}$/;
 const MAX_ASSIST_INSTRUCTIONS = 2000;
 const MAX_SELECTED_MESSAGES = 40;
+// Matches the runtime's per-anchor prompt cap; the bytes are verified first.
+const NATIVE_ASSIST_ARTIFACT_BYTES = 12 * 1024;
 const processTable = () => process.env.V2_PROCESS_TABLE || '';
 const pinnedAgentCli = (execution) =>
   execution?.status === 'DRAFT' ? null : (execution?.agentCli ?? null);
@@ -106,9 +114,14 @@ export const issueRealtimeToken = async (event, res) => {
   } else if (intentId) {
     // Intent realtime token: the route is project-scoped; verify the intent
     // belongs to the project when the Intent vertex exists (post-Start).
-    projectId = (await query((g) => fetchProjectIdForIntent(g, intentId))) || pathProjectId;
+    let native = false;
+    projectId = await resolveNativeAwareIntentProject({ onNative: () => { native = true; }, ddb, nativeTable: process.env.NATIVE_RUNTIME_BINDINGS_TABLE, processTable: process.env.V2_PROCESS_TABLE, projectId: pathProjectId, intentId, platformProject: () => query((g) => fetchProjectIdForIntent(g, intentId)) });
     if (!projectId) return res(404, { error: 'Intent not found' });
-    scopes = [`intent:${intentId}`, `project:${projectId}`];
+    // Keep in step with the deployed intents token route (lambda/intents).
+    const identity = { projectId, executionId: intentId };
+    scopes = native
+      ? [nativeIntentChannel(identity), nativeCollaborationScope(identity), `project:${projectId}`]
+      : [`intent:${intentId}`, `project:${projectId}`];
   } else if (pathProjectId) {
     scopes = [`project:${pathProjectId}`];
   } else {
@@ -124,7 +137,7 @@ export const issueRealtimeToken = async (event, res) => {
 };
 
 export const listDiscussions = async (event, res) => {
-  const scope = resolveScope(event.pathParameters);
+  const scope = resolveScope(event.pathParameters, event.resource || event.path);
   const caller = getCaller(event);
   const auth = await authorizeScope(scope, caller.sub, res);
   if (auth.res) return auth.res;
@@ -164,7 +177,7 @@ export const listDiscussions = async (event, res) => {
 };
 
 export const getOrCreateDiscussion = async (event, res) => {
-  const scope = resolveScope(event.pathParameters);
+  const scope = resolveScope(event.pathParameters, event.resource || event.path);
   const caller = getCaller(event);
   const auth = await authorizeScope(scope, caller.sub, res);
   if (auth.res) return auth.res;
@@ -189,6 +202,13 @@ export const getOrCreateDiscussion = async (event, res) => {
   if (!entityId) return res(400, { error: 'Missing entityId' });
 
   const anchorLabel = scope.anchorLabels[entityType];
+  const nativeRevision =
+    scope.kind === 'native' && entityType === 'artifact'
+      ? parseNativeArtifactRevisionId(entityId)
+      : null;
+  if (scope.kind === 'native' && entityType === 'artifact' && !nativeRevision) {
+    return res(400, { error: 'Native artifact threads require a "<fileId>:<sha256>" revision' });
+  }
 
   // Fast path: thread already exists — no lock.
   const existing = await query((g) =>
@@ -196,12 +216,32 @@ export const getOrCreateDiscussion = async (event, res) => {
   );
   if (existing) return res(200, existing);
 
-  // Validate the anchor lives in this scope before creating anything.
-  const anchorOk = await query((g) => anchorExistsInScope(g, scope, entityType, entityId));
-  if (!anchorOk)
-    return res(404, { error: `${entityType} "${entityId}" not found in ${scope.kind}` });
+  // Validate the anchor lives in this scope before creating anything. A native
+  // artifact revision must be a committed file with these exact bytes in the
+  // named protected publication; the projection graph is never trusted.
+  let verifiedRevision = null;
+  if (nativeRevision) {
+    try {
+      verifiedRevision = await nativeArtifactRevisions().verify(auth.native.execution, {
+        ...nativeRevision,
+        publicationId: String(body.publicationId || ''),
+        publicationSequence: body.publicationSequence,
+      });
+    } catch (err) {
+      if (err?.code !== 'NATIVE_ARTIFACT_REVISION_INVALID') throw err;
+      return res(404, { error: 'Artifact revision not found in this execution' });
+    }
+  } else {
+    const anchorOk = await query((g) => anchorExistsInScope(g, scope, entityType, entityId));
+    if (!anchorOk)
+      return res(404, { error: `${entityType} "${entityId}" not found in ${scope.kind}` });
+  }
 
-  const guardKey = `create:${scope.rootId}:${entityType}:${entityId}`;
+  // Native creation serializes per execution so the lazily created root is unique.
+  const guardKey =
+    scope.kind === 'native'
+      ? `create:${scope.rootId}`
+      : `create:${scope.rootId}:${entityType}:${entityId}`;
 
   // Two iterations max: a crashed-winner takeover re-runs the acquire once.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -240,13 +280,26 @@ export const getOrCreateDiscussion = async (event, res) => {
       const id = `disc-${randomUUID()}`;
       const createdAt = new Date().toISOString();
       const fetchedTitle =
-        entityType === 'review'
+        entityType === 'review' || scope.kind === 'native'
           ? ''
           : await query((g) => fetchAnchorTitle(g, anchorLabel, entityId, scope, entityType));
-      const entityTitle = fetchedTitle || String(body.entityTitle || '');
+      const entityTitle =
+        verifiedRevision?.path || fetchedTitle || String(body.entityTitle || '').slice(0, 512);
 
+      if (scope.kind === 'native') {
+        await query((g) => ensureNativeDiscussionRoot(g, scope, createdAt));
+      }
       await query((g) =>
         createDiscussionVertex(g, {
+          anchorProps: verifiedRevision
+            ? {
+                native_file_id: verifiedRevision.fileId,
+                native_path: verifiedRevision.path,
+                content_sha256: verifiedRevision.sha256,
+                publication_id: verifiedRevision.publicationId,
+                publication_sequence: verifiedRevision.publicationSequence,
+              }
+            : {},
           id,
           scope,
           entityType,
@@ -292,7 +345,7 @@ export const getOrCreateDiscussion = async (event, res) => {
 
 export const listMessages = async (event, res) => {
   const { discussionId } = event.pathParameters || {};
-  const scope = resolveScope(event.pathParameters);
+  const scope = resolveScope(event.pathParameters, event.resource || event.path);
   const auth = await authorizeScope(scope, getCaller(event).sub, res);
   if (auth.res) return auth.res;
 
@@ -356,7 +409,7 @@ export const listMessages = async (event, res) => {
 
 export const postMessage = async (event, res) => {
   const { discussionId } = event.pathParameters || {};
-  const scope = resolveScope(event.pathParameters);
+  const scope = resolveScope(event.pathParameters, event.resource || event.path);
   const caller = getCaller(event);
   const auth = await authorizeScope(scope, caller.sub, res);
   if (auth.res) return auth.res;
@@ -557,10 +610,11 @@ export const postMessage = async (event, res) => {
 
 export const assistDiscussion = async (event, res) => {
   const { discussionId } = event.pathParameters || {};
-  const scope = resolveScope(event.pathParameters);
-  if (scope?.kind !== 'intent') {
+  const scope = resolveScope(event.pathParameters, event.resource || event.path);
+  if (scope?.kind !== 'intent' && scope?.kind !== 'native') {
     return res(400, { error: 'Discussion assist is only available for intent discussions' });
   }
+  const native = scope.kind === 'native';
   const caller = getCaller(event);
   const auth = await authorizeScope(scope, caller.sub, res);
   if (auth.res) return auth.res;
@@ -603,7 +657,9 @@ export const assistDiscussion = async (event, res) => {
 
   let executionPromise = null;
   const loadExecution = async () => {
-    if (!processTable()) return null;
+    // Native threads never read platform META: there is no pinned platform CLI
+    // or credential, and a same-ID platform record must not be consulted.
+    if (native || !processTable()) return null;
     executionPromise ??= ddb
       .send(
         new GetCommand({
@@ -694,8 +750,43 @@ export const assistDiscussion = async (event, res) => {
             bindings: [credentialBinding],
           })
         : null;
-      const out = await invokeDiscussionAssist({
+      // Native: only the verified selected revision travels to Quorum. A thread
+      // whose revision can no longer be verified fails visibly; it never falls
+      // back to the latest file, the projection graph or the native runtime.
+      let nativeContext = null;
+      if (native) {
+        let artifact = null;
+        if (getVal(discussion, 'entity_type') === 'artifact') {
+          try {
+            artifact = await nativeArtifactRevisions().read(
+              auth.native.execution,
+              {
+                fileId: getVal(discussion, 'native_file_id'),
+                sha256: getVal(discussion, 'content_sha256'),
+                publicationId: getVal(discussion, 'publication_id'),
+                publicationSequence: Number(getVal(discussion, 'publication_sequence')),
+              },
+              { maxBytes: NATIVE_ASSIST_ARTIFACT_BYTES },
+            );
+          } catch (err) {
+            if (err?.code !== 'NATIVE_ARTIFACT_REVISION_INVALID') throw err;
+            return await failMessage('Reason: The discussed artifact revision could not be verified.');
+          }
+        }
+        // The run's own verified model pin, so Quorum on the run's harness CLI
+        // uses exactly the model the run uses (project settings may not define
+        // one). Other CLIs keep the existing project selection.
+        const configuration = auth.native.execution?.configuration ?? {};
+        const runModel =
+          typeof configuration.harness === 'string' && typeof configuration.model === 'string'
+            ? { cli: configuration.harness, model: configuration.model }
+            : null;
+        nativeContext = { executionId: scope.executionId, artifact, runModel };
+      }
+      const invoke = native ? invokeNativeDiscussionAssist : invokeDiscussionAssist;
+      const out = await invoke({
         intentId: scope.rootId,
+        scope,
         payload: {
           command: 'discussion-assist-start',
           projectId: auth.projectId,
@@ -713,6 +804,7 @@ export const assistDiscussion = async (event, res) => {
             ? { requestedCli: effectiveRequestedCli, credentialBinding }
             : {}),
           ...(agentCredentialGrant ? { agentCredentialGrant } : {}),
+          ...(nativeContext ? { nativeContext } : {}),
         },
       });
       if (out?.ok === false) {
@@ -835,7 +927,7 @@ export const assistDiscussion = async (event, res) => {
 
 export const updateDiscussion = async (event, res) => {
   const { discussionId } = event.pathParameters || {};
-  const scope = resolveScope(event.pathParameters);
+  const scope = resolveScope(event.pathParameters, event.resource || event.path);
   const caller = getCaller(event);
   const auth = await authorizeScope(scope, caller.sub, res);
   if (auth.res) return auth.res;
@@ -920,7 +1012,7 @@ export const updateDiscussion = async (event, res) => {
 
 export const redactMessage = async (event, res) => {
   const { discussionId, messageId } = event.pathParameters || {};
-  const scope = resolveScope(event.pathParameters);
+  const scope = resolveScope(event.pathParameters, event.resource || event.path);
   const caller = getCaller(event);
   const auth = await authorizeScope(scope, caller.sub, res);
   if (auth.res) return auth.res;
@@ -995,7 +1087,7 @@ export const redactMessage = async (event, res) => {
 
 export const markRead = async (event, res) => {
   const { discussionId } = event.pathParameters || {};
-  const scope = resolveScope(event.pathParameters);
+  const scope = resolveScope(event.pathParameters, event.resource || event.path);
   const caller = getCaller(event);
   const auth = await authorizeScope(scope, caller.sub, res);
   if (auth.res) return auth.res;
@@ -1021,7 +1113,7 @@ export const markRead = async (event, res) => {
 };
 
 export const searchDiscussions = async (event, res) => {
-  const scope = resolveScope(event.pathParameters);
+  const scope = resolveScope(event.pathParameters, event.resource || event.path);
   const auth = await authorizeScope(scope, getCaller(event).sub, res);
   if (auth.res) return auth.res;
 

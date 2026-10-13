@@ -89,6 +89,7 @@ const toolOf = (event) => {
 };
 
 export const createOpenCodeJsonlParser = ({
+  retainState = true,
   onText = () => {},
   onTool = () => {},
   onError = () => {},
@@ -112,7 +113,7 @@ export const createOpenCodeJsonlParser = ({
     try {
       event = JSON.parse(trimmed);
     } catch {
-      state.diagnostics.push(trimmed);
+      if (retainState) state.diagnostics.push(trimmed);
       onDiagnostic(trimmed);
       return;
     }
@@ -131,10 +132,10 @@ export const createOpenCodeJsonlParser = ({
       .replaceAll('-', '_')
       .toLowerCase();
     if ((type === 'text' || partType === 'text') && typeof part.text === 'string') {
-      state.text += part.text;
+      if (retainState) state.text += part.text;
       onText(part.text, event);
     } else if (type === 'text' && typeof event.text === 'string') {
-      state.text += event.text;
+      if (retainState) state.text += event.text;
       onText(event.text, event);
     }
 
@@ -148,7 +149,7 @@ export const createOpenCodeJsonlParser = ({
         ['error', 'failed'].includes(String(part?.state?.status ?? '').toLowerCase()))
     ) {
       const message = String(errorMessage(event));
-      state.errors.push(message);
+      if (retainState) state.errors.push(message);
       onError(message, event);
     }
 

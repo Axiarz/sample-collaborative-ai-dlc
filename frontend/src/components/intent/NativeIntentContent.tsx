@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArtifactViewer } from './ArtifactViewer';
 import { NativeInteractionPanel, useNativeReply } from './NativeInteractionPanel';
+import { useOptionalAuth } from '@/contexts/AuthContext';
+import { DiscussButton } from '@/components/discussion/DiscussButton';
+import { useDiscussions } from '@/components/discussion/DiscussionProvider';
+import { nativeArtifactRevisionId } from '@/lib/nativeCollaboration';
 import { GraphCanvas } from '@/components/graph/GraphCanvas';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -176,12 +180,23 @@ function NativePublicationContent({
   ]);
 
   const replyFailure = useCallback((err: unknown) => failed(err, generation.current), [failed]);
+  const auth = useOptionalAuth();
+  // Native threads have no pinned platform CLI; Quorum defaults to this run's
+  // harness CLI, resolved with the requesting member's own credential.
+  const discussions = useDiscussions();
+  const setAssistAgentCli = discussions?.setAssistAgentCli;
+  const assistAgentCli = discussions?.assistAgentCli ?? null;
+  const nativeDiscussions = discussions?.scope?.kind === 'native';
+  useEffect(() => {
+    if (nativeDiscussions && !assistAgentCli) setAssistAgentCli?.(intent.harness);
+  }, [nativeDiscussions, assistAgentCli, setAssistAgentCli, intent.harness]);
   const reply = useNativeReply({
     intent,
     interaction,
     scopeCurrent,
     onAccessFailure: replyFailure,
     onRefresh,
+    userName: auth?.user?.displayName || auth?.user?.email || '',
   });
 
   // Resolve the question from the committed manifest before showing any text.
@@ -341,6 +356,7 @@ function NativePublicationContent({
                 file={questionFile}
                 descriptor={publication.files.find((file) => file.id === questionFile.id)!}
                 createdAt={publication.createdAt}
+                publicationSequence={publication.sequence}
               />
               <Button variant="outline" onClick={() => openFile(questionFile.id)}>
                 View question file
@@ -386,6 +402,7 @@ function NativePublicationContent({
                       file={selectedFile}
                       descriptor={descriptor}
                       createdAt={publication.createdAt}
+                      publicationSequence={publication.sequence}
                     />
                   ) : (
                     <p className="text-sm">Loading file…</p>
@@ -435,15 +452,27 @@ function NativeFileView({
   file,
   descriptor,
   createdAt,
+  publicationSequence,
 }: {
   file: NativeFileContent;
   descriptor: NativePublishedFile;
   createdAt: string;
+  publicationSequence: number;
 }) {
   const markdown = file.mediaType.split(';')[0] === 'text/markdown' || /\.md$/i.test(file.path);
   return (
     <section className="min-w-0 space-y-2" aria-label={`File ${file.path}`}>
-      <h3 className="break-all text-sm font-medium">{file.path}</h3>
+      <div className="flex items-start gap-2">
+        <h3 className="min-w-0 flex-1 break-all text-sm font-medium">{file.path}</h3>
+        {/* Discussion and Quorum are bound to these exact verified bytes. */}
+        <DiscussButton
+          entityType="artifact"
+          entityId={nativeArtifactRevisionId(file.id, file.sha256)}
+          entityTitle={file.path}
+          publicationId={file.publicationId}
+          publicationSequence={publicationSequence}
+        />
+      </div>
       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
         <Badge variant="outline">{descriptor.role}</Badge>
         <span>

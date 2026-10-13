@@ -825,3 +825,19 @@ describe('renderIntentBlock + prompt placement', () => {
     expect(buildStagePrompt({ stage: stage(), stageBody: 'x' })).not.toContain('## The intent');
   });
 });
+
+describe('explicit no-bridge context (native Quorum)', () => {
+  const scope = { executionId: 'native-discussions-x', intentId: 'native-discussions-x', projectId: 'p1', role: 'reader' };
+  it('configures no aidlc bridge or custom servers for any CLI', () => {
+    expect(buildMcpConfig({ mcpEntry: null, scope, customServers: { other: { command: 'x' } } })).toEqual({ mcpServers: {} });
+    expect(buildKiroAgentConfig({ mcpEntry: null, scope }).mcpServers).toEqual({});
+    expect(buildOpenCodeConfig({ mcpEntry: null, scope }).mcp).toEqual({});
+    const toml = buildCodexConfigToml({ mcpEntry: null, scope });
+    expect(toml).toContain('model_provider = "amazon-bedrock"');
+    expect(toml).not.toContain('mcp_servers');
+  });
+  it('keeps the bridge for every ordinary entry point', () => {
+    expect(buildMcpConfig({ mcpEntry: '/opt/mcp/index.js', scope }).mcpServers).toHaveProperty('aidlc');
+    expect(buildCodexConfigToml({ mcpEntry: '/opt/mcp/index.js', scope })).toContain('[mcp_servers."aidlc"]');
+  });
+});

@@ -27,6 +27,9 @@ const api = vi.hoisted(() => ({
   graph: vi.fn(),
   list: vi.fn(),
 }));
+// Shared drafts: in-memory Yjs relay + textarea stand-in (see test/collaborationFakes).
+vi.mock('@/hooks/useYjsDocument', async () => await import('@/test/collaborationFakes'));
+vi.mock('@/components/CollaborativeTextarea', async () => await import('@/test/collaborationFakes'));
 vi.mock('@/services/nativeIntents', () => ({ nativeIntentsService: api }));
 // Native content must work without either platform provider, including markdown.
 vi.mock('@/contexts/IntentContext', () => ({
@@ -472,8 +475,6 @@ it('reloads committed files and graph and navigates from the graph into the nati
   expect(screen.getByText(/Current committed revision 1/)).toBeInTheDocument();
   for (const name of [
     'Start agent',
-    'Answer question',
-    'Approve',
     'Edit artifacts',
     'Create unit PR',
     'Delete intent',

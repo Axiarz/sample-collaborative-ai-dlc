@@ -16,6 +16,9 @@ const protectedTypes = new Set([
   'aws_s3_bucket',
   'aws_dynamodb_table',
   'aws_efs_file_system',
+  // Retained native runs pin immutable digests in this repository; dev uses
+  // force_delete, so destroying it would delete every still-required image.
+  'aws_ecr_repository',
 ]);
 
 const expectedRetirement = (change) => {

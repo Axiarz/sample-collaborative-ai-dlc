@@ -21,8 +21,8 @@ describe('shouldDefaultOpen', () => {
   it('returns false for new intent creation', () => {
     expect(shouldDefaultOpen('/space/p1/intent/new')).toBe(false);
   });
-  it('returns false for native preparation and creation routes', () => {
-    expect(shouldDefaultOpen('/space/p1/native-intent/i1')).toBe(false);
+  it('opens activity for native runs and leaves creation focused', () => {
+    expect(shouldDefaultOpen('/space/p1/native-intent/i1')).toBe(true);
     expect(shouldDefaultOpen('/space/p1/native-intent/new')).toBe(false);
   });
 
@@ -165,7 +165,7 @@ beforeEach(() => {
 });
 
 describe('AppShell panel default behavior', () => {
-  it('keeps native activity controls inert and preserves the platform section preference', async () => {
+  it('toggles native activity and preserves the platform section preference', async () => {
     localStorage.setItem('aidlc.intentSection.v2.i1', 'graph');
     renderAtRoute('/space/p1/native-intent/i1');
     await userEvent.click(screen.getByTestId('toggle-activity'));
@@ -174,12 +174,12 @@ describe('AppShell panel default behavior', () => {
     expect(screen.queryByTestId('activity-panel')).not.toBeInTheDocument();
     expect(localStorage.getItem('aidlc.intentSection.v2.i1')).toBe('graph');
   });
-  it('closes platform activity when navigating to a native intent with the same UUID', async () => {
+  it('keeps shared activity available when navigating to native', async () => {
     renderAtRoute('/space/p1/intent/i1');
     await screen.findByTestId('intent-activity-panel');
     await userEvent.click(screen.getByRole('link', { name: 'Open native status' }));
-    expect(screen.queryByTestId('intent-activity-panel')).not.toBeInTheDocument();
-    expect(screen.getByTestId('panel-state')).toHaveTextContent('closed');
+    expect(await screen.findByTestId('intent-activity-panel')).toBeInTheDocument();
+    expect(screen.getByTestId('panel-state')).toHaveTextContent('open');
   });
   it('opens panel on intent work root', async () => {
     renderAtRoute('/space/p1/intent/i1');

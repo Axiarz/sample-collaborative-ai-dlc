@@ -257,7 +257,14 @@ const scrubCustomMcpAuth = (customServers = {}) =>
 // validated + reserved-name-filtered upstream) are scrubbed and spread FIRST so
 // the reserved `aidlc` entry, written last, always wins a name collision — a
 // custom entry can never override the runtime bridge.
-export const buildMcpConfig = ({ mcpEntry, scope, env = {}, customServers = {} }) => ({
+//
+// `mcpEntry: null` is an explicit no-bridge context for surfaces that must see
+// only the context in their prompt (native Quorum): no `aidlc` graph/process
+// tools and no custom servers are configured.
+export const buildMcpConfig = ({ mcpEntry, scope, env = {}, customServers = {} }) =>
+  mcpEntry === null ? { mcpServers: {} } : buildBridgeMcpConfig({ mcpEntry, scope, env, customServers });
+
+const buildBridgeMcpConfig = ({ mcpEntry, scope, env = {}, customServers = {} }) => ({
   mcpServers: {
     ...scrubCustomMcpAuth(customServers),
     aidlc: {
@@ -425,7 +432,7 @@ export const buildOpenCodeConfig = ({
     $schema: 'https://opencode.ai/config.json',
     share: 'disabled',
     instructions,
-    mcp: { ...others, aidlc },
+    mcp: aidlc ? { ...others, aidlc } : others,
   };
 };
 
@@ -589,7 +596,7 @@ export const buildCodexConfigToml = ({
     env,
     customServers,
   }).mcpServers;
-  const mcpServers = { ...others, [MCP_SERVER_NAME]: aidlc };
+  const mcpServers = aidlc ? { ...others, [MCP_SERVER_NAME]: aidlc } : others;
   return [
     '# Materialized by the AI-DLC runtime — regenerated every stage run.',
     'model_provider = "amazon-bedrock"',

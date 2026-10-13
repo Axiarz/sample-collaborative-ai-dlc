@@ -90,6 +90,7 @@ describe('native completed-turn content', () => {
       kind: 'assistant_turn',
       harness: 'codex',
       publicationId: original.publicationId,
+      pendingInput: null,
       messages: original.messages,
       contentSha256: body.contentSha256,
       createdAt: body.createdAt,
@@ -275,5 +276,53 @@ describe('native completed-turn content', () => {
       code: 'NATIVE_INTERACTION_INVALID',
     });
     expect(stream.destroyed).toBe(true);
+  });
+});
+
+describe('task-3 structured pending input (schema v2)', () => {
+  const pendingInput = {
+    schemaVersion: 1,
+    kind: 'choice',
+    source: 'rendered-question',
+    stage: null,
+    questions: [
+      {
+        id: 'q1',
+        prompt: 'Approve, edit the grid, or reject?',
+        header: 'Proposal',
+        multiSelect: false,
+        options: [
+          { label: 'Approve', description: null },
+          { label: 'Reject', description: 'Discard the grid' },
+        ],
+      },
+    ],
+  };
+  it('binds the content hash to the exact options and returns them in the view', async () => {
+    const f = fixture();
+    const receipt = await f.interactions.write({ ...input(), pendingInput });
+    const body = await f.interactions.read(identity, receipt);
+    expect(body.schemaVersion).toBe(2);
+    expect(body.pendingInput).toEqual(pendingInput);
+    expect(body.contentSha256).toBe(hash(canonicalJson({ messages: input().messages, pendingInput })));
+    expect(nativeInteractionView(receipt, body).pendingInput).toEqual(pendingInput);
+  });
+  it('keeps free-text turns byte-compatible with v1', async () => {
+    const f = fixture();
+    const receipt = await f.interactions.write({ ...input(), pendingInput: null });
+    const body = await f.interactions.read(identity, receipt);
+    expect(body.schemaVersion).toBe(1);
+    expect(body).not.toHaveProperty('pendingInput');
+    expect(body.contentSha256).toBe(hash(canonicalJson(input().messages)));
+  });
+  it('refuses a tampered or invalid pending input', async () => {
+    const f = fixture();
+    await expect(f.interactions.write({ ...input(), pendingInput: { ...pendingInput, kind: 'vote' } })).rejects.toMatchObject({ code: 'NATIVE_INTERACTION_INVALID' });
+    const receipt = await f.interactions.write({ ...input(), pendingInput });
+    const key = [...f.objects.keys()][0];
+    const stored = JSON.parse(f.objects.get(key).toString());
+    stored.pendingInput.questions[0].options[0].label = 'Approve and merge';
+    f.objects.set(key, Buffer.from(canonicalJson(stored)));
+    await expect(f.interactions.read(identity, receipt)).rejects.toBeTruthy();
   });
 });

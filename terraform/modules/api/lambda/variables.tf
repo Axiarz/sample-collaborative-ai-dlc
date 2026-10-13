@@ -368,3 +368,8 @@ variable "runtime_compatibility_version" {
   description = "Protected runtime contract version"
   type        = string
 }
+
+variable "native_preparation_enabled" {
+  type = bool
+  default = false
+}

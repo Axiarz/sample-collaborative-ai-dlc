@@ -96,9 +96,24 @@ const INTENT_DOC_RE = new RegExp(
   `^intent-(?:sq|discussion|presence|review|artifact|draft)-(${UUID_PATTERN})(?:-.+)?$`,
 );
 const INTENT_CHANNEL_RE = new RegExp(`^intent:(${UUID_PATTERN})$`);
+// Native collaboration docs are keyed by the protected project/execution digest
+// (sha256 of JSON [projectId, executionId]); native IDs are only unique within a
+// project. A discussion doc needs the execution-wide `native-collab:` scope. A
+// reply draft needs its exact revision scope, minted only for the interaction
+// and turn that are currently awaiting a reply. See lambda/shared/native-realtime.js.
+const NATIVE_DISCUSSION_DOC_RE = /^native-discussion-([a-f0-9]{64})-disc-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const NATIVE_REPLY_DOC_RE = /^native-reply-([a-f0-9]{64})-([a-f0-9]{64})-([1-9][0-9]{0,15})$/;
+// Task-3 structured answer draft (QuestionEditor) for the same awaited turn.
+const NATIVE_ANSWER_DOC_RE = /^native-answer-([a-f0-9]{64})-([a-f0-9]{64})-([1-9][0-9]{0,15})$/;
 
 export const requiredScopeForYjsDoc = (docName) => {
   if (typeof docName !== 'string') return null;
+  const nativeDiscussion = NATIVE_DISCUSSION_DOC_RE.exec(docName);
+  if (nativeDiscussion) return `native-collab:${nativeDiscussion[1]}`;
+  const nativeReply = NATIVE_REPLY_DOC_RE.exec(docName);
+  if (nativeReply) return `native-reply:${nativeReply[1]}:${nativeReply[2]}:${nativeReply[3]}`;
+  const nativeAnswer = NATIVE_ANSWER_DOC_RE.exec(docName);
+  if (nativeAnswer) return `native-answer:${nativeAnswer[1]}:${nativeAnswer[2]}:${nativeAnswer[3]}`;
   const intent = INTENT_DOC_RE.exec(docName);
   if (intent) return `intent:${intent[1].toLowerCase()}`;
   const sprint = SPRINT_DOC_RE.exec(docName);

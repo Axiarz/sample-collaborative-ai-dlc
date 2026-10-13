@@ -10,6 +10,7 @@ locals {
     NATIVE_PACKAGES_BUCKET              = var.native_packages_bucket_name
   }
   execution_api_statements = [
+    { Sid = "ReadNativeOutputHistory", Effect = "Allow", Action = ["dynamodb:Query"], Resource = aws_dynamodb_table.bindings.arn },
     {
       # TransactWriteItems authorizes its constituent operations individually.
       # Get/Put on the authority table are already in the preparation API policy.
@@ -156,6 +157,8 @@ resource "aws_iam_role_policy" "execution_worker" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      { Sid = "NativeActivityConnections", Effect = "Allow", Action = ["dynamodb:Query"], Resource = "${var.connections_table_arn}/index/DocumentIdIndex" },
+      { Sid = "NotifyNativeActivity", Effect = "Allow", Action = ["execute-api:ManageConnections"], Resource = "${var.websocket_execution_arn}/*" },
       {
         Sid      = "NativeExecutionAuthority"
         Effect   = "Allow"
@@ -371,15 +374,8 @@ module "execution_credentials" {
   lambda_role            = aws_iam_role.execution_credentials[0].arn
   vpc_subnet_ids         = var.api_subnet_ids
   vpc_security_group_ids = var.api_security_group_ids
-  source_path = [{
-    path     = local.source_path
-    patterns = ["!.build/.*"]
-    commands = [
-      "cd ../.. && npm run build:execution-credentials -w native-runtime-control",
-      ":zip lambda/native-runtime-control/.build/execution-credentials",
-    ]
-  }]
-  hash_extra = sha256("${local.source_hash}:${filesha256("${path.module}/../../../../package-lock.json")}")
+  create_package         = false
+  local_existing_package = module.packages["execution-credentials"].local_filename
   environment_variables = merge(local.execution_environment, {
     NATIVE_RUNTIME_BINDINGS_TABLE      = aws_dynamodb_table.bindings.name
     NATIVE_RUNTIME_ACCOUNT_ID          = local.account_id
@@ -428,15 +424,8 @@ module "execution_worker" {
   lambda_role            = aws_iam_role.execution_worker[0].arn
   vpc_subnet_ids         = var.api_subnet_ids
   vpc_security_group_ids = var.api_security_group_ids
-  source_path = [{
-    path     = local.source_path
-    patterns = ["!.build/.*"]
-    commands = [
-      "cd ../.. && npm run build:execution-worker -w native-runtime-control",
-      ":zip lambda/native-runtime-control/.build/execution-worker",
-    ]
-  }]
-  hash_extra = sha256("${local.source_hash}:${filesha256("${path.module}/../../../../package-lock.json")}")
+  create_package         = false
+  local_existing_package = module.packages["execution-worker"].local_filename
   environment_variables = merge(local.base_environment, local.execution_environment, {
     NEPTUNE_ENDPOINT                      = var.neptune_endpoint
     WORKFLOW_SOURCE_BINDINGS_TABLE        = var.workflow_source_bindings_table_name
@@ -444,6 +433,8 @@ module "execution_worker" {
     SOURCE_CONTROL_BINDINGS_TABLE         = var.source_control_bindings_table_name
     NATIVE_EXECUTION_QUEUE_URL            = aws_sqs_queue.execution[0].url
     NATIVE_EXECUTION_CREDENTIALS_FUNCTION = module.execution_credentials[0].lambda_function_arn
+    CONNECTIONS_TABLE                    = var.connections_table_name
+    WEBSOCKET_ENDPOINT                   = var.websocket_endpoint
     POWERTOOLS_LOGGER_LOG_EVENT           = "false"
   })
   cloudwatch_logs_retention_in_days = 7

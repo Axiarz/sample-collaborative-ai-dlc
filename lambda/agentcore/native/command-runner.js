@@ -166,6 +166,8 @@ export const runNativeCommand = async (options) => {
     let timeout;
     let cleanupTimeout;
     let poll;
+    let pressure = null;
+    let drainingPressure = null;
 
     const groupGone = () => {
       if (pid === undefined) return true; // spawn failed before obtaining a PID
@@ -220,7 +222,19 @@ export const runNativeCommand = async (options) => {
 
     const cleanup = () => {
       if (finished || cleaning) return;
+      if (exited && pressure && !input.signal?.aborted && !result.timedOut && !result.spawnError) {
+        // A normally exited producer may still have buffered stdout. Preserve
+        // its observer's persistence backpressure before the cleanup deadline.
+        if (drainingPressure !== pressure) {
+          drainingPressure = pressure;
+          Promise.resolve(pressure).then(cleanup, () => { result.spawnError ??= 'IO_ERROR'; cleanup(); });
+        }
+        return;
+      }
       cleaning = true;
+      // A blocked observer must not prevent draining/closing a killed child.
+      pressure = null;
+      child?.stdout?.resume();
       clearTimeout(timeout);
       cleanupTimeout = setTimeout(() => finish(false), NATIVE_COMMAND_LIMITS.cleanupMs);
       let groupSignalled = false;
@@ -246,7 +260,23 @@ export const runNativeCommand = async (options) => {
       try {
         // The observer sees every chunk, independently of the private capture
         // prefix. It must retain its own bounded projection, never raw output.
-        input.onStdoutChunk?.(chunk);
+        const pending = input.onStdoutChunk?.(chunk);
+        if (pending && typeof pending.then === 'function') {
+          pressure = pending;
+          child.stdout.pause();
+          Promise.resolve(pending).then(
+            () => {
+              if (pressure !== pending || finished) return;
+              pressure = null;
+              child.stdout.resume();
+            },
+            () => {
+              if (pressure !== pending || finished) return;
+              result.spawnError ??= 'IO_ERROR';
+              cleanup();
+            },
+          );
+        }
       } catch {
         result.spawnError ??= 'IO_ERROR';
         cleanup();

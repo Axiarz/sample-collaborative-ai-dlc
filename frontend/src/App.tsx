@@ -43,7 +43,6 @@ const WorkflowList = lazy(() => import('./pages/WorkflowList'));
 const WorkflowComposer = lazy(() => import('./pages/WorkflowComposer'));
 const NewIntentPage = lazy(() => import('./pages/NewIntentPage'));
 const NewNativeIntentPage = lazy(() => import('./pages/NewNativeIntentPage'));
-const NativeIntentPage = lazy(() => import('./pages/NativeIntentPage'));
 const IntentComposePage = lazy(() => import('./pages/IntentComposePage'));
 const IntentObservabilityPage = lazy(() => import('./pages/IntentObservabilityPage'));
 const IntentGraphPage = lazy(() => import('./pages/IntentGraphPage'));
@@ -139,7 +138,7 @@ function App() {
                   />
                   <Route
                     path="/space/:projectId/native-intent/:intentId"
-                    element={<NativeIntentPage />}
+                    element={<IntentView />}
                   />
                   <Route
                     path="/space/:projectId/intent/:intentId/compose"

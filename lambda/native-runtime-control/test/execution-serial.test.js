@@ -253,3 +253,138 @@ describe('serial native interaction authority', () => {
     });
   });
 });
+
+describe('task-2 accepted answer attribution and revocation races', () => {
+  const member = { membershipId: 'edge-accepting', projectIdentity: 'vertex-project' };
+
+  it('freezes the accepting membership snapshot and presented publication with the answer', async () => {
+    const f = await waiting();
+    const presented = f.row().interaction.publicationId;
+    const request = f.replyRequest({ text: 'Use green pipes.' });
+    await f.api.respond(f.prepared, 'member-one', request, f.recheck, member);
+    const ledger = await f.store.response(f.row(), request.interactionId);
+    expect(ledger).toMatchObject({ actorId: 'member-one', member, publicationId: presented, text: 'Use green pipes.' });
+    // The execution pointer keeps its established shape for retained runs.
+    expect(f.row().response).not.toHaveProperty('member');
+    expect(f.row().response).not.toHaveProperty('publicationId');
+    // The idempotent retry returns the same attributed command.
+    const retry = await f.api.respond(f.prepared, 'member-one', request, f.recheck, member);
+    expect(retry.response.id).toBe(ledger.commandId);
+  });
+
+  it('keeps earlier unattributed ledgers valid for retained runs', async () => {
+    const f = await waiting();
+    const request = f.replyRequest();
+    await f.respond(request);
+    const ledger = await f.store.response(f.row(), request.interactionId);
+    expect(ledger).not.toHaveProperty('member');
+    expect(ledger.text).toBe(request.text);
+  });
+
+  it('rejects a malformed membership snapshot before writing anything', async () => {
+    const f = await waiting();
+    const writes = [];
+    f.hooks.before = (command) => {
+      if (command instanceof TransactWriteCommand) writes.push(command);
+    };
+    await expect(
+      f.store.respond({ ...f.bindingIdentity, actorId: 'member-one', request: f.replyRequest(), member: { membershipId: '' , projectIdentity: 'v' } }),
+    ).rejects.toBeTruthy();
+    await expect(
+      f.store.respond({ ...f.bindingIdentity, actorId: 'member-one', request: f.replyRequest(), member: { membershipId: 'e', projectIdentity: 'v', role: 'owner' } }),
+    ).rejects.toBeTruthy();
+    expect(writes).toHaveLength(0);
+    expect(f.row().status).toBe('AWAITING_USER');
+  });
+
+  it('queues the one continuation of an accepted answer even when membership is revoked mid-request', async () => {
+    const f = await waiting();
+    const request = f.replyRequest();
+    f.hooks.after = (command) => {
+      if (executionPut(command)?.response) {
+        delete f.hooks.after;
+        f.authorization.member = false;
+      }
+    };
+    await expect(f.api.respond(f.prepared, 'member-one', request, f.recheck, member)).rejects.toMatchObject({
+      code: 'NATIVE_PREPARATION_FORBIDDEN',
+    });
+    // Accepted exactly once; its continuation is queued, not stranded, and the
+    // revoked caller receives no result.
+    expect(f.row()).toMatchObject({ status: 'DISPATCHING', turnSequence: 2 });
+    expect(f.enqueue).toHaveBeenCalledTimes(1);
+    f.authorization.member = true;
+    const ledger = await f.store.response(f.row(), request.interactionId);
+    expect(ledger.member).toEqual(member);
+  });
+});
+
+describe('task-3 structured answers', () => {
+  const pendingInput = {
+    schemaVersion: 1,
+    kind: 'approval',
+    source: 'engine-gate',
+    stage: 'requirements-analysis',
+    questions: [
+      {
+        id: 'q1',
+        prompt: 'Requirements complete. How would you like to proceed?',
+        header: 'Approval',
+        multiSelect: false,
+        options: [
+          { label: 'Approve', description: 'Continue to user stories' },
+          { label: 'Request Changes', description: 'Provide revision feedback' },
+        ],
+      },
+    ],
+  };
+  const gated = () => waiting({ pendingInput, text: 'Requirements complete.\n1. **Approve**\n2. **Request Changes**' });
+
+  it('accepts a selection whose text is the exact label and records both', async () => {
+    const f = await gated();
+    const request = f.replyRequest({ text: 'Approve', selection: { answers: [{ selectedOptions: [0] }] } });
+    const accepted = await f.api.respond(f.prepared, 'member-one', request, f.recheck);
+    expect(accepted.response.text).toBe('Approve');
+    const ledger = await f.store.response(f.row(), request.interactionId);
+    expect(ledger.selection).toEqual({ answers: [{ selectedOptions: [0] }] });
+    // Same frozen request is idempotent; a different selection is a conflict.
+    expect((await f.api.respond(f.prepared, 'member-one', request, f.recheck)).response.id).toBe(ledger.commandId);
+    await expect(
+      f.api.respond(f.prepared, 'member-one', { ...request, selection: { answers: [{ selectedOptions: [1], freeText: 'x' }] } }, f.recheck),
+    ).rejects.toMatchObject({ code: 'NATIVE_EXECUTION_CONFLICT' });
+  });
+
+  it('accepts request-changes feedback rendered after the label', async () => {
+    const f = await gated();
+    const selection = { answers: [{ selectedOptions: [1], freeText: 'Add offline mode.' }] };
+    const request = f.replyRequest({ text: 'Request Changes\n\nAdd offline mode.', selection });
+    expect((await f.api.respond(f.prepared, 'member-one', request, f.recheck)).response.text).toBe(
+      'Request Changes\n\nAdd offline mode.',
+    );
+  });
+
+  it('rejects selections that disagree with the text or the presented question', async () => {
+    const f = await gated();
+    for (const [text, selection] of [
+      ['1', { answers: [{ selectedOptions: [0] }] }],
+      ['Approve', { answers: [{ selectedOptions: [1] }] }],
+      ['Approve', { answers: [{ selectedOptions: [7] }] }],
+      ['Approve', { answers: [{ selectedOptions: [0] }, { selectedOptions: [0] }] }],
+    ]) {
+      await expect(
+        f.api.respond(f.prepared, 'member-one', f.replyRequest({ text, selection }), f.recheck),
+      ).rejects.toMatchObject({ code: 'NATIVE_EXECUTION_INVALID' });
+    }
+    expect(f.row().status).toBe('AWAITING_USER');
+    // Free text remains a valid reply to a structured question.
+    const free = await f.api.respond(f.prepared, 'member-one', f.replyRequest({ text: 'Please explain the scope first.' }), f.recheck);
+    expect(free.response.text).toBe('Please explain the scope first.');
+  });
+
+  it('rejects any selection on a free-text (v1) turn', async () => {
+    const f = await waiting();
+    await expect(
+      f.api.respond(f.prepared, 'member-one', f.replyRequest({ text: 'Approve', selection: { answers: [{ selectedOptions: [0] }] } }), f.recheck),
+    ).rejects.toMatchObject({ code: 'NATIVE_EXECUTION_INVALID' });
+  });
+});

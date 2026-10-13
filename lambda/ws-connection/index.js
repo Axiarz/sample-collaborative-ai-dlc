@@ -15,6 +15,7 @@ import {
   isTokenLive,
 } from '../shared/realtime-token.js';
 import { Logger } from '@aws-lambda-powertools/logger';
+import { requiredNativeScopeForChannel } from '../shared/native-realtime.js';
 
 const logger = new Logger({ persistentKeys: { component: 'ws-connection' } });
 
@@ -58,7 +59,7 @@ export const handler = async (event, context) => {
     const access = verifyRealtimeAccess({
       token: docToken,
       secret: await getSecret(),
-      requiredScope: requiredScopeForChannel(documentId),
+      requiredScope: requiredNativeScopeForChannel(documentId) ?? requiredScopeForChannel(documentId),
       sub: event.requestContext.authorizer?.userId,
     });
     if (!access.ok) {

@@ -277,6 +277,8 @@ export const createNativeTurnOutput = ({
   };
   const parser = createProjectionParser((event) => {
     if (!event || typeof event !== 'object' || Array.isArray(event)) invalid();
+    // Incremental ACP presentation is independent of the final interaction record.
+    if (harness === 'kiro' && event.transport === 'kiro-acp-activity' && event.schemaVersion === 1) return;
     for (const value of [
       event.thread_id,
       event.session_id,
@@ -297,7 +299,11 @@ export const createNativeTurnOutput = ({
       invalid('terminal');
     }
     if (harness === 'codex') {
-      if (event.type === 'error' || event.type === 'turn.failed') invalid('failed');
+      // Codex 0.145 emits `error` for every server error notification,
+      // including retried stream disconnects ("Reconnecting... 1/5"), and keeps
+      // running. Only the turn's final status decides: `turn.failed` (or no
+      // `turn.completed`, for an interrupted turn) is never a completed turn.
+      if (event.type === 'turn.failed') invalid('failed');
       if (event.type === 'turn.started') {
         if (started) invalid('terminal');
         started = true;

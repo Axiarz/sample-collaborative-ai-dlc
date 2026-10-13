@@ -128,6 +128,7 @@ const toolOf = (item, event) => {
 };
 
 export const createCodexJsonlParser = ({
+  retainState = true,
   onText = () => {},
   onTool = () => {},
   onError = () => {},
@@ -151,7 +152,7 @@ export const createCodexJsonlParser = ({
     try {
       event = JSON.parse(trimmed);
     } catch {
-      state.diagnostics.push(trimmed);
+      if (retainState) state.diagnostics.push(trimmed);
       onDiagnostic(trimmed);
       return;
     }
@@ -168,7 +169,7 @@ export const createCodexJsonlParser = ({
       const item = event?.item ?? {};
       const itemType = String(item?.type ?? '');
       if (itemType === 'agent_message' && typeof item.text === 'string') {
-        state.text += item.text;
+        if (retainState) state.text += item.text;
         onText(item.text, event);
         return;
       }
@@ -181,7 +182,7 @@ export const createCodexJsonlParser = ({
       // hidden context, not user-facing messages.
       const summary =
         typeof item.text === 'string' ? `${itemType}: ${item.text}` : JSON.stringify(item);
-      state.diagnostics.push(summary);
+      if (retainState) state.diagnostics.push(summary);
       onDiagnostic(summary);
       return;
     }
@@ -197,7 +198,7 @@ export const createCodexJsonlParser = ({
 
     if (type === 'turn.failed' || type === 'error') {
       const message = String(errorMessage(event));
-      state.errors.push(message);
+      if (retainState) state.errors.push(message);
       onError(message, event);
       return;
     }

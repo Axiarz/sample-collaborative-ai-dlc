@@ -1,5 +1,6 @@
 import { api, ApiError } from './api';
 import type { AgentCli } from './projects';
+import { nativeDiscussionRootId } from '../lib/nativeCollaboration';
 
 // Discussions service — typed client for lambda/discussions.
 //
@@ -34,18 +35,38 @@ export type DiscussionEntityType =
 // v1 sprint discussions are READ-ONLY: the backend keeps list/messages/search
 // + the read-state PUT, but the write routes (thread create, post, resolve,
 // redact) only exist for the intent scope.
+//
+// Native executions have their own routes and protected ownership. `digest` is
+// the project/execution collaboration digest (lib/nativeCollaboration.ts); it
+// keys the thread root and Yjs documents so a reused ID never shares threads.
 export type DiscussionScope =
   | { kind: 'sprint'; sprintId: string }
-  | { kind: 'intent'; projectId: string; intentId: string };
+  | { kind: 'intent'; projectId: string; intentId: string }
+  | { kind: 'native'; projectId: string; intentId: string; digest: string };
 
 export const discussionBasePath = (scope: DiscussionScope): string =>
   scope.kind === 'intent'
     ? `/projects/${scope.projectId}/intents/${scope.intentId}`
-    : `/sprints/${scope.sprintId}`;
+    : scope.kind === 'native'
+      ? `/projects/${scope.projectId}/native-intents/${scope.intentId}`
+      : `/sprints/${scope.sprintId}`;
 
-// The scope root id (sprintId | intentId) — used as the realtime/channel key.
+// The scope root id (sprintId | intentId | native root) — the `sprintId` DTO key.
 export const discussionScopeId = (scope: DiscussionScope): string =>
-  scope.kind === 'intent' ? scope.intentId : scope.sprintId;
+  scope.kind === 'intent'
+    ? scope.intentId
+    : scope.kind === 'native'
+      ? nativeDiscussionRootId(scope.digest)
+      : scope.sprintId;
+
+/** The exact verified revision a native artifact thread discusses. */
+export interface DiscussionRevision {
+  fileId: string;
+  path: string;
+  sha256: string;
+  publicationId: string;
+  publicationSequence: number;
+}
 
 export interface Discussion {
   id: string;
@@ -66,6 +87,7 @@ export interface Discussion {
   lastMessageAt: string;
   messageCount?: number;
   unreadCount?: number;
+  revision?: DiscussionRevision;
 }
 
 export interface DiscussionMessage {
@@ -137,7 +159,14 @@ export const discussionsService = {
 
   getOrCreate: (
     scope: DiscussionScope,
-    input: { entityType: DiscussionEntityType; entityId?: string; entityTitle?: string },
+    input: {
+      entityType: DiscussionEntityType;
+      entityId?: string;
+      entityTitle?: string;
+      // Native artifact threads: the publication that contains the revision.
+      publicationId?: string;
+      publicationSequence?: number;
+    },
   ) =>
     withTransparentRetry(() =>
       api.post<Discussion>(`${discussionBasePath(scope)}/discussions`, input),
@@ -193,7 +222,7 @@ export const discussionsService = {
       agentCli?: AgentCli;
     },
   ) => {
-    if (scope.kind !== 'intent') {
+    if (scope.kind === 'sprint') {
       return Promise.reject(
         new Error('Discussion assist is only available for v2 intent discussions'),
       );

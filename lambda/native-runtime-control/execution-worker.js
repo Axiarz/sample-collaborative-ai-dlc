@@ -35,6 +35,10 @@ import { nativeFileExclusion } from '../shared/native-project-files.js';
 import { createWorkflowSourceService } from '../shared/workflow-source-service.js';
 import { fetchWorkflowSourceMembership } from '../shared/workflow-source-membership.js';
 import { projectNativePublication, readNativePublicationInteraction } from './publication-graph.js';
+import { createNativeRuntimeImagePolicy } from './runtime-images.js';
+import { createNativeActivityStore } from './activity-store.js';
+import { recordNativeBoundary } from '../shared/native-lifecycle.js';
+import { broadcastToNativeIntentChannel } from '../shared/ws-fanout.js';
 import {
   createNativeExecutionDiagnostics,
   emitNativeExecutionDiagnostic,
@@ -196,6 +200,7 @@ const phaseError = (error) => {
     return 'native_execution_publication_invalid';
   if (['WORKFLOW_SOURCE_FORBIDDEN', 'NATIVE_EXECUTION_FORBIDDEN'].includes(error?.code))
     return 'native_execution_access_denied';
+  if (error?.code === 'NATIVE_EXECUTION_IMAGE_REVOKED') return 'native_execution_image_revoked';
   if (
     [
       'WORKFLOW_SOURCE_CONFLICT',
@@ -210,6 +215,7 @@ const checkedCredentials = (row, material) => {
   if (!material?.ok) {
     const code = material?.code;
     if (code === 'NATIVE_EXECUTION_CREDENTIALS_FORBIDDEN') fail('NATIVE_EXECUTION_FORBIDDEN');
+    if (code === 'NATIVE_EXECUTION_CREDENTIALS_IMAGE_REVOKED') fail('NATIVE_EXECUTION_IMAGE_REVOKED');
     if (
       [
         'NATIVE_EXECUTION_CREDENTIALS_CHANGED',
@@ -251,6 +257,8 @@ export const createNativeExecutionSupervisor =
     project,
     fence,
     diagnostics,
+    imagePolicy,
+    activity,
     now = Date.now,
   }) =>
   async (identity) => {
@@ -264,8 +272,29 @@ export const createNativeExecutionSupervisor =
     const observe = (value) => emitNativeExecutionDiagnostic(diagnostics, value);
     const observedInvoke = async (input) => {
       const phase = nativeDiagnosticPhase(input.payload.command);
+      if (['native-start','native-continue','native-recover'].includes(input.payload.command)) recordNativeBoundary(executionIdentity(row),'dispatchStarted',now(),{sequence:nativeTurnSequence(row),writerGeneration:nativeWriterGeneration(row)});
       try {
         const report = await invoke(input);
+        if (activity && input.payload.command === 'native-status' && report?.capabilities?.includes('activity-v1')) {
+          checkReportIdentity(row, report);
+          let after = await activity.cursor(row);
+          for (let page = 0; page < 4; page++) {
+            await check();
+            const batch = await invoke({ execution: row, payload: {
+              command: 'native-activity', ...writerPayload(row), after,
+            } });
+            const persisted = await activity.ingest(row, batch);
+            // The next pull is the acknowledgment; this cursor exists only
+            // after persistence. A failed transaction leaves the prior cursor.
+            if (persisted === after && !batch.events?.length) {
+              if (!batch.complete && ['publication_ready','failed','cancelled','stopped_needs_review'].includes(report.status))
+                throw Object.assign(new Error('Final native activity pending'), { code: batch.cold ? 'NATIVE_ACTIVITY_UNCLOSED' : 'NATIVE_ACTIVITY_PENDING' });
+              break;
+            }
+            after = persisted;
+            if (page === 3) throw Object.assign(new Error('Native activity catch-up pending'), { code: 'NATIVE_ACTIVITY_PENDING' });
+          }
+        }
         observation = { phase, ...nativeDiagnosticReport(row, report) };
         observe({ ...observation, stage: 'report', code: 'REPORT_OBSERVED' });
         return report;
@@ -430,6 +459,21 @@ export const createNativeExecutionSupervisor =
         return { pending: false, status: 'CANCELLED' };
       }
       await check();
+      // An administrator revocation fences active execution before any status
+      // read, dispatch or recovery step. Committed results stay readable and a
+      // pending graph projection of already-published content still completes.
+      if (
+        imagePolicy &&
+        ['REQUESTED', 'UPGRADING', 'DISPATCHING', 'RUNNING', 'RECOVERING'].includes(row.status) &&
+        (await imagePolicy.revocation(row.configuration.image.digest))
+      ) {
+        observe({ stage: 'decision', code: 'IMAGE_REVOKED', controlStatus: row.status });
+        await current();
+        await fence.cancel(executionIdentity(row));
+        await stop({ draft, execution: row });
+        await advance({ status: 'FAILED', failureCode: 'native_execution_image_revoked' });
+        return { pending: false, status: 'FAILED', failureCode: 'native_execution_image_revoked' };
+      }
       if (['DISPATCHING', 'RUNNING', 'RECOVERING'].includes(row.status) && fence.read) {
         let savedFence;
         try {
@@ -463,6 +507,7 @@ export const createNativeExecutionSupervisor =
           interactions,
         });
         await check();
+        recordNativeBoundary(executionIdentity(row),'graphStarted',now());
         await project({
           draft,
           publication: row.publication,
@@ -470,6 +515,7 @@ export const createNativeExecutionSupervisor =
           interaction,
           authorize: check,
         });
+        recordNativeBoundary(executionIdentity(row),'graphCompleted',now());
         row = await store.projected({ row });
         return {
           pending: ['DISPATCHING', 'RUNNING', 'RECOVERING'].includes(row.status),
@@ -483,7 +529,10 @@ export const createNativeExecutionSupervisor =
       if (row.status === 'UPGRADING') {
         if (!row.target) {
           const result = await upgrade({ draft, execution: row, authorize: check });
-          if (result.ready) await advance({ target: result.target });
+          if (result.ready) {
+            recordNativeBoundary(executionIdentity(row),'targetReady',now());
+            await advance({ target: result.target });
+          }
           return yieldPending();
         }
         const material = checkedCredentials(row, await credentials(row));
@@ -787,6 +836,8 @@ export const createNativeExecutionSupervisor =
           /* A changed/cancelled owner wins. Retain its durable record. */
         }
       }
+      if (error?.code === 'NATIVE_ACTIVITY_UNCLOSED') return requireRecovery('DELIVERY_UNCERTAIN');
+      if (['NATIVE_ACTIVITY_PENDING', 'NATIVE_ACTIVITY_CONFLICT'].includes(error?.code)) return yieldPending();
       if (shortTransportRetry(error)) {
         // SDK transport uncertainty retains the same attempt/session. Release
         // and send a fresh short-delay pointer instead of waiting for the long
@@ -1033,6 +1084,12 @@ export const createNativeExecutionWorker =
           publications,
           interactions,
           diagnostics,
+          activity: createNativeActivityStore({ ddb, tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE, broadcast: broadcastToNativeIntentChannel }),
+          imagePolicy: createNativeRuntimeImagePolicy({
+            ddb,
+            tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE,
+            env,
+          }),
           checkpoints: createNativeRecoveryCheckpoints({
             s3,
             bucket: env.NATIVE_EXECUTION_PUBLICATION_BUCKET,

@@ -239,7 +239,10 @@ describe('published assistant turn contract', () => {
       nativeSessionId: 'private',
       transcript: ['secret'],
     });
-    expect(await nativeIntentsService.interaction('project-1', 'run-1')).toEqual(interaction);
+    expect(await nativeIntentsService.interaction('project-1', 'run-1')).toEqual({
+      ...interaction,
+      pendingInput: null,
+    });
     expect(get).toHaveBeenCalledWith('/projects/project-1/native-intents/run-1/interaction');
   });
   it('restores the separately protected reply, bound to the displayed interaction', async () => {
@@ -359,5 +362,64 @@ describe('ordinary reply contract', () => {
       edges: [],
     });
     await expect(nativeIntentsService.graph('project-1', 'run-1')).rejects.toThrow();
+  });
+});
+
+describe('task-3 structured question contract', () => {
+  const pendingInput = {
+    schemaVersion: 1,
+    kind: 'approval',
+    source: 'engine-gate',
+    stage: 'requirements-analysis',
+    questions: [
+      {
+        id: 'q1',
+        prompt: 'Requirements complete. How would you like to proceed?',
+        header: 'Approval',
+        multiSelect: false,
+        options: [
+          { label: 'Approve', description: 'Continue to user stories' },
+          { label: 'Request Changes', description: null },
+        ],
+      },
+    ],
+  };
+  // Mirrors the server: sorted-key canonical JSON over messages and the question.
+  const canonical = (value: unknown): string =>
+    Array.isArray(value)
+      ? `[${value.map(canonical).join(',')}]`
+      : value && typeof value === 'object'
+        ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(',')}}`
+        : JSON.stringify(value);
+  const v2 = {
+    ...interaction,
+    pendingInput,
+    contentSha256: createHash('sha256').update(canonical({ messages, pendingInput })).digest('hex'),
+  };
+  it('verifies the digest over messages and the exact presented options', async () => {
+    get.mockResolvedValue(v2);
+    expect((await nativeIntentsService.interaction('project-1', 'run-1')).pendingInput).toEqual(pendingInput);
+  });
+  it('rejects options changed after the digest was computed', async () => {
+    const tampered = structuredClone(v2);
+    tampered.pendingInput.questions[0].options[0].label = 'Approve and merge';
+    get.mockResolvedValue(tampered);
+    await expect(nativeIntentsService.interaction('project-1', 'run-1')).rejects.toThrow();
+  });
+  it('sends the selection alongside its exact label text', async () => {
+    post.mockResolvedValue({
+      executionAvailable: true,
+      execution: { status: 'DISPATCHING', attemptId: 'attempt-1', epoch: 1, startedAt: '2026-09-29T11:50:00Z', updatedAt: '2026-09-29T12:00:00Z', model: 'm', repository: { provider: 'github', repository: 'o/r', branch: 'main', commit: 'abc' }, publicationId: 'pub-1', interactionId: interaction.id, turnSequence: 2, responsePending: true },
+      response: { ...response, text: 'Approve' },
+    });
+    const selection = { answers: [{ selectedOptions: [0] }] };
+    await nativeIntentsService.respond('project-1', 'run-1', { ...request, contentSha256: v2.contentSha256, text: 'Approve', selection }).catch(() => undefined);
+    expect(post).toHaveBeenCalledWith('/projects/project-1/native-intents/run-1/response', {
+      requestId: request.requestId,
+      interactionId: interaction.id,
+      contentSha256: v2.contentSha256,
+      text: 'Approve',
+      selection,
+    });
   });
 });

@@ -17,6 +17,7 @@ const CODES = new Set([
   'RECOVERY_REQUIRED',
   'RUNTIME_TERMINAL',
   'STATUS_READ_RETRY',
+  'IMAGE_REVOKED',
 ]);
 const READ_FAILURES = new Set([
   'SDK_FAILURE',
@@ -56,6 +57,14 @@ const RUNTIME_CODES = new Set([
   'native_execution_recovery_failed',
   'native_execution_cancelled',
   'native_execution_command_failed',
+  // Harness output contract failures (agentcore/native/turn-output.js).
+  'native_execution_output_invalid',
+  'native_execution_output_failed',
+  'native_execution_output_incomplete',
+  'native_execution_output_terminal',
+  'native_execution_output_session',
+  'native_execution_output_credential',
+  'native_execution_output_limit',
   'native_execution_directory_changed',
   'native_execution_request_invalid',
   'native_execution_busy',
@@ -90,6 +99,7 @@ const ERROR_CODES = new Set([
   'NATIVE_EXECUTION_FENCE_INVALID',
   'NATIVE_EXECUTION_FENCE_CONFLICT',
   'NATIVE_EXECUTION_CREDENTIALS_UNAVAILABLE',
+  'NATIVE_EXECUTION_IMAGE_REVOKED',
   'NATIVE_EXECUTION_RETRY',
   'NATIVE_RECOVERY_INVALID',
   'NATIVE_RECOVERY_MISSING',

@@ -12,6 +12,7 @@ import {
   sortMessages,
 } from '../lib/discussion';
 import { generateColor } from '../utils/colors';
+import { nativeDiscussionDocument } from '../lib/nativeCollaboration';
 
 // Core discussion hook.
 //
@@ -53,7 +54,9 @@ const toPlain = (m: DiscussionMessage): DiscussionMessage => ({ ...m });
 const discussionDocId = (scope: DiscussionScope, discussionId: string): string =>
   scope.kind === 'intent'
     ? `intent-discussion-${scope.intentId}-${discussionId}`
-    : `discussion-${scope.sprintId}-${discussionId}`;
+    : scope.kind === 'native'
+      ? nativeDiscussionDocument(scope.digest, discussionId)
+      : `discussion-${scope.sprintId}-${discussionId}`;
 
 export function useDiscussion({
   scope,
@@ -67,7 +70,9 @@ export function useDiscussion({
     ? undefined
     : scope.kind === 'intent'
       ? { intentId: scope.intentId, projectId: scope.projectId }
-      : { sprintId: scope.sprintId };
+      : scope.kind === 'native'
+        ? { intentId: scope.intentId, projectId: scope.projectId, executionBackend: 'native' as const }
+        : { sprintId: scope.sprintId };
   const { doc, synced, awareness, remoteUsers } = useYjsDocument(
     docId,
     user.name,
@@ -276,7 +281,7 @@ export function useDiscussion({
       instructions = '',
       opts: { requestId?: string; selectedMessageIds?: string[] } = {},
     ) => {
-      if (!discussionId || !scope || scope.kind !== 'intent') return;
+      if (!discussionId || !scope || scope.kind === 'sprint') return;
       const requestId = opts.requestId || makeAssistRequestId();
       try {
         const { message } = await discussionsService.assist(scope, discussionId, {
