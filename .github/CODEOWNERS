@@ -1,10 +1,1 @@
 * @leandrodamascena @svozza @eipasteur @JWThewes @jeromevdl
-
-# Native architecture, replay and authority changes require scoped review.
-/architecture/ @JWThewes @jeromevdl
-/lambda/native-runtime-control/ @JWThewes @jeromevdl
-/lambda/agentcore/native/ @JWThewes @jeromevdl
-/terraform/modules/compute/native-runs/ @JWThewes @jeromevdl
-/lambda/shared/v2-process-store.js @JWThewes @jeromevdl
-/lambda/agentcore/commands/run-stage.js @JWThewes @jeromevdl
-/lambda/v2-orchestrator/ @JWThewes @jeromevdl

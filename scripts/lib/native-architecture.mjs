@@ -156,39 +156,3 @@ export const checkArchitecture = (files, manifest, baseline) => {
   }
   return errors;
 };
-
-export const semanticReviewRequired = (files) =>
-  files.some(
-    (file) =>
-      /^(architecture\/|\.github\/(CODEOWNERS|workflows\/native-architecture)|lambda\/native-runtime-control\/|lambda\/agentcore\/native\/|lambda\/shared\/native-|terraform\/modules\/compute\/native-runs\/|docs\/development\/native-(architecture|compatibility)|scripts\/.*native-(architecture|dependencies))/.test(
-        file,
-      ) ||
-      [
-        'lambda/shared/v2-process-store.js',
-        'lambda/agentcore/commands/run-stage.js',
-        'lambda/v2-orchestrator/index.js',
-        'lambda/intents/index.js',
-        'lambda/shared/native-execution-fence.js',
-        'lambda/shared/native-interaction.js',
-        'lambda/shared/native-recovery-checkpoint.js',
-        'lambda/discussions/data-access.js',
-        'lambda/discussions/assist-result.js',
-        'lambda/discussions/handlers.js',
-        'lambda/agentcore/commands/discussion-assist-start.js',
-        'terraform/native-runtime-preparation.tf',
-      ].includes(file),
-  );
-export const hasArchitectureReview = ({ head, author, reviews, reviewers }) => {
-  const latest = new Map();
-  for (const review of reviews)
-    if (
-      review.commit_id === head &&
-      reviewers.includes(review.user?.login) &&
-      review.user.login !== author &&
-      ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)
-    )
-      latest.set(review.user.login, review.state);
-  return (
-    ![...latest.values()].includes('CHANGES_REQUESTED') && [...latest.values()].includes('APPROVED')
-  );
-};

@@ -1,6 +1,5 @@
 {
   "schemaVersion": 1,
-  "reviewers": ["leandrodamascena", "svozza", "eipasteur", "JWThewes", "jeromevdl"],
   "records": {
     "RUNTIME": {
       "owner": "native-authority",

@@ -214,8 +214,8 @@ non-default switch cases + catch`, attributed to the nearest function. Boolean
 operators do not count. The committed baseline was measured from the published
 pre-milestone HEAD using exactly that metric. New native functions must score at
 most 20; pre-existing hotspots must not increase. An exception must name the
-function, maximum and reason in the owner manifest and receive architecture
-review. There are no initial exceptions. This measure is neither Jerome's older
+function, maximum and reason in the owner manifest for review through the existing
+PR process. There are no initial exceptions. This measure is neither Jerome's older
 metric nor a claim that a function is untestable.
 
 Run `npm run architecture:check`, `npm run test:native-wiring` and
@@ -226,13 +226,12 @@ hotspots, compatibility provenance and unresolved dynamic edges. CI uploads the
 map; release tooling includes it as a release asset. Previewing a dirty tree
 requires `--allow-dirty` and is explicitly labeled.
 
-Owner/command/fence/lifecycle/replay/protocol changes require an independent
-declared reviewer's approval at the current PR head, including transition and
-failure evidence. Changes requested by a declared reviewer block the gate.
-Diff size is a review triage signal, not a fixed cap. GitHub operators must make
-the architecture job and existing validation jobs required, enforce code-owner
-review, and protect policy files from bypass. Adding the workflow does not
-configure these repository settings or prove a release ran.
+For owner/command/fence/lifecycle/replay/protocol changes, include transition,
+failure and compatibility evidence in the PR and use the repository's existing
+review process. Diff size is a review triage signal, not a fixed cap. The native
+architecture job checks technical boundaries and generates the map; it does not
+assign reviewers or require approval of a particular commit. Adding the workflow
+does not configure GitHub branch protection or prove a release ran.
 
 ## Release qualification
 
@@ -248,8 +247,8 @@ configure these repository settings or prove a release ran.
    tampered checkpoints, revoked membership/image and unsupported formats.
 5. Close admission and verify prepared, waiting, running and recovering work.
    Inventory all references before any runtime/resource or decoder removal.
-6. Review generated architecture artifacts and release evidence. Configure
-   required architecture checks and reviewer policy in GitHub separately.
+6. Review generated architecture artifacts and release evidence through the
+   repository's existing review process.
 
 Local tests do not qualify real old-image recovery, live resources, model behavior,
 deployed permissions or a rollout. Those require the authorized qualification above.

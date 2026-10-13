@@ -74,9 +74,9 @@ a parallel feature roadmap. See the [ownership and upgrade contract](docs/develo
 For writer, accepted-command, fence, lifecycle or replay/protocol changes, describe
 the owner, allowed callers, atomic transition, stale/duplicate/failure behavior,
 and retained-run compatibility in the PR. Include relevant regression evidence
-and any narrow complexity/policy exception. The architecture review gate requires
-an independent declared reviewer's approval of the current head. Large mechanical
-or generated diffs need review context rather than an arbitrary size exemption.
+and any narrow complexity/policy exception through the repository's existing PR
+review process. Large mechanical or generated diffs need review context rather
+than an arbitrary size exemption.
 
 ## Contributing via Pull Requests
 

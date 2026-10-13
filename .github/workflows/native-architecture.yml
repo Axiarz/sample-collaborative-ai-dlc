@@ -2,15 +2,12 @@ name: Native architecture
 
 on:
   pull_request:
-  pull_request_review:
-    types: [submitted, dismissed]
   workflow_dispatch:
   push:
     branches: [main]
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   architecture:
@@ -24,10 +21,6 @@ jobs:
       - run: npm run architecture:check
       - run: node --test scripts/test/native-architecture.test.mjs
       - run: npm run test:native-wiring
-      - name: Review semantic changes at the current head
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: node scripts/native-architecture-review.mjs
       - run: npm run architecture:map
       - uses: actions/upload-artifact@v4
         with:

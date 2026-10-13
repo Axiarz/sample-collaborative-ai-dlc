@@ -1,12 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import {
-  analyzeArchitectureSource,
-  checkArchitecture,
-  hasArchitectureReview,
-  semanticReviewRequired,
-} from '../lib/native-architecture.mjs';
+import { analyzeArchitectureSource, checkArchitecture } from '../lib/native-architecture.mjs';
 import { nativeDependencyInventory, assertNativeRemoval } from '../lib/native-dependencies.mjs';
 
 const manifest = JSON.parse(
@@ -47,48 +42,6 @@ test('forbidden writers and mutator imports fail even when package dependencies 
     "import { createNativeExecutionStore } from './execution-store.js'; import { PutCommand } from '@aws-sdk/lib-dynamodb'; new PutCommand({});",
   );
   assert.deepEqual(checkArchitecture([parsed], manifest, { functions: {} }).length, 2);
-});
-test('semantic changes require a current-head independent architecture reviewer', () => {
-  assert.equal(semanticReviewRequired(['lambda/shared/native-execution-fence.js']), true);
-  assert.equal(semanticReviewRequired(['frontend/src/styles.css']), false);
-  const input = { head: 'new-head', author: 'author', reviewers: ['reviewer'], reviews: [] };
-  assert.equal(hasArchitectureReview(input), false);
-  assert.equal(
-    hasArchitectureReview({
-      ...input,
-      reviews: [
-        {
-          commit_id: 'old-head',
-          state: 'APPROVED',
-          user: { login: 'reviewer' },
-        },
-      ],
-    }),
-    false,
-  );
-  assert.equal(
-    hasArchitectureReview({
-      ...input,
-      reviews: [
-        {
-          commit_id: 'new-head',
-          state: 'APPROVED',
-          user: { login: 'reviewer' },
-        },
-      ],
-    }),
-    true,
-  );
-  assert.equal(
-    hasArchitectureReview({
-      ...input,
-      reviews: [
-        { commit_id: 'new-head', state: 'APPROVED', user: { login: 'reviewer' } },
-        { commit_id: 'new-head', state: 'CHANGES_REQUESTED', user: { login: 'reviewer' } },
-      ],
-    }),
-    false,
-  );
 });
 test('prepared, accepted, cold-recovery and unknown references block removal without leaking answers', () => {
   const records = [
