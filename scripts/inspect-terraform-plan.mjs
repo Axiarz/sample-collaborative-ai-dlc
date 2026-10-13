@@ -15,6 +15,7 @@ const protectedTypes = new Set([
   'aws_neptune_cluster_instance',
   'aws_s3_bucket',
   'aws_dynamodb_table',
+  'aws_efs_file_system',
 ]);
 
 const expectedRetirement = (change) => {
@@ -23,8 +24,17 @@ const expectedRetirement = (change) => {
 };
 
 const destructive = (change) => change.change?.actions?.includes('delete');
+// Image replacements destroy using the BEFORE state. Setting keep_remotely on
+// only the replacement does not preserve an image that active runs still pin.
+const deletesPinnedRuntimeImage = (change) =>
+  change.type === 'docker_registry_image' &&
+  change.address.startsWith('module.agentcore.') &&
+  change.change?.before?.keep_remotely !== true;
 const rejected = (plan.resource_changes || []).filter(
-  (change) => destructive(change) && protectedTypes.has(change.type) && !expectedRetirement(change),
+  (change) =>
+    destructive(change) &&
+    ((protectedTypes.has(change.type) && !expectedRetirement(change)) ||
+      deletesPinnedRuntimeImage(change)),
 );
 const expected = (plan.resource_changes || []).filter(
   (change) => destructive(change) && expectedRetirement(change),
