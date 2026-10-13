@@ -2300,7 +2300,8 @@ const runStageAttempt = async (
     // stage that failed while revising, so its FAILED row resumes as well.
     const retriesFeedbackRound = resumeGate?.stageInstanceId == null && row?.state === 'FAILED';
     if (
-      resumeFrom && !freshFromGate &&
+      resumeFrom &&
+      !freshFromGate &&
       (!humanTaskMatchesOwner({
         task: resumeGate,
         stageInstanceId,
@@ -2335,7 +2336,12 @@ const runStageAttempt = async (
       row?.state === 'WAITING_FOR_HUMAN' &&
       row.pendingHumanTaskId === resumeFrom &&
       resumeGate?.stageInstanceId === stageInstanceId;
-    if ((!cli || !priorSessionId) && !reviewFeedback && !recoverMissingKiroSession && !freshFromGate) {
+    if (
+      (!cli || !priorSessionId) &&
+      !reviewFeedback &&
+      !recoverMissingKiroSession &&
+      !freshFromGate
+    ) {
       return fail(
         stageInstanceId,
         'resume_no_session',
@@ -4179,50 +4185,54 @@ const runStageAttempt = async (
   await publishGitEvidence(gitResult);
 
   const parkStage = async (parked) => {
-  const failUnresumableGate = async (reason, detail) => {
-    // Cleanup can hit the same storage outage as the park write. Attempt each
-    // write independently and preserve the original structured stage failure.
-    await store
-      .supersedeHumanTask({
-        executionId,
-        humanTaskId: parked.humanTaskId,
-        supersededBy: reason,
-      })
-      .catch((error) => {
-        console.error(
-          `[run-stage] failed to supersede unresumable gate ${parked.humanTaskId} stage=${stageInstanceId} reason=${reason}`,
-          error,
-        );
-      });
-    if (!unitSlug) {
+    const failUnresumableGate = async (reason, detail) => {
+      // Cleanup can hit the same storage outage as the park write. Attempt each
+      // write independently and preserve the original structured stage failure.
       await store
-        .updateExecution({
+        .supersedeHumanTask({
           executionId,
-          pendingHumanTaskId: null,
-          ...(ownership
-            ? { ifOrchestratorRunId: orchestratorRunId, ifPendingHumanTaskId: parked.humanTaskId }
-            : {}),
+          humanTaskId: parked.humanTaskId,
+          supersededBy: reason,
         })
         .catch((error) => {
-          console.error(
-            `[run-stage] failed to clear pending gate execution=${executionId} stage=${stageInstanceId} reason=${reason}`,
+          logger.error('failed to supersede unresumable gate', {
+            humanTaskId: parked.humanTaskId,
+            stageInstanceId,
+            reason,
             error,
-          );
+          });
         });
+      if (!unitSlug) {
+        await store
+          .updateExecution({
+            executionId,
+            pendingHumanTaskId: null,
+            ...(ownership
+              ? { ifOrchestratorRunId: orchestratorRunId, ifPendingHumanTaskId: parked.humanTaskId }
+              : {}),
+          })
+          .catch((error) => {
+            logger.error('failed to clear pending gate', {
+              executionId,
+              stageInstanceId,
+              reason,
+              error,
+            });
+          });
+      }
+      return fail(stageInstanceId, reason, detail, { clearPending: true });
+    };
+    if (
+      parked &&
+      cli === 'kiro' &&
+      (!cliSessionId || (resolveKiroStore(env) && !kiroStorePersisted))
+    ) {
+      const reason = !cliSessionId ? 'kiro_session_missing' : 'kiro_store_persist_failed';
+      return failUnresumableGate(
+        reason,
+        'Kiro could not save a resumable conversation. Retry this stage using its saved artifacts; the unresumable question has been retired.',
+      );
     }
-    return fail(stageInstanceId, reason, detail, { clearPending: true });
-  };
-  if (
-    parked &&
-    cli === 'kiro' &&
-    (!cliSessionId || (resolveKiroStore(env) && !kiroStorePersisted))
-  ) {
-    const reason = !cliSessionId ? 'kiro_session_missing' : 'kiro_store_persist_failed';
-    return failUnresumableGate(
-      reason,
-      'Kiro could not save a resumable conversation. Retry this stage using its saved artifacts; the unresumable question has been retired.',
-    );
-  }
 
     if ((cli === 'opencode' || cli === 'codex') && !cliSessionId) {
       return fail(
@@ -4349,7 +4359,8 @@ const runStageAttempt = async (
         credentialFailureDetail({
           binding: credentialBindingForCli(credentialBindings, cli),
           state: 'exhausted',
-        }) ?? 'The provider credit allowance is exhausted. Replenish it or rotate the pinned credential, then retry the failed stage.',
+        }) ??
+          'The provider credit allowance is exhausted. Replenish it or rotate the pinned credential, then retry the failed stage.',
       );
     } else if (cli === 'kiro' && isBenignKiroEmptyCompletion(result?.stderrTail)) {
       logger.error('kiro empty-completion (benign); treating as success', {

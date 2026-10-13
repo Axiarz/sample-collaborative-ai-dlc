@@ -951,6 +951,8 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
             callbackId,
             stageInstanceId: expectedStageInstanceId,
             callbackOwner: expectedCallbackOwner,
+            unitSlug,
+            sectionIndex,
           }),
         );
         let answeredEarly = false;

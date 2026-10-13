@@ -2941,7 +2941,7 @@ export const handler = async (event, context) => {
               executionId: intentId,
               resumeRequired: {
                 humanTaskId,
-                callbackId: gate.callbackId,
+                callbackId: answered.callbackId,
                 answeredAt: answered.answeredAt ?? null,
               },
             })

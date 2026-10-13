@@ -126,6 +126,46 @@ describe('stage attempt ownership transactions', () => {
     expect(items[2].Update.ConditionExpression).toContain('orchestratorRunId = :ownedRun');
     expect(items[2].Update.UpdateExpression).toContain('GSI1SK');
   });
+  it.each([true, false])(
+    'keeps credential inventory in the same META transaction (owned: %s)',
+    async (owned) => {
+      const { ddb, store } = setup();
+      await store.updateExecution({
+        executionId: 'e1',
+        projectId: 'p1',
+        status: 'RUNNING',
+        credentialBinding: { provider: 'bedrock', source: 'user', userId: 'u1' },
+        ...(owned
+          ? { ownership }
+          : {
+              additionalWrites: [{ Put: { TableName: 't', Item: { pk: 'EXEC#e1', sk: 'OTHER' } } }],
+            }),
+      });
+      const transactions = ddb.send.mock.calls.filter(
+        ([cmd]) => cmd instanceof TransactWriteCommand,
+      );
+      expect(transactions).toHaveLength(1);
+      const items = transactions[0][0].input.TransactItems;
+      expect(
+        items
+          .filter(({ Put }) => Put?.Item.type === 'AgentAuthInventoryReference')
+          .map(({ Put }) => Put.Item.pk)
+          .toSorted(),
+      ).toEqual(['AGENTAUTH#SCOPE#space#p1', 'AGENTAUTH#SCOPE#user#u1']);
+      const meta = items.find(({ Update }) => Update?.Key.pk === 'EXEC#e1');
+      expect(meta.Update.ExpressionAttributeValues[':status']).toBe('RUNNING');
+      for (const item of items.filter(({ Update }) => Update?.Key.pk.startsWith('AGENTAUTH#'))) {
+        expect(item.Update.ConditionExpression).toBeUndefined();
+      }
+      if (owned) {
+        expect(meta.Update.ConditionExpression).toContain('orchestratorRunId = :ownedRun');
+        expect(
+          items.find(({ ConditionCheck }) => ConditionCheck?.Key.sk === 'STAGE#s1').ConditionCheck
+            .ExpressionAttributeValues[':ownedCallback'],
+        ).toBe('cb1');
+      }
+    },
+  );
   it.each([
     ['resumeStageRow', { stageInstanceId: 's1', cli: 'claude', cliSessionId: 'sess-2' }],
     ['updateStageState', { stageInstanceId: 's1', state: 'SUCCEEDED' }],
@@ -904,6 +944,7 @@ describe('createProcessStore', () => {
 
   it('answers with attached steering in one transaction', async () => {
     ddb.on(TransactWriteCommand).resolves({});
+    ddb.on(GetCommand).resolves({ Item: { humanTaskId: 'h1', status: 'answered' } });
 
     const result = await store.answerHumanTaskWithSteering({
       executionId: 'e1',
@@ -938,7 +979,10 @@ describe('createProcessStore', () => {
       Item: expect.objectContaining({ sk: 'STEER#T#st-id-1' }),
       ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
     });
-    expect(ddb.commandCalls(GetCommand)).toHaveLength(0);
+    expect(ddb.commandCalls(GetCommand)[0].args[0].input).toMatchObject({
+      Key: humanTaskKey('e1', 'h1'),
+      ConsistentRead: true,
+    });
   });
 
   it('listEvents queries the EVENT# prefix time-ordered and drains pagination', async () => {

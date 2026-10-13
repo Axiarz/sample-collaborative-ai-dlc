@@ -199,7 +199,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       const input = { ...item[type] };
       delete input.ReturnValues;
       const key = input.Key ?? input.Item;
-      if (key.sk === 'META') {
+      if (key.pk === ownsRun.Key.pk && key.sk === ownsRun.Key.sk) {
         writesMeta = true;
         input.ConditionExpression = [input.ConditionExpression, ownsRun.ConditionExpression]
           .filter(Boolean)
@@ -213,7 +213,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
           ...ownsRun.ExpressionAttributeValues,
         };
       }
-      if (key.sk === stage.sk) {
+      if (key.pk === stage.pk && key.sk === stage.sk) {
         writesStage = true;
         if (!claim) {
           input.ConditionExpression = [input.ConditionExpression, ownsStage.ConditionExpression]
@@ -724,31 +724,34 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       values[':ifDraftRevision'] = ifDraftRevision;
     }
     if (conditions.length) params.ConditionExpression = conditions.join(' AND ');
+    const credentialWrites = [];
+    if (credentialBinding !== undefined) {
+      const row = { ...executionMetaKey(executionId), projectId, credentialBinding };
+      credentialWrites.push(
+        ...inventoryReferenceWrites(table(), row),
+        ...scopeActivityWrites(table(), [row], { includePlatform: true }),
+      );
+    }
     if (ownership) {
       await writeStageAttempt({
         executionId,
         ownership,
-        writes: [...additionalWrites, { Update: params }],
+        writes: [...additionalWrites, ...credentialWrites, { Update: params }],
       });
       // Transactions cannot return ALL_NEW; read the committed row instead.
       return getExecution(executionId, { consistentRead: true });
     }
     if (additionalWrites.length) {
       const { ReturnValues: _returnValues, ...update } = params;
-      await transact([...additionalWrites, { Update: update }]);
+      await transact([...additionalWrites, ...credentialWrites, { Update: update }]);
       return getExecution(executionId, { consistentRead: true });
     }
     if (credentialBinding !== undefined) {
-      const row = { ...executionMetaKey(executionId), projectId, credentialBinding };
       const { ReturnValues: _returnValues, ...write } = params;
       try {
         await ddb.send(
           new TransactWriteCommand({
-            TransactItems: [
-              { Update: write },
-              ...inventoryReferenceWrites(table(), row),
-              ...scopeActivityWrites(table(), [row], { includePlatform: true }),
-            ],
+            TransactItems: [{ Update: write }, ...credentialWrites],
           }),
         );
       } catch (error) {

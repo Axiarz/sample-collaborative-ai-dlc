@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { Logger } from '@aws-lambda-powertools/logger';
 import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -2548,21 +2549,24 @@ describe('runStage — resume mode', () => {
   ])(
     'resumes %s with callback %s and stale gate bookkeeping',
     async (state, rowCallback, expected) => {
-      const store = spyStore({
-        humanTask: {
-          humanTaskId: 'feedback',
-          status: 'answered',
-          stageInstanceId: BASE_STAGE_INSTANCE_ID,
-          answer: { decision: 'request-changes', feedback: 'Add validation' },
+      const store = spyStore(
+        {
+          humanTask: {
+            humanTaskId: 'feedback',
+            status: 'answered',
+            stageInstanceId: BASE_STAGE_INSTANCE_ID,
+            answer: { decision: 'request-changes', feedback: 'Add validation' },
+          },
+          stage: {
+            state,
+            stageCallbackId: rowCallback,
+            pendingHumanTaskId: 'old-question',
+            cli: 'claude',
+            cliSessionId: 'session-1',
+          },
         },
-        stage: {
-          state,
-          stageCallbackId: rowCallback,
-          pendingHumanTaskId: 'old-question',
-          cli: 'claude',
-          cliSessionId: 'session-1',
-        },
-      });
+        { persistStageWrites: true },
+      );
       const spawnFn = vi.fn(okSpawn);
       const result = await runStage(
         {
@@ -2836,7 +2840,7 @@ describe('runStage — resume mode', () => {
         }),
       });
       const res = await runStage({ ...baseArgs, resumeFrom: humanTask.humanTaskId }, deps);
-      expect(res, label).toMatchObject({ ok: false, reason: 'resume_no_session' });
+      expect(res, label).toMatchObject({ ok: false, reason: 'resume_state_conflict' });
       expect(promptSeen, label).toBeNull();
     }
   });
@@ -3653,7 +3657,7 @@ describe('runStage — Kiro SQLite store sync (restore before spawn, persist aft
 
   it('recovers an owned legacy Kiro wait with no session ID and injects its saved answer', async () => {
     const prompts = [];
-    const store = spyStore(ownedMissingSession());
+    const store = spyStore(ownedMissingSession(), { persistStageWrites: true });
     const res = await runStage(
       { ...baseArgs, requestedCli: 'kiro', resumeFrom: 'q-1' },
       baseDeps({
@@ -3662,7 +3666,7 @@ describe('runStage — Kiro SQLite store sync (restore before spawn, persist aft
         spawnFn: sessionSpawn(true, prompts),
       }),
     );
-    expect(res).toMatchObject({ ok: true, cli: 'kiro' });
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED', cli: 'kiro' });
     expect(prompts.join('\n')).toContain('Keep the existing compliance requirements');
     expect(prompts.join('\n')).not.toContain('--resume');
     expect(
@@ -3686,7 +3690,7 @@ describe('runStage — Kiro SQLite store sync (restore before spawn, persist aft
       baseDeps({
         availableClis: ['kiro'],
         env: kiroStoreEnv,
-        store: spyStore(ownedMissingSession()),
+        store: spyStore(ownedMissingSession(), { persistStageWrites: true }),
         restoreKiroStore,
         spawnFn: (command, args) => {
           if (!args.includes('--list-sessions') && !args.includes('/usage')) {
@@ -3915,7 +3919,7 @@ describe('runStage — Kiro SQLite store sync (restore before spawn, persist aft
       return updateExecution(row);
     });
     const broadcast = vi.fn().mockResolvedValue(undefined);
-    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const log = vi.spyOn(Logger.prototype, 'error').mockImplementation(() => {});
     try {
       const res = await runStage(
         { ...baseArgs, requestedCli: 'kiro' },
@@ -3954,12 +3958,12 @@ describe('runStage — Kiro SQLite store sync (restore before spawn, persist aft
         }),
       );
       expect(log).toHaveBeenCalledWith(
-        expect.stringContaining('failed to supersede unresumable gate q-1'),
-        storageError,
+        'failed to supersede unresumable gate',
+        expect.objectContaining({ humanTaskId: 'q-1', error: storageError }),
       );
       expect(log).toHaveBeenCalledWith(
         expect.stringContaining('failed to clear pending gate'),
-        storageError,
+        expect.objectContaining({ error: storageError }),
       );
       expect(broadcast).toHaveBeenCalledWith(
         expect.objectContaining({

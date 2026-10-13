@@ -60,13 +60,17 @@ describe('answer/bind interleaving', () => {
   afterEach(() => vi.unstubAllEnvs());
 
   it.each([
-    [true, false],
-    [false, false],
-    [true, true],
-    [false, true],
+    [true, false, false],
+    [false, false, false],
+    [true, true, false],
+    [false, true, false],
+    [true, false, true],
+    [false, false, true],
+    [true, true, true],
+    [false, true, true],
   ])(
-    'wakes the callback from the committed answer (bind raced: %s, owned: %s)',
-    async (bindRaced, owned) => {
+    'wakes the callback from the committed answer (bind raced: %s, owned: %s, steering: %s)',
+    async (bindRaced, owned, withSteering) => {
       let gate = {
         humanTaskId: 'h1',
         status: 'pending',
@@ -97,7 +101,10 @@ describe('answer/bind interleaving', () => {
       });
       ddb.on(QueryCommand).resolves({ Items: [] });
       const applyUpdate = ({ ExpressionAttributeValues: values }) => {
-        if (values[':cb']) {
+        if (values[':cb'] && values[':ts']) {
+          gate = { ...gate, callbackConsumedAt: values[':ts'] };
+          order.push('callback-consumed');
+        } else if (values[':cb']) {
           gate = { ...gate, callbackId: values[':cb'], callbackOwner: values[':owner'] };
           order.push('bind');
         } else {
@@ -117,7 +124,10 @@ describe('answer/bind interleaving', () => {
         path: '/projects/p1/intents/i1/gates/h1/answer',
         pathParameters: { projectId: 'p1', intentId: 'i1', humanTaskId: 'h1' },
         requestContext: { authorizer: { claims: { sub: 'u1' } } },
-        body: JSON.stringify({ answer: { decision: 'approve' } }),
+        body: JSON.stringify({
+          answer: { decision: 'approve' },
+          ...(withSteering ? { steering: 'Use the event bus.' } : {}),
+        }),
       });
       expect(response.statusCode).toBe(200);
       const callbacks = lambda.commandCalls(SendDurableExecutionCallbackSuccessCommand);
@@ -128,11 +138,56 @@ describe('answer/bind interleaving', () => {
           'bind',
           'orchestrator-read-pending',
           'answer-committed',
+          'callback-consumed',
         ]);
         expect(callbacks[0].args[0].input.CallbackId).toBe('cb1');
       }
     },
   );
+
+  it('retains the newly bound callback when delivery of the committed answer fails', async () => {
+    let reads = 0;
+    const gate = {
+      humanTaskId: 'h1',
+      status: 'answered',
+      callbackId: 'cb-new',
+      answer: { decision: 'approve' },
+      answeredAt: 'T',
+    };
+    ddb.on(GetCommand).callsFake(({ Key }) => ({
+      Item:
+        Key.sk === 'META'
+          ? { projectId: 'p1', status: 'WAITING' }
+          : reads++ === 0
+            ? { ...gate, status: 'pending', callbackId: null }
+            : gate,
+    }));
+    ddb.on(QueryCommand).resolves({ Items: [] });
+    ddb.on(UpdateCommand).resolves({ Attributes: gate });
+    lambda
+      .on(SendDurableExecutionCallbackSuccessCommand)
+      .rejects(new Error('callback unavailable'));
+
+    const response = await handler({
+      httpMethod: 'POST',
+      path: '/projects/p1/intents/i1/gates/h1/answer',
+      pathParameters: { projectId: 'p1', intentId: 'i1', humanTaskId: 'h1' },
+      requestContext: { authorizer: { claims: { sub: 'u1' } } },
+      body: JSON.stringify({ answer: gate.answer }),
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(
+      lambda.commandCalls(SendDurableExecutionCallbackSuccessCommand)[0].args[0].input,
+    ).toMatchObject({ CallbackId: 'cb-new' });
+    const markerWrite = ddb
+      .commandCalls(UpdateCommand)
+      .find((call) => call.args[0].input.ExpressionAttributeValues?.[':rsr'] !== undefined);
+    expect(markerWrite.args[0].input.ExpressionAttributeValues[':rsr']).toMatchObject({
+      humanTaskId: 'h1',
+      callbackId: 'cb-new',
+    });
+  });
   it.each([false, true])(
     'does not answer or wake a gate after its run loses ownership (steering: %s)',
     async (withSteering) => {

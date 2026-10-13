@@ -12,7 +12,7 @@ const input = {
 
 describe('bindGateCallback', () => {
   it.each(['answered', 'approved', 'rejected'])('accepts an unbound %s gate', async (status) => {
-    const gate = { status, stageInstanceId: 's1' };
+    const gate = { status, stageInstanceId: 's1', answeredAt: 'T' };
     const store = {
       setGateCallbackId: vi.fn(async () => null),
       getHumanTask: vi.fn(async () => gate),
@@ -23,18 +23,36 @@ describe('bindGateCallback', () => {
   });
 
   it.each([
+    { status: 'answered', stageInstanceId: 's1', answeredAt: null },
     { status: 'pending', stageInstanceId: 's1' },
     { status: 'answered', stageInstanceId: 'sibling' },
     { status: 'answered', stageInstanceId: 's1', callbackId: 'other' },
     { status: 'answered', stageInstanceId: 's1', callbackOwner: 'stage:other' },
+    { status: 'answered', stageInstanceId: 's1', unitSlug: 'sibling-unit' },
     null,
   ])('never steals a callback or consumes a different stage answer: %j', async (gate) => {
     const store = {
       setGateCallbackId: vi.fn(async () => null),
-      getHumanTask: vi.fn(async () => gate),
+      getHumanTask: vi.fn(async () => gate && { answeredAt: 'T', ...gate }),
     };
     expect(await bindGateCallback(store, input)).toBeNull();
     expect(store.setGateCallbackId).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an answer from another section in the same unit', async () => {
+    const store = {
+      setGateCallbackId: vi.fn(async () => null),
+      getHumanTask: vi.fn(async () => ({
+        status: 'answered',
+        answeredAt: 'T',
+        stageInstanceId: 's1',
+        unitSlug: 'unit-a',
+        sectionIndex: 2,
+      })),
+    };
+    expect(
+      await bindGateCallback(store, { ...input, unitSlug: 'unit-a', sectionIndex: 1 }),
+    ).toBeNull();
   });
 });
 

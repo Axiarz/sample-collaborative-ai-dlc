@@ -18,6 +18,7 @@ export const bindGateCallback = async (store, input) => {
 // claimed it, and (for stage gates) it belongs to the expected stage.
 export const ownsAnsweredGate = (gate, input) =>
   isHumanTaskAnswerStatus(gate?.status) &&
+  Boolean(gate.answeredAt || gate.answer) &&
   (gate.callbackId == null || gate.callbackId === input.callbackId) &&
   (gate.callbackOwner == null || gate.callbackOwner === input.callbackOwner) &&
   (input.stageInstanceId === undefined ||
