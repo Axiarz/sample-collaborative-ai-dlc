@@ -3,7 +3,7 @@ import {
   logNativeProvisioningDiagnostic,
   NATIVE_WORKSPACE_CHECK_TIMEOUT_MS,
 } from './provisioner.js';
-import { createNativeRuntimeStore } from './store.js';
+import { preparationObservationPort } from './authority-client.js';
 import { controlError, validateDeployment } from './policies.js';
 import { nativeRuntimeBindingKey } from '../shared/native-runtime-binding.js';
 
@@ -240,13 +240,11 @@ export const createNativeRuntimeWorker =
 let worker;
 export const handler = async (event, context) => {
   if (!worker) {
-    const [efs, iam, control, runtime, dynamodb, document, sqs] = await Promise.all([
+    const [efs, iam, control, runtime, sqs] = await Promise.all([
       import('@aws-sdk/client-efs'),
       import('@aws-sdk/client-iam'),
       import('@aws-sdk/client-bedrock-agentcore-control'),
       import('@aws-sdk/client-bedrock-agentcore'),
-      import('@aws-sdk/client-dynamodb'),
-      import('@aws-sdk/lib-dynamodb'),
       import('@aws-sdk/client-sqs'),
     ]);
     const deployment = nativeDeploymentFromEnv(process.env);
@@ -301,8 +299,7 @@ export const handler = async (event, context) => {
         ...port(runtime, 'BedrockAgentCoreClient', ['stopRuntimeSession']),
       },
     };
-    const ddb = document.DynamoDBDocumentClient.from(new dynamodb.DynamoDBClient(config));
-    const store = createNativeRuntimeStore({ ddb: nativeDiagnosticDdb(ddb), deployment });
+    const store = preparationObservationPort();
     const queue = new sqs.SQSClient({
       region: deployment.region,
       maxAttempts: 1,

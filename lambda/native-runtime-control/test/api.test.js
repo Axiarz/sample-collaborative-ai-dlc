@@ -237,6 +237,17 @@ describe('native API authentication and gates', () => {
 });
 
 describe('native draft creation and shared status', () => {
+  it('closes new draft admission while retaining prepared draft reads and preparation retries', async () => {
+    const f = makeApi({ admissionEnabled: false });
+    expect((await f.api(event('create', { body: JSON.stringify(request()) }))).statusCode).toBe(
+      503,
+    );
+    await f.store.create(createInput());
+    expect((await f.api(event('get'))).statusCode).toBe(200);
+    expect((await f.api(event('prepare'))).statusCode).toBe(202);
+    expect((await f.api(event('prepare'))).statusCode).toBe(202);
+    expect(f.enqueue).toHaveBeenCalledTimes(2);
+  });
   it.each([
     ['title only', { title: 'Flappy bird', prompt: '' }],
     ['prompt only', { title: '', prompt: 'Build a small game.' }],
@@ -382,7 +393,7 @@ describe('durable model-free preparation', () => {
       throw new Error('private SQS credential failure');
     });
     const failed = await f.api(event('prepare', { body: '{}' }));
-    expect(failed.statusCode).toBe(503);
+    expect(failed.statusCode).toBe(202);
     expect(failed.body).not.toContain('private');
     expect(f.read().status).toBe('PREPARING');
     const retry = await f.api(event('prepare'));

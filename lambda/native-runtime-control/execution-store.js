@@ -462,7 +462,7 @@ const responseRequestKey = (value, actorId, requestId) => ({
   ...nativeExecutionKey(value),
   sk: `RESPONSE_REQUEST#${sha(canonicalJson([actorId, requestId]))}`,
 });
-const publicationHistoryKey = (value, sequence) => ({
+export const publicationHistoryKey = (value, sequence) => ({
   ...nativeExecutionKey(value),
   sk: `PUBLICATION#${String(sequence).padStart(16, '0')}`,
 });
@@ -1464,9 +1464,7 @@ export const createNativeExecutionStore = ({
       if (
         !['DISPATCHING', 'RUNNING'].includes(row.status) ||
         publication.sequence !== nativeTurnSequence(row) ||
-        (row.publication &&
-          (row.publication.sequence + 1 !== publication.sequence ||
-            row.projectionStatus !== 'complete'))
+        (row.publication && row.publication.sequence + 1 !== publication.sequence)
       )
         fail('CONFLICT');
       const next = {

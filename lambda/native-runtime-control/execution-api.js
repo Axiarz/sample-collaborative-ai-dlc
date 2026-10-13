@@ -70,6 +70,8 @@ const TERMINAL = new Set(['STOPPED', 'FAILED', 'CANCELLED', 'WAITING_FOR_INPUT']
 
 export const createNativeExecutionApi = ({
   enabled,
+  admissionEnabled = enabled,
+  projectionStatus,
   store,
   configure,
   publications,
@@ -80,6 +82,14 @@ export const createNativeExecutionApi = ({
   activity,
   deployment,
 }) => {
+  // Fast notification is optional; stream + state reconciliation owns delivery.
+  const notify = async (scope) => {
+    try {
+      await enqueue?.(scope);
+    } catch {
+      /* Committed work remains discoverable. */
+    }
+  };
   // Protected image policy: the API rejects work that the controller and
   // credential resolver would refuse, but never hides committed results.
   const imageDecision = async (row) => {
@@ -102,7 +112,9 @@ export const createNativeExecutionApi = ({
     if (row && row.bindingId !== draft.bindingId)
       fail('NATIVE_EXECUTION_CONFLICT', 'Native execution binding changed');
     await recheck(draft);
-    return row;
+    return row && projectionStatus
+      ? { ...row, projectionStatus: await projectionStatus(row) }
+      : row;
   };
   const committed = async (draft, recheck) => {
     const row = await read(draft, recheck);
@@ -160,13 +172,18 @@ export const createNativeExecutionApi = ({
           view.imageStatus = 'unavailable';
         }
       }
-      return { executionAvailable: enabled === true, execution: view };
+      return {
+        executionAvailable: row ? true : admissionEnabled === true,
+        admissionEnabled: admissionEnabled === true,
+        execution: view,
+      };
     },
     async start(draft, actorId, requestId, recheck) {
-      if (!enabled) fail('NATIVE_EXECUTION_DISABLED', 'Native execution is disabled');
       // An existing start retains its original starter and configuration.
       let row = await read(draft, recheck);
       if (!row) {
+        if (!admissionEnabled)
+          fail('NATIVE_EXECUTION_DISABLED', 'New native executions are disabled');
         await authorizeSource(draft, actorId);
         const configuration = await configure({ draft, actorId });
         // A new run always pins the current deployment image; an emergency
@@ -200,18 +217,21 @@ export const createNativeExecutionApi = ({
           'CANCEL_REQUESTED',
         ].includes(row.status)
       )
-        await enqueue(identity(draft));
+        await notify(identity(draft));
       return { executionAvailable: true, execution: nativeExecutionView(row) };
     },
     async cancel(draft, recheck) {
       await recheck(draft);
       const row = await store.cancel({ ...identity(draft), bindingId: draft.bindingId });
       await recheck(draft);
-      if (row.status === 'CANCEL_REQUESTED') await enqueue(identity(draft));
-      return { executionAvailable: enabled === true, execution: nativeExecutionView(row) };
+      if (row.status === 'CANCEL_REQUESTED') await notify(identity(draft));
+      return {
+        executionAvailable: true,
+        admissionEnabled: admissionEnabled === true,
+        execution: nativeExecutionView(row),
+      };
     },
     async recover(draft, input, recheck) {
-      if (!enabled) fail('NATIVE_EXECUTION_DISABLED', 'Native execution is disabled');
       const existing = await read(draft, recheck);
       if (existing) await requireImage(existing);
       await recheck(draft);
@@ -221,7 +241,7 @@ export const createNativeExecutionApi = ({
         request: input,
       });
       await recheck(draft);
-      if (row.status === 'RECOVERING') await enqueue(identity(draft));
+      if (row.status === 'RECOVERING') await notify(identity(draft));
       return { executionAvailable: true, execution: nativeExecutionView(row) };
     },
     async interaction(draft, recheck) {
@@ -232,7 +252,6 @@ export const createNativeExecutionApi = ({
       };
     },
     async respond(draft, actorId, input, recheck, member = null) {
-      if (!enabled) fail('NATIVE_EXECUTION_DISABLED', 'Native execution is disabled');
       const request = nativeReplyRequest(input);
       // Validate the exact presentation before accepting a new response. A
       // committed response retry uses its immutable ledger even after the next
@@ -277,9 +296,9 @@ export const createNativeExecutionApi = ({
       // The committed acceptance is the authority point. Queue its one
       // continuation before the read-back recheck, so a revocation racing this
       // request cannot strand an accepted command; the recheck still withholds
-      // the result from a caller who is no longer a member. Retrying the same
-      // request repairs a lost queue send; its command ID never changes.
-      if (accepted.row.status === 'DISPATCHING') await enqueue(identity(draft));
+      // the result from a caller who is no longer a member. Stream delivery
+      // and reconciliation repair lost notifications without a client retry.
+      if (accepted.row.status === 'DISPATCHING') await notify(identity(draft));
       await recheck(draft);
       return {
         executionAvailable: true,

@@ -8,7 +8,14 @@ import test from 'node:test';
 
 const inspector = fileURLToPath(new URL('../inspect-terraform-plan.mjs', import.meta.url));
 
-function inspect(actions) {
+function inspect(
+  actions,
+  {
+    type = 'aws_efs_file_system',
+    address = 'module.native_runs[0].aws_efs_file_system.runs',
+    proof,
+  } = {},
+) {
   const directory = mkdtempSync(join(tmpdir(), 'aidlc-efs-retention-'));
   try {
     const plan = join(directory, 'plan.json');
@@ -17,10 +24,19 @@ function inspect(actions) {
       JSON.stringify({
         resource_changes: [
           {
-            address: 'module.native_runs[0].aws_efs_file_system.runs',
-            type: 'aws_efs_file_system',
+            address,
+            type,
             change: { actions },
           },
+          ...(proof
+            ? [
+                {
+                  address: 'data.external.native_decommission[0]',
+                  type: 'external',
+                  change: { actions: ['read'], after: proof },
+                },
+              ]
+            : []),
         ],
       }),
     );
@@ -43,4 +59,20 @@ test('allows creating, updating or retaining the native filesystem', () => {
     const result = inspect(actions);
     assert.equal(result.status, 0, result.stderr);
   }
+});
+
+test('native service removal requires an evaluated empty protected inventory and closed admission', () => {
+  const service = {
+    type: 'aws_lambda_function',
+    address: 'module.native_runs[0].module.execution_worker[0].aws_lambda_function.this[0]',
+  };
+  for (const proof of [
+    undefined,
+    { result: { empty: 'true', records: '1' }, query: { admissionClosed: 'true' } },
+    { result: { empty: 'true', records: '0' }, query: { admissionClosed: 'false' } },
+  ])
+    assert.equal(inspect(['delete'], { ...service, proof }).status, 1);
+  const proof = { result: { empty: 'true', records: '0' }, query: { admissionClosed: 'true' } };
+  assert.equal(inspect(['delete'], { ...service, proof }).status, 0);
+  assert.equal(inspect(['delete'], { proof }).status, 1); // storage has its own guard
 });

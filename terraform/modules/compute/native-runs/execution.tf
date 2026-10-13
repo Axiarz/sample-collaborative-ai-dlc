@@ -3,7 +3,8 @@ locals {
   ssm_prefix_arn        = "arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter${local.agent_settings_prefix}"
   graph_arn             = "arn:${local.partition}:neptune-db:${local.region}:${local.account_id}:${var.neptune_cluster_resource_id}/*"
   execution_environment = {
-    NATIVE_EXECUTION_ENABLED            = tostring(var.execution_enabled)
+    NATIVE_EXECUTION_ENABLED            = "true"
+    NATIVE_EXECUTION_ADMISSION_ENABLED  = tostring(var.execution_enabled)
     NATIVE_EXECUTION_IMAGE_URI          = "${var.image_repository_url}@${var.image_digest}"
     NATIVE_EXECUTION_IMAGE_DIGEST       = var.image_digest
     NATIVE_EXECUTION_PUBLICATION_BUCKET = aws_s3_bucket.publications.id
@@ -13,10 +14,10 @@ locals {
     { Sid = "ReadNativeOutputHistory", Effect = "Allow", Action = ["dynamodb:Query"], Resource = aws_dynamodb_table.bindings.arn },
     {
       # TransactWriteItems authorizes its constituent operations individually.
-      # Get/Put on the authority table are already in the preparation API policy.
-      Sid      = "CheckNativeExecutionTransactions"
+      # Read permissions shared by the authority's execution command operations.
+      Sid      = "ReadNativeExecutionPins"
       Effect   = "Allow"
-      Action   = ["dynamodb:ConditionCheckItem"]
+      Action   = ["dynamodb:GetItem"]
       Resource = aws_dynamodb_table.bindings.arn
     },
     {
@@ -129,7 +130,7 @@ resource "aws_s3_bucket_policy" "publications" {
 }
 
 resource "aws_sqs_queue" "execution" {
-  count                      = var.execution_enabled ? 1 : 0
+  count                      = 1
   name                       = "${local.name}-execution"
   visibility_timeout_seconds = 720
   message_retention_seconds  = 1209600
@@ -140,29 +141,28 @@ resource "aws_sqs_queue" "execution" {
 }
 
 resource "aws_iam_role" "execution_worker" {
-  count              = var.execution_enabled ? 1 : 0
+  count              = 1
   name               = "${local.name}-execution"
   assume_role_policy = local.lambda_trust
   tags               = var.tags
 }
 resource "aws_iam_role_policy_attachment" "execution_worker_basic" {
-  count      = var.execution_enabled ? 1 : 0
+  count      = 1
   role       = aws_iam_role.execution_worker[0].name
   policy_arn = "arn:${local.partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 resource "aws_iam_role_policy" "execution_worker" {
-  count = var.execution_enabled ? 1 : 0
+  count = 1
   name  = "native-execution-control"
   role  = aws_iam_role.execution_worker[0].id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      { Sid = "NativeActivityConnections", Effect = "Allow", Action = ["dynamodb:Query"], Resource = "${var.connections_table_arn}/index/DocumentIdIndex" },
-      { Sid = "NotifyNativeActivity", Effect = "Allow", Action = ["execute-api:ManageConnections"], Resource = "${var.websocket_execution_arn}/*" },
+      { Sid = "SubmitFencedObservations", Effect = "Allow", Action = ["lambda:InvokeFunction"], Resource = "${local.base_environment.NATIVE_AUTHORITY_FUNCTION}:execution" },
       {
         Sid      = "NativeExecutionAuthority"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:ConditionCheckItem"]
+        Action   = ["dynamodb:GetItem"]
         Resource = aws_dynamodb_table.bindings.arn
       },
       {
@@ -172,11 +172,10 @@ resource "aws_iam_role_policy" "execution_worker" {
         Resource = [var.workflow_source_bindings_table_arn, var.package_jobs_table_arn, var.source_control_bindings_table_arn]
       },
       {
-        # Neptune property() requires delete access even for cardinality.single
-        # replacing a projection value. Only this trusted controller receives it.
-        Sid      = "AuthorizeAndProjectNativeExecution"
+        # Execution checks membership. Only the independent projector writes graph data.
+        Sid      = "AuthorizeNativeExecution"
         Effect   = "Allow"
-        Action   = ["neptune-db:connect", "neptune-db:ReadDataViaQuery", "neptune-db:WriteDataViaQuery", "neptune-db:DeleteDataViaQuery"]
+        Action   = ["neptune-db:connect", "neptune-db:ReadDataViaQuery"]
         Resource = local.graph_arn
       },
       {
@@ -279,18 +278,18 @@ resource "aws_iam_role_policy" "execution_worker" {
 # A new controller-only principal. It intentionally does not share or extend the
 # legacy runtime-callable credential broker role, signing secret or policies.
 resource "aws_iam_role" "execution_credentials" {
-  count              = var.execution_enabled ? 1 : 0
+  count              = 1
   name               = "${local.name}-credentials"
   assume_role_policy = local.lambda_trust
   tags               = var.tags
 }
 resource "aws_iam_role_policy_attachment" "execution_credentials_basic" {
-  count      = var.execution_enabled ? 1 : 0
+  count      = 1
   role       = aws_iam_role.execution_credentials[0].name
   policy_arn = "arn:${local.partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 resource "aws_iam_role_policy" "execution_credentials" {
-  count = var.execution_enabled ? 1 : 0
+  count = 1
   name  = "native-execution-credential-resolution"
   role  = aws_iam_role.execution_credentials[0].id
   policy = jsonencode({
@@ -361,7 +360,7 @@ resource "aws_iam_role_policy" "execution_credentials" {
 }
 
 module "execution_credentials" {
-  count                  = var.execution_enabled ? 1 : 0
+  count                  = 1
   source                 = "terraform-aws-modules/lambda/aws"
   version                = "~> 8.0"
   function_name          = "${local.name}-credentials"
@@ -406,7 +405,7 @@ module "execution_credentials" {
 }
 
 module "execution_worker" {
-  count         = var.execution_enabled ? 1 : 0
+  count         = 1
   source        = "terraform-aws-modules/lambda/aws"
   version       = "~> 8.0"
   function_name = "${local.name}-execution"
@@ -451,7 +450,7 @@ module "execution_worker" {
 }
 
 resource "aws_lambda_event_source_mapping" "execution" {
-  count                   = var.execution_enabled ? 1 : 0
+  count                   = 1
   event_source_arn        = aws_sqs_queue.execution[0].arn
   function_name           = module.execution_worker[0].lambda_function_arn
   batch_size              = 1

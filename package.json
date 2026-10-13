@@ -74,7 +74,10 @@
     "release:prepare": "node scripts/release.mjs prepare",
     "release:check": "node scripts/release.mjs check",
     "test:release": "node --test scripts/test/*.test.mjs",
-    "prepare": "husky"
+    "prepare": "husky",
+    "architecture:check": "node scripts/native-architecture.mjs",
+    "architecture:map": "node scripts/native-architecture.mjs --map",
+    "test:native-wiring": "PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s terraform/modules/compute/native-runs/tests -p 'test_*.py'"
   },
   "devDependencies": {
     "@aws-sdk/client-apigatewaymanagementapi": "^3.1092.0",
@@ -90,6 +93,7 @@
     "@smithy/config-resolver": "^4.6.10",
     "@smithy/node-config-provider": "^3.0.0",
     "@vitest/coverage-v8": "^4.1.11",
+    "acorn": "8.18.0",
     "aws-sdk-client-mock": "^4.1.0",
     "aws-sdk-client-mock-vitest": "^7.1.0",
     "dependency-cruiser": "^16.10.4",

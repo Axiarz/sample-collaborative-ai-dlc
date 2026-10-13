@@ -716,6 +716,399 @@ export const createNativeExecutor = ({
       fail(model ? 'native_execution_command_failed' : 'native_execution_initialization_failed');
     return result;
   };
+  // Preparation owns package/harness installation; it returns the exact one-turn context.
+  const prepareNativeTurn = async (payload, onActivity) => {
+    timing('preparationStarted');
+    const signal = current.controller.signal;
+    const continuing = payload.command === 'native-continue';
+    const prepared = continuing
+      ? await prepareContinuation({ payload, signal })
+      : await prepare({ payload, root, project, home: current.home, signal });
+    timing('preparationCompleted');
+    checkCancelled();
+    await checkDirectories();
+    const pkg = continuing ? current.package : prepared?.package;
+    const configuration = payload.configuration;
+    if (
+      !pkg ||
+      pkg.version !== configuration.packageVersion ||
+      !safeText(pkg.packageId, 128) ||
+      ![pkg.directory, pkg.binaryPath].every(
+        (path) => typeof path === 'string' && isAbsolute(path) && resolve(path) === path,
+      ) ||
+      !within(root, pkg.directory) ||
+      within(project, pkg.directory) ||
+      within(control, pkg.directory) ||
+      !pkg.binaryPath.startsWith(`${pkg.directory}/`) ||
+      (!continuing && prepared.repositoryCommit !== configuration.repository.commit) ||
+      !prepared.authEnv ||
+      typeof prepared.authEnv !== 'object'
+    )
+      fail('native_execution_preparation_invalid');
+    await privateDirectory(pkg.directory);
+    const auth = getDriver(configuration.harness).envForAuth(prepared.authEnv);
+    if (
+      !text(
+        configuration.harness === 'kiro' ? auth.KIRO_API_KEY : auth.AWS_BEARER_TOKEN_BEDROCK,
+        64 * 1024,
+      )
+    )
+      fail('native_execution_credentials_missing');
+    let harnessBaseline;
+    try {
+      // prepare has verified the checkout commit and removed Git credentials.
+      // Never learn baseline directories after any package command has run.
+      if (!continuing)
+        harnessBaseline = await captureNativeInitializationBaseline({
+          projectDirectory: project,
+          harness: configuration.harness,
+        });
+    } catch (error) {
+      current.report.initializationChecks = [{ id: 'harness-layout', status: 'failed' }];
+      current.report.initializationBaselineReason =
+        nativeInitializationBaselineReason(error?.baselineReason) ?? 'baseline-read-failed';
+      fail('native_execution_initialization_unverified');
+    }
+    const forbiddenBytes = [
+      ...(current.forbiddenBytes ?? []),
+      ...[prepared.authEnv.AWS_BEARER_TOKEN_BEDROCK, prepared.authEnv.KIRO_API_KEY].filter(Boolean),
+      ...(prepared.forbiddenBytes ?? []),
+    ];
+    const activityTurn = activityLog().turn({
+      sequence: current.report.sequence,
+      harness: configuration.harness,
+      forbiddenBytes,
+      signal,
+    });
+    onActivity(activityTurn);
+    activityTurn.lifecycle({ title: 'Preparing native harness' });
+    timing('installationStarted');
+    // Kept only in the hot owner for subsequent credential leak checks.
+    // Never serialize these values into local status, messages or Git.
+    current.forbiddenBytes = [...new Set(forbiddenBytes)];
+    const baseEnv = {
+      HOME: current.home,
+      TMPDIR: '/tmp',
+      PATH: `${join(root, 'machine/bin')}:${HOST_PATH}`,
+      LANG: 'C.UTF-8',
+      LC_ALL: 'C.UTF-8',
+      AIDLC_INSTALL_ROOT: join(root, 'machine/data'),
+      AIDLC_BIN_DIR: join(root, 'machine/bin'),
+      AIDLC_OFFLINE: '1',
+      AIDLC_PROJECT_DIR: project,
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      ...(safeText(pkg.sourceRepository, 1024)
+        ? {
+            AIDLC_RELEASE_REPOSITORY: pkg.sourceRepository,
+            AIDLC_RELEASE_WORKFLOW: `${pkg.sourceRepository}/.github/workflows/release.yml`,
+          }
+        : {}),
+    };
+    const binary = join(root, 'machine/bin/aidlc');
+    if (!continuing)
+      for (const invocation of [
+        {
+          command: pkg.binaryPath,
+          args: ['use', pkg.version, '--from', pkg.directory, '--offline', '--json'],
+        },
+        {
+          command: binary,
+          args: [
+            'config',
+            '--pin',
+            pkg.version,
+            '--project-dir',
+            project,
+            '--from',
+            pkg.directory,
+            '--offline',
+            '--json',
+          ],
+        },
+        {
+          command: binary,
+          args: [
+            'config',
+            '--harness',
+            configuration.harness,
+            '--project-dir',
+            project,
+            '--from',
+            join(root, 'machine/data/versions', pkg.version, 'runtime', configuration.harness),
+            '--mcp',
+            'none',
+            '--yes',
+            '--json',
+          ],
+        },
+      ])
+        await run(invocation, baseEnv);
+    if (!continuing) {
+      const inspection = await inspectInitialization({
+        projectDirectory: project,
+        installRoot: join(root, 'machine/data'),
+        version: pkg.version,
+        harness: configuration.harness,
+        harnessBaseline,
+      });
+      if (inspection?.ok !== true) {
+        current.report.initializationChecks = nativeInitializationCheckStatuses(inspection?.checks);
+        fail('native_execution_initialization_unverified');
+      }
+      await checkDirectories();
+      if (configuration.harness === 'claude') await configureNativeClaudeSessionEnd(project);
+      current.package = structuredClone(pkg);
+    }
+    timing('installationCompleted');
+    return {
+      payload,
+      signal,
+      continuing,
+      pkg,
+      configuration,
+      forbiddenBytes,
+      activityTurn,
+      auth,
+      baseEnv,
+    };
+  };
+
+  // One turn returns quiescent output. No publication or recovery head is admitted here.
+  const runNativeTurn = async ({
+    payload,
+    signal,
+    continuing,
+    pkg,
+    configuration,
+    forbiddenBytes,
+    activityTurn,
+    auth,
+    baseEnv,
+  }) => {
+    // A spec from an earlier turn must never describe this turn's question.
+    await clearNativePendingSpec(project);
+    const beforeFiles = (await snapshot({ project, signal, forbiddenBytes })).files.map(fileRef);
+    const modelEnv = {
+      ...auth,
+      ...baseEnv,
+      ...(auth.AWS_REGION ? { AWS_REGION: auth.AWS_REGION } : {}),
+      CLAUDE_CONFIG_DIR: join(current.home, '.claude'),
+      CODEX_HOME: join(current.home, '.codex'),
+      XDG_CONFIG_HOME: join(current.home, '.config'),
+      XDG_DATA_HOME: join(current.home, '.data'),
+      XDG_CACHE_HOME: join(current.home, '.cache'),
+      OPENCODE_DISABLE_AUTOUPDATE: '1',
+    };
+    const prompt = continuing
+      ? payload.text
+      : nativeFirstTurnPrompt({
+          harness: configuration.harness,
+          request: configuration.prompt,
+        });
+    const nextPromptEvidence =
+      configuration.harness === 'kiro'
+        ? await resolveKiroPromptEvidence({ project, prompt })
+        : null;
+    const output = createNativeTurnOutput({
+      harness: configuration.harness,
+      nativeSessionId: continuing ? current.head.nativeSessionId : null,
+      forbiddenBytes,
+    });
+    await checkpoint('running', { packageId: pkg.packageId });
+    activityTurn.lifecycle({ title: 'Agent started' });
+    const result = await run(
+      {
+        ...nativeExecutionInvocation({
+          harness: configuration.harness,
+          model: configuration.model,
+          prompt,
+          project,
+          nativeSessionId: continuing ? current.head.nativeSessionId : null,
+          promptEvidence: current.promptEvidence,
+          priorAssistantSha256: current.priorAssistantSha256,
+        }),
+        onStdoutChunk: (chunk) => {
+          if (!current.report.timings.firstOutput) timing('firstOutput');
+          output.write(chunk);
+          return activityTurn.write(chunk);
+        },
+      },
+      modelEnv,
+      true,
+    );
+    timing('harnessCompleted');
+    const completed = output.finish();
+    await checkDirectories();
+    const renderedSpec = await readNativePendingSpec(project);
+    const files = await snapshot({ project, signal, forbiddenBytes });
+    const pendingInput = buildNativePendingInput({
+      gate: nativeGateFromSnapshot(files),
+      spec: renderedSpec,
+      messagesText: completed.messages.map((message) => message.text).join('\n'),
+    });
+    const nativeSessionId = completed.nativeSessionId;
+    let outcome = classifyNativeFirstWait({
+      snapshot: files,
+      harness: configuration.harness,
+      beforeFiles,
+    });
+    outcome = {
+      ...outcome,
+      nativeSessionId,
+      outputTruncated: result.outputLimitExceeded === true,
+    };
+    checkCancelled();
+    await checkpoint('publishing', { nativeSessionId, outputTruncated: outcome.outputTruncated });
+    return { completed, files, pendingInput, nativeSessionId, outcome, nextPromptEvidence };
+  };
+
+  // Public receipts and private CLI recovery bytes complete before the local head moves.
+  const publishNativeTurn = async (
+    { signal, pkg, configuration, forbiddenBytes },
+    { completed, files, pendingInput, nativeSessionId, outcome, nextPromptEvidence },
+  ) => {
+    const publicationOutcome =
+      outcome.kind === 'waiting_for_input' ? 'WAITING_FOR_INPUT' : 'STOPPED';
+    const questionPath = outcome.evidence?.questions[0]?.path ?? null;
+    timing('publicationStarted');
+    const uploaded = await publish({
+      identity: current.identity,
+      sequence: current.report.sequence,
+      packageId: pkg.packageId,
+      nativeSessionId,
+      outcome: publicationOutcome,
+      repository: {
+        branch: configuration.repository.branch,
+        commit: configuration.repository.commit,
+      },
+      files: files.files,
+      questionPath,
+      signal,
+    });
+    checkCancelled();
+    timing('publicationCompleted');
+    const publication = uploaded?.receipt;
+    if (
+      uploaded?.uploaded !== true ||
+      !/^[a-f0-9]{64}$/.test(publication?.id ?? '') ||
+      publication.sequence !== current.report.sequence ||
+      publication.outcome !== publicationOutcome ||
+      publication.nativeSessionId !== nativeSessionId ||
+      publication.filesCount !== files.files.length ||
+      !publication.manifest ||
+      publication.manifest.sha256 !== publication.id ||
+      !safeText(publication.manifest.key, 4096) ||
+      !safeText(publication.manifest.versionId, 1024) ||
+      !Number.isSafeInteger(publication.manifest.bytes) ||
+      publication.manifest.bytes < 1 ||
+      (questionPath
+        ? publication.question?.path !== questionPath ||
+          publication.question?.sha256 !== outcome.evidence.questions[0].sha256
+        : publication.question !== null)
+    )
+      fail('native_execution_publication_unconfirmed');
+    // Copy only the documented receipt, never arbitrary callback properties
+    // (such as a request context, SDK metadata or credential-bearing debug).
+    const receipt = {
+      id: publication.id,
+      sequence: publication.sequence,
+      manifest: Object.fromEntries(
+        ['key', 'versionId', 'sha256', 'bytes'].map((key) => [key, publication.manifest[key]]),
+      ),
+      question: publication.question
+        ? {
+            path: publication.question.path,
+            sha256: publication.question.sha256,
+          }
+        : null,
+      outcome: publication.outcome,
+      nativeSessionId: publication.nativeSessionId,
+      filesCount: publication.filesCount,
+    };
+    const interaction = nativeInteractionReceipt(
+      await publishInteraction({
+        identity: current.identity,
+        packageId: pkg.packageId,
+        sequence: current.report.sequence,
+        harness: configuration.harness,
+        nativeSessionId,
+        publicationId: receipt.id,
+        messages: completed.messages,
+        pendingInput,
+        signal,
+      }),
+      current.identity,
+    );
+    checkCancelled();
+    if (
+      interaction.sequence !== receipt.sequence ||
+      interaction.publicationId !== receipt.id ||
+      interaction.nativeSessionId !== nativeSessionId
+    )
+      fail('native_execution_interaction_unconfirmed');
+    let recoveryCheckpoint;
+    const continuation = {
+      promptEvidence: nextPromptEvidence ?? null,
+      priorAssistantSha256: kiroAssistantHash(
+        completed.messages.map((message) => message.text).join(''),
+      ),
+    };
+    if (publishRecovery) {
+      // Quiescent private session state is required for the next reply.
+      // Public artifact/message uploads alone are not a resumable session.
+      const captured = await captureRecovery({
+        project,
+        home: current.home,
+        harness: configuration.harness,
+        nativeSessionId,
+        forbiddenBytes,
+        signal,
+        limits: RECOVERY_CAPTURE_LIMITS,
+      });
+      await checkDirectories();
+      checkCancelled();
+      timing('checkpointUploadStarted');
+      recoveryCheckpoint = await publishRecovery({
+        identity: current.identity,
+        writerGeneration: current.writerGeneration,
+        sequence: receipt.sequence,
+        nativeSessionId,
+        harness: configuration.harness,
+        configurationSha256: current.configurationSha256,
+        packageId: pkg.packageId,
+        imageDigest: env.NATIVE_EXECUTION_IMAGE_DIGEST,
+        publicationId: receipt.id,
+        interactionId: interaction.id,
+        continuation,
+        filesystem: captured.metadata,
+        files: captured.files,
+        forbiddenBytes,
+        signal,
+      });
+      checkCancelled();
+      if (
+        recoveryCheckpoint?.sequence !== receipt.sequence ||
+        !/^[a-f0-9]{64}$/.test(recoveryCheckpoint.id ?? '') ||
+        recoveryCheckpoint.manifest?.sha256 !== recoveryCheckpoint.id
+      )
+        fail('native_execution_recovery_unconfirmed');
+      timing('checkpointUploadCompleted');
+    }
+    await checkpoint('publication_ready', {
+      outcome: publicationOutcome,
+      waitEvidence: outcome.evidence ?? null,
+      stopCode: outcome.code,
+      receipt,
+      interaction,
+      ...(recoveryCheckpoint ? { checkpoint: recoveryCheckpoint } : {}),
+    });
+    checkCancelled();
+    current.head = structuredClone(current.report);
+    current.promptEvidence = continuation.promptEvidence;
+    current.priorAssistantSha256 = continuation.priorAssistantSha256;
+  };
+
   const execute = async (payload) => {
     current.executing = true;
     current.report.timings = { accepted: current.report.updatedAt };
@@ -725,365 +1118,12 @@ export const createNativeExecutor = ({
     });
     let activityTurn;
     try {
-      timing('preparationStarted');
-      const signal = current.controller.signal;
-      const continuing = payload.command === 'native-continue';
-      const prepared = continuing
-        ? await prepareContinuation({ payload, signal })
-        : await prepare({ payload, root, project, home: current.home, signal });
-      timing('preparationCompleted');
-      checkCancelled();
-      await checkDirectories();
-      const pkg = continuing ? current.package : prepared?.package;
-      const configuration = payload.configuration;
-      if (
-        !pkg ||
-        pkg.version !== configuration.packageVersion ||
-        !safeText(pkg.packageId, 128) ||
-        ![pkg.directory, pkg.binaryPath].every(
-          (path) => typeof path === 'string' && isAbsolute(path) && resolve(path) === path,
-        ) ||
-        !within(root, pkg.directory) ||
-        within(project, pkg.directory) ||
-        within(control, pkg.directory) ||
-        !pkg.binaryPath.startsWith(`${pkg.directory}/`) ||
-        (!continuing && prepared.repositoryCommit !== configuration.repository.commit) ||
-        !prepared.authEnv ||
-        typeof prepared.authEnv !== 'object'
-      )
-        fail('native_execution_preparation_invalid');
-      await privateDirectory(pkg.directory);
-      const auth = getDriver(configuration.harness).envForAuth(prepared.authEnv);
-      if (
-        !text(
-          configuration.harness === 'kiro' ? auth.KIRO_API_KEY : auth.AWS_BEARER_TOKEN_BEDROCK,
-          64 * 1024,
-        )
-      )
-        fail('native_execution_credentials_missing');
-      let harnessBaseline;
-      try {
-        // prepare has verified the checkout commit and removed Git credentials.
-        // Never learn baseline directories after any package command has run.
-        if (!continuing)
-          harnessBaseline = await captureNativeInitializationBaseline({
-            projectDirectory: project,
-            harness: configuration.harness,
-          });
-      } catch (error) {
-        current.report.initializationChecks = [{ id: 'harness-layout', status: 'failed' }];
-        current.report.initializationBaselineReason =
-          nativeInitializationBaselineReason(error?.baselineReason) ?? 'baseline-read-failed';
-        fail('native_execution_initialization_unverified');
-      }
-      const forbiddenBytes = [
-        ...(current.forbiddenBytes ?? []),
-        ...[prepared.authEnv.AWS_BEARER_TOKEN_BEDROCK, prepared.authEnv.KIRO_API_KEY].filter(
-          Boolean,
-        ),
-        ...(prepared.forbiddenBytes ?? []),
-      ];
-      activityTurn = activityLog().turn({
-        sequence: current.report.sequence,
-        harness: configuration.harness,
-        forbiddenBytes,
-        signal,
+      const prepared = await prepareNativeTurn(payload, (turn) => {
+        activityTurn = turn;
       });
-      activityTurn.lifecycle({ title: 'Preparing native harness' });
-      timing('installationStarted');
-      // Kept only in the hot owner for subsequent credential leak checks.
-      // Never serialize these values into local status, messages or Git.
-      current.forbiddenBytes = [...new Set(forbiddenBytes)];
-      const baseEnv = {
-        HOME: current.home,
-        TMPDIR: '/tmp',
-        PATH: `${join(root, 'machine/bin')}:${HOST_PATH}`,
-        LANG: 'C.UTF-8',
-        LC_ALL: 'C.UTF-8',
-        AIDLC_INSTALL_ROOT: join(root, 'machine/data'),
-        AIDLC_BIN_DIR: join(root, 'machine/bin'),
-        AIDLC_OFFLINE: '1',
-        AIDLC_PROJECT_DIR: project,
-        GIT_CONFIG_NOSYSTEM: '1',
-        GIT_CONFIG_GLOBAL: '/dev/null',
-        ...(safeText(pkg.sourceRepository, 1024)
-          ? {
-              AIDLC_RELEASE_REPOSITORY: pkg.sourceRepository,
-              AIDLC_RELEASE_WORKFLOW: `${pkg.sourceRepository}/.github/workflows/release.yml`,
-            }
-          : {}),
-      };
-      const binary = join(root, 'machine/bin/aidlc');
-      if (!continuing)
-        for (const invocation of [
-          {
-            command: pkg.binaryPath,
-            args: ['use', pkg.version, '--from', pkg.directory, '--offline', '--json'],
-          },
-          {
-            command: binary,
-            args: [
-              'config',
-              '--pin',
-              pkg.version,
-              '--project-dir',
-              project,
-              '--from',
-              pkg.directory,
-              '--offline',
-              '--json',
-            ],
-          },
-          {
-            command: binary,
-            args: [
-              'config',
-              '--harness',
-              configuration.harness,
-              '--project-dir',
-              project,
-              '--from',
-              join(root, 'machine/data/versions', pkg.version, 'runtime', configuration.harness),
-              '--mcp',
-              'none',
-              '--yes',
-              '--json',
-            ],
-          },
-        ])
-          await run(invocation, baseEnv);
-      if (!continuing) {
-        const inspection = await inspectInitialization({
-          projectDirectory: project,
-          installRoot: join(root, 'machine/data'),
-          version: pkg.version,
-          harness: configuration.harness,
-          harnessBaseline,
-        });
-        if (inspection?.ok !== true) {
-          current.report.initializationChecks = nativeInitializationCheckStatuses(
-            inspection?.checks,
-          );
-          fail('native_execution_initialization_unverified');
-        }
-        await checkDirectories();
-        if (configuration.harness === 'claude') await configureNativeClaudeSessionEnd(project);
-        current.package = structuredClone(pkg);
-      }
-      timing('installationCompleted');
-      // A spec from an earlier turn must never describe this turn's question.
-      await clearNativePendingSpec(project);
-      const beforeFiles = (await snapshot({ project, signal, forbiddenBytes })).files.map(fileRef);
-      const modelEnv = {
-        ...auth,
-        ...baseEnv,
-        ...(auth.AWS_REGION ? { AWS_REGION: auth.AWS_REGION } : {}),
-        CLAUDE_CONFIG_DIR: join(current.home, '.claude'),
-        CODEX_HOME: join(current.home, '.codex'),
-        XDG_CONFIG_HOME: join(current.home, '.config'),
-        XDG_DATA_HOME: join(current.home, '.data'),
-        XDG_CACHE_HOME: join(current.home, '.cache'),
-        OPENCODE_DISABLE_AUTOUPDATE: '1',
-      };
-      const prompt = continuing
-        ? payload.text
-        : nativeFirstTurnPrompt({
-            harness: configuration.harness,
-            request: configuration.prompt,
-          });
-      const nextPromptEvidence =
-        configuration.harness === 'kiro'
-          ? await resolveKiroPromptEvidence({ project, prompt })
-          : null;
-      const output = createNativeTurnOutput({
-        harness: configuration.harness,
-        nativeSessionId: continuing ? current.head.nativeSessionId : null,
-        forbiddenBytes,
-      });
-      await checkpoint('running', { packageId: pkg.packageId });
-      activityTurn.lifecycle({ title: 'Agent started' });
-      const result = await run(
-        {
-          ...nativeExecutionInvocation({
-            harness: configuration.harness,
-            model: configuration.model,
-            prompt,
-            project,
-            nativeSessionId: continuing ? current.head.nativeSessionId : null,
-            promptEvidence: current.promptEvidence,
-            priorAssistantSha256: current.priorAssistantSha256,
-          }),
-          onStdoutChunk: (chunk) => {
-            if (!current.report.timings.firstOutput) timing('firstOutput');
-            output.write(chunk);
-            return activityTurn.write(chunk);
-          },
-        },
-        modelEnv,
-        true,
-      );
-      timing('harnessCompleted');
-      const completed = output.finish();
-      await checkDirectories();
-      const renderedSpec = await readNativePendingSpec(project);
-      const files = await snapshot({ project, signal, forbiddenBytes });
-      const pendingInput = buildNativePendingInput({
-        gate: nativeGateFromSnapshot(files),
-        spec: renderedSpec,
-        messagesText: completed.messages.map((message) => message.text).join('\n'),
-      });
-      const nativeSessionId = completed.nativeSessionId;
-      let outcome = classifyNativeFirstWait({
-        snapshot: files,
-        harness: configuration.harness,
-        beforeFiles,
-      });
-      outcome = {
-        ...outcome,
-        nativeSessionId,
-        outputTruncated: result.outputLimitExceeded === true,
-      };
-      checkCancelled();
-      await checkpoint('publishing', { nativeSessionId, outputTruncated: outcome.outputTruncated });
-      const publicationOutcome =
-        outcome.kind === 'waiting_for_input' ? 'WAITING_FOR_INPUT' : 'STOPPED';
-      const questionPath = outcome.evidence?.questions[0]?.path ?? null;
-      timing('publicationStarted');
-      const uploaded = await publish({
-        identity: current.identity,
-        sequence: current.report.sequence,
-        packageId: pkg.packageId,
-        nativeSessionId,
-        outcome: publicationOutcome,
-        repository: {
-          branch: configuration.repository.branch,
-          commit: configuration.repository.commit,
-        },
-        files: files.files,
-        questionPath,
-        signal,
-      });
-      checkCancelled();
-      timing('publicationCompleted');
-      const publication = uploaded?.receipt;
-      if (
-        uploaded?.uploaded !== true ||
-        !/^[a-f0-9]{64}$/.test(publication?.id ?? '') ||
-        publication.sequence !== current.report.sequence ||
-        publication.outcome !== publicationOutcome ||
-        publication.nativeSessionId !== nativeSessionId ||
-        publication.filesCount !== files.files.length ||
-        !publication.manifest ||
-        publication.manifest.sha256 !== publication.id ||
-        !safeText(publication.manifest.key, 4096) ||
-        !safeText(publication.manifest.versionId, 1024) ||
-        !Number.isSafeInteger(publication.manifest.bytes) ||
-        publication.manifest.bytes < 1 ||
-        (questionPath
-          ? publication.question?.path !== questionPath ||
-            publication.question?.sha256 !== outcome.evidence.questions[0].sha256
-          : publication.question !== null)
-      )
-        fail('native_execution_publication_unconfirmed');
-      // Copy only the documented receipt, never arbitrary callback properties
-      // (such as a request context, SDK metadata or credential-bearing debug).
-      const receipt = {
-        id: publication.id,
-        sequence: publication.sequence,
-        manifest: Object.fromEntries(
-          ['key', 'versionId', 'sha256', 'bytes'].map((key) => [key, publication.manifest[key]]),
-        ),
-        question: publication.question
-          ? {
-              path: publication.question.path,
-              sha256: publication.question.sha256,
-            }
-          : null,
-        outcome: publication.outcome,
-        nativeSessionId: publication.nativeSessionId,
-        filesCount: publication.filesCount,
-      };
-      const interaction = nativeInteractionReceipt(
-        await publishInteraction({
-          identity: current.identity,
-          packageId: pkg.packageId,
-          sequence: current.report.sequence,
-          harness: configuration.harness,
-          nativeSessionId,
-          publicationId: receipt.id,
-          messages: completed.messages,
-          pendingInput,
-          signal,
-        }),
-        current.identity,
-      );
-      checkCancelled();
-      if (
-        interaction.sequence !== receipt.sequence ||
-        interaction.publicationId !== receipt.id ||
-        interaction.nativeSessionId !== nativeSessionId
-      )
-        fail('native_execution_interaction_unconfirmed');
-      let recoveryCheckpoint;
-      const continuation = {
-        promptEvidence: nextPromptEvidence ?? null,
-        priorAssistantSha256: kiroAssistantHash(
-          completed.messages.map((message) => message.text).join(''),
-        ),
-      };
-      if (publishRecovery) {
-        // Quiescent private session state is required for the next reply.
-        // Public artifact/message uploads alone are not a resumable session.
-        const captured = await captureRecovery({
-          project,
-          home: current.home,
-          harness: configuration.harness,
-          nativeSessionId,
-          forbiddenBytes,
-          signal,
-          limits: RECOVERY_CAPTURE_LIMITS,
-        });
-        await checkDirectories();
-        checkCancelled();
-        timing('checkpointUploadStarted');
-        recoveryCheckpoint = await publishRecovery({
-          identity: current.identity,
-          writerGeneration: current.writerGeneration,
-          sequence: receipt.sequence,
-          nativeSessionId,
-          harness: configuration.harness,
-          configurationSha256: current.configurationSha256,
-          packageId: pkg.packageId,
-          imageDigest: env.NATIVE_EXECUTION_IMAGE_DIGEST,
-          publicationId: receipt.id,
-          interactionId: interaction.id,
-          continuation,
-          filesystem: captured.metadata,
-          files: captured.files,
-          forbiddenBytes,
-          signal,
-        });
-        checkCancelled();
-        if (
-          recoveryCheckpoint?.sequence !== receipt.sequence ||
-          !/^[a-f0-9]{64}$/.test(recoveryCheckpoint.id ?? '') ||
-          recoveryCheckpoint.manifest?.sha256 !== recoveryCheckpoint.id
-        )
-          fail('native_execution_recovery_unconfirmed');
-        timing('checkpointUploadCompleted');
-      }
-      await checkpoint('publication_ready', {
-        outcome: publicationOutcome,
-        waitEvidence: outcome.evidence ?? null,
-        stopCode: outcome.code,
-        receipt,
-        interaction,
-        ...(recoveryCheckpoint ? { checkpoint: recoveryCheckpoint } : {}),
-      });
-      checkCancelled();
-      current.head = structuredClone(current.report);
-      current.promptEvidence = continuation.promptEvidence;
-      current.priorAssistantSha256 = continuation.priorAssistantSha256;
+      activityTurn = prepared.activityTurn;
+      const result = await runNativeTurn(prepared);
+      await publishNativeTurn(prepared, result);
     } catch (error) {
       // Never expose raw port/subprocess errors (which may contain credentials).
       const code = /^(native_execution|native_snapshot|native_recovery)_[a-z_]{1,64}$/.test(

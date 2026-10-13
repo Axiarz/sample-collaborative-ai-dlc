@@ -39,6 +39,16 @@ def actions(source):
         for action in re.findall(r'"([^"]+)"', field)
     )
 
+def has_control_mutation(source):
+    return any(
+        fnmatchcase(required, allowed)
+        for allowed in actions(source)
+        for required in [
+            "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem",
+            "dynamodb:TransactWriteItems", "dynamodb:BatchWriteItem",
+        ]
+    )
+
 def permits_s3(source, action, key):
     """Evaluate this module's explicit S3 Allow action/resource pairs offline."""
     resource = f"arn:aws:s3:::test-publications/{key}"
@@ -60,6 +70,43 @@ def permits_s3(source, action, key):
 
 
 class NativeExecutionWiring(unittest.TestCase):
+    def test_only_native_authority_can_mutate_control_records(self):
+        projection = (MODULE / "projection.tf").read_text()
+        wakeup = (MODULE / "wakeup.tf").read_text()
+        for source, header in [
+            (MAIN, 'resource "aws_iam_role_policy" "api"'),
+            (MAIN, 'resource "aws_iam_role_policy" "worker"'),
+            (EXECUTION, 'resource "aws_iam_role_policy" "execution_worker"'),
+            (projection, 'resource "aws_iam_role_policy" "projection"'),
+            (wakeup, 'resource "aws_iam_role_policy" "wakeup"'),
+        ]:
+            with self.subTest(role=header):
+                self.assertFalse(has_control_mutation(block(source, header)))
+        authority = (MODULE / "authority.tf").read_text()
+        self.assertTrue(has_control_mutation(authority))
+        self.assertIn('"dynamodb:LeadingKeys" = ["NATIVE#*"]', authority)
+        self.assertNotIn('NATIVE_RUNTIME_IMAGE#', authority)
+        # The credential reader retains rotation writes to credential tables.
+        # Its only native-control grant is the independently checked read.
+        credentials = block(EXECUTION, 'resource "aws_iam_role_policy" "execution_credentials"')
+        native_read = credentials.split('Sid      = "ReadNativeExecutionAuthority"', 1)[1].split("},", 1)[0]
+        self.assertEqual(actions(native_read), {"dynamodb:GetItem"})
+        self.assertEqual(credentials.count("aws_dynamodb_table.bindings.arn"), 1)
+
+    def test_control_mutation_guard_rejects_wildcards_and_single_item_bypasses(self):
+        for action in ["*", "dynamodb:*", "dynamodb:Put*", "dynamodb:UpdateItem", "dynamodb:TransactWriteItems"]:
+            self.assertTrue(has_control_mutation(f'Action = ["{action}"]'))
+        self.assertFalse(has_control_mutation('Action = ["dynamodb:GetItem", "dynamodb:Query"]'))
+
+    def test_adapters_can_invoke_only_their_authority_alias(self):
+        api = block(MAIN, 'resource "aws_iam_role_policy" "api"')
+        preparation = block(MAIN, 'resource "aws_iam_role_policy" "worker"')
+        execution = block(EXECUTION, 'resource "aws_iam_role_policy" "execution_worker"')
+        projection = block((MODULE / "projection.tf").read_text(), 'resource "aws_iam_role_policy" "projection"')
+        for name, source in [("commands", api), ("preparation", preparation), ("execution", execution), ("projection", projection)]:
+            aliases = re.findall(r'NATIVE_AUTHORITY_FUNCTION\}:([^"]+)"', source)
+            self.assertEqual(aliases, [name])
+
     def test_only_execution_poller_allows_intentional_lambda_recursion(self):
         # The deployed first turn lost its status pointer to Lambda's recursion
         # cutoff. Allow only this deliberately self-scheduling controller.
@@ -104,7 +151,8 @@ class NativeExecutionWiring(unittest.TestCase):
 
     def test_runtime_boundary_extends_only_scoped_s3_access(self):
         boundary = block(MAIN, 'resource "aws_iam_policy" "runtime_boundary"')
-        self.assertIn("var.execution_enabled ? local.execution_runtime_boundary_statements : []", boundary)
+        self.assertIn("local.execution_runtime_boundary_statements", boundary)
+        self.assertNotIn("var.execution_enabled ?", boundary)
         extension = EXECUTION.split("execution_runtime_boundary_statements = [", 1)[1].split("\n}\n", 1)[0]
         self.assertEqual(actions(extension), {"s3:GetObjectVersion", "s3:PutObject", "s3:GetObject"})
         self.assertIn("${var.native_packages_bucket_arn}/native-packages/v1/*", extension)
@@ -117,7 +165,7 @@ class NativeExecutionWiring(unittest.TestCase):
     def test_api_cannot_redeem_credentials_or_write_publications(self):
         api = EXECUTION.split("execution_api_statements = [", 1)[1].split("execution_runtime_boundary_statements = [", 1)[0]
         self.assertEqual(actions(api), {
-            "dynamodb:ConditionCheckItem", "dynamodb:GetItem", "dynamodb:Query", "ssm:GetParameter",
+            "dynamodb:GetItem", "dynamodb:Query", "ssm:GetParameter",
             "lambda:InvokeFunction", "s3:GetObjectVersion", "sqs:SendMessage",
         })
         # Output history queries are restricted to the protected native table.
@@ -150,15 +198,16 @@ class NativeExecutionWiring(unittest.TestCase):
         worker = block(EXECUTION, 'resource "aws_iam_role_policy" "execution_worker"')
         allowed = actions(worker)
         self.assertTrue({
-            "dynamodb:ConditionCheckItem", "dynamodb:GetItem", "dynamodb:PutItem",
+            "dynamodb:GetItem",
             "bedrock-agentcore:UpdateAgentRuntime", "bedrock-agentcore:StopRuntimeSession",
             "bedrock-agentcore:InvokeAgentRuntime", "lambda:InvokeFunction",
-            "neptune-db:ReadDataViaQuery", "neptune-db:WriteDataViaQuery",
+            "neptune-db:ReadDataViaQuery",
         } <= allowed)
         self.assertFalse({
             "iam:CreateRole", "elasticfilesystem:CreateAccessPoint",
             "bedrock-agentcore:CreateAgentRuntime", "ssm:GetParameter",
-            "secretsmanager:GetSecretValue",
+            "secretsmanager:GetSecretValue", "dynamodb:PutItem", "dynamodb:ConditionCheckItem",
+            "neptune-db:WriteDataViaQuery", "neptune-db:DeleteDataViaQuery",
         } & allowed)
         self.assertIn("module.execution_credentials[0].lambda_function_arn", worker)
         self.assertNotIn("credential_broker", worker)
@@ -175,20 +224,13 @@ class NativeExecutionWiring(unittest.TestCase):
         # cardinality.single replacing a value. Read+Write alone denied the first
         # native projection even though publication and serialization succeeded.
         worker = block(EXECUTION, 'resource "aws_iam_role_policy" "execution_worker"')
-        projection = worker.split(
-            'Sid      = "AuthorizeAndProjectNativeExecution"', 1,
-        )[1].split("},", 1)[0]
-        self.assertEqual(actions(projection), {
+        projection = block((MODULE / "projection.tf").read_text(), 'resource "aws_iam_role_policy" "projection"')
+        self.assertTrue({
             "neptune-db:connect", "neptune-db:ReadDataViaQuery",
             "neptune-db:WriteDataViaQuery", "neptune-db:DeleteDataViaQuery",
-        })
-        self.assertRegex(projection, r'Effect\s*=\s*"Allow"')
-        self.assertRegex(projection, r"Resource\s*=\s*local\.graph_arn\s*$")
-        self.assertIn(
-            '"arn:${local.partition}:neptune-db:${local.region}:${local.account_id}:${var.neptune_cluster_resource_id}/*"',
-            EXECUTION,
-        )
-        self.assertRegex(worker, r"role\s*=\s*aws_iam_role\.execution_worker\[0\]\.id")
+        } <= actions(projection))
+        self.assertNotIn("neptune-db:WriteDataViaQuery", actions(worker))
+        self.assertIn("local.graph_arn", projection)
         api_extension, runtime_extension = EXECUTION.split(
             "execution_api_statements = [", 1,
         )[1].split("execution_runtime_boundary_statements = [", 1)
@@ -306,7 +348,7 @@ class NativeExecutionWiring(unittest.TestCase):
                 for pattern in [
                     rf'handler\s*=\s*"{handler}"', r'runtime\s*=\s*"nodejs24.x"',
                     r'architectures\s*=\s*\["arm64"\]', r'memory_size\s*=\s*512',
-                    rf'timeout\s*=\s*{timeout}', r'count\s*=\s*var.execution_enabled \? 1 : 0',
+                    rf'timeout\s*=\s*{timeout}', r'count\s*=\s*1',
                     r'vpc_subnet_ids\s*=\s*var.api_subnet_ids',
                     r'vpc_security_group_ids\s*=\s*var.api_security_group_ids',
                     r'POWERTOOLS_LOGGER_LOG_EVENT\s*=\s*"false"',

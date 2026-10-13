@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "reviewers": ["leandrodamascena", "svozza", "eipasteur", "JWThewes", "jeromevdl"],
+  "records": {
+    "RUNTIME": {
+      "owner": "native-authority",
+      "commands": ["commands:create", "commands:prepare"],
+      "observations": ["preparation:claim/advance/release/fail/ready"],
+      "role": "authority",
+      "adapters": ["api", "worker"]
+    },
+    "EXECUTION": {
+      "owner": "native-authority",
+      "commands": ["commands:start/respond/cancel/recover"],
+      "observations": [
+        "execution:claim/advance/dispatchAttempted/dispatched/recoveryStopped/recovered/recoveryRequired/publish"
+      ],
+      "role": "authority",
+      "adapters": ["execution_worker", "cancellation_worker"]
+    },
+    "RESPONSE/PUBLICATION": {
+      "owner": "native-authority",
+      "kind": "immutable transactional history",
+      "role": "authority"
+    },
+    "OUTPUT/OUTPUT_CURSOR": {
+      "owner": "native-authority",
+      "observations": ["execution:activity.ingest"],
+      "role": "authority"
+    },
+    "PROJECTION": {
+      "owner": "native-authority",
+      "observations": ["projection:claim/acknowledge/release"],
+      "role": "authority",
+      "effectRole": "projection"
+    },
+    "REVOCATION": {
+      "owner": "operator",
+      "partition": "NATIVE_RUNTIME_IMAGE#*",
+      "role": "operator only"
+    },
+    "DiscussionMessage": {
+      "owner": "discussions",
+      "observations": ["assist-result:request/attempt-bound completion"],
+      "role": "discussions",
+      "limit": "Shared platform runtime retains legacy graph permissions; Quorum module bypass forbidden by code review/check"
+    },
+    "workflow-files": {
+      "owner": "admitted runtime generation",
+      "limit": "same UID tools share write authority"
+    },
+    "Yjs": {
+      "owner": "Yjs persistence",
+      "limit": "drafts only"
+    }
+  },
+  "controlWriters": [
+    "lambda/native-runtime-control/store.js",
+    "lambda/native-runtime-control/execution-store.js",
+    "lambda/native-runtime-control/activity-store.js",
+    "lambda/native-runtime-control/projection-store.js"
+  ],
+  "mutatorModules": {
+    "lambda/native-runtime-control/store.js": "createNativeRuntimeStore",
+    "lambda/native-runtime-control/execution-store.js": "createNativeExecutionStore",
+    "lambda/native-runtime-control/activity-store.js": "createNativeActivityStore",
+    "lambda/native-runtime-control/projection-store.js": "createNativeProjectionStore"
+  },
+  "mutatorFactories": {
+    "createNativeRuntimeStore": [
+      "lambda/native-runtime-control/authority.js",
+      "lambda/native-runtime-control/command-service.js",
+      "lambda/native-runtime-control/execution-credentials-entry.js"
+    ],
+    "createNativeExecutionStore": [
+      "lambda/native-runtime-control/authority.js",
+      "lambda/native-runtime-control/command-service.js",
+      "lambda/native-runtime-control/execution-credentials-entry.js"
+    ],
+    "createNativeActivityStore": [
+      "lambda/native-runtime-control/authority.js",
+      "lambda/native-runtime-control/command-service.js"
+    ],
+    "createNativeProjectionStore": [
+      "lambda/native-runtime-control/authority.js",
+      "lambda/native-runtime-control/command-service.js"
+    ]
+  },
+  "complexityExceptions": {}
+}

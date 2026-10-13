@@ -1,3 +1,24 @@
+import {
+  fail,
+  hash,
+  recoveryStopId,
+  writerOptions,
+  verifyPublicProjectFiles,
+  writerPayload,
+  checkReportIdentity,
+  admitted,
+  ownerErrors,
+  statusOwnerErrors,
+  markRuntimeReadFailure,
+  failRuntimeRead,
+  shortTransportRetry,
+  statusReadFailure,
+  phaseError,
+  checkedCredentials,
+  reconcileNativeRecovery,
+  reconcileNativeDispatch,
+  verifyCompletedNativeTurn,
+} from './execution-lifecycle.js';
 import { createHash } from 'node:crypto';
 import gremlin from 'gremlin';
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers';
@@ -15,12 +36,8 @@ import { EFSClient } from '@aws-sdk/client-efs';
 import { S3Client } from '@aws-sdk/client-s3';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
-import { createNativeRuntimeStore, ID, UUID_V4, matches } from './store.js';
-import {
-  createNativeExecutionStore,
-  nativeTurnSequence,
-  nativeWriterGeneration,
-} from './execution-store.js';
+import { ID, UUID_V4, matches } from './store.js';
+import { nativeTurnSequence, nativeWriterGeneration } from './execution-store.js';
 import {
   createExecutionRuntimeUpgrade,
   executionIdentity,
@@ -31,14 +48,11 @@ import { createNativePublications } from '../shared/native-publication.js';
 import { createNativeInteractions } from '../shared/native-interaction.js';
 import { createNativeExecutionFence } from '../shared/native-execution-fence.js';
 import { createNativeRecoveryCheckpoints } from '../shared/native-recovery-checkpoint.js';
-import { nativeFileExclusion } from '../shared/native-project-files.js';
 import { createWorkflowSourceService } from '../shared/workflow-source-service.js';
 import { fetchWorkflowSourceMembership } from '../shared/workflow-source-membership.js';
-import { projectNativePublication, readNativePublicationInteraction } from './publication-graph.js';
 import { createNativeRuntimeImagePolicy } from './runtime-images.js';
-import { createNativeActivityStore } from './activity-store.js';
+import { executionObservationPort, nativeAuthorityPort } from './authority-client.js';
 import { recordNativeBoundary } from '../shared/native-lifecycle.js';
-import { broadcastToNativeIntentChannel } from '../shared/ws-fanout.js';
 import {
   createNativeExecutionDiagnostics,
   emitNativeExecutionDiagnostic,
@@ -47,201 +61,6 @@ import {
   nativeDiagnosticReport,
   nativeDiagnosticResponse,
 } from './execution-diagnostics.js';
-
-const fail = (code) => {
-  throw Object.assign(new Error(code), { code });
-};
-const hash = (value) => createHash('sha256').update(value).digest('hex');
-const recoveryStopId = (row, reason) => {
-  const digest = hash(
-    JSON.stringify({
-      purpose: 'native-recovery-required',
-      identity: executionIdentity(row),
-      writerGeneration: nativeWriterGeneration(row),
-      sequence: nativeTurnSequence(row),
-      reason,
-      recoveryId: row.recovery?.id ?? null,
-    }),
-  );
-  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
-};
-const writerOptions = (row) => ({ writerGeneration: nativeWriterGeneration(row) });
-const excludedProjectPath = (path) => {
-  // The publisher applies its predicate before descending into directories.
-  // Apply it to ancestors too so children of private lock directories retain
-  // exactly that same visibility when verifying a flat checkpoint inventory.
-  let prefix = '';
-  for (const part of path.split('/')) {
-    prefix = prefix ? `${prefix}/${part}` : part;
-    if (nativeFileExclusion(prefix)) return true;
-  }
-  return false;
-};
-const verifyPublicProjectFiles = (checkpoint, publication) => {
-  if (!Array.isArray(checkpoint.files) || !Array.isArray(publication.files))
-    fail('NATIVE_RECOVERY_INVALID');
-  const files = new Map();
-  const published = new Set();
-  try {
-    for (const file of checkpoint.files) {
-      if (file.scope !== 'project' || excludedProjectPath(file.path)) continue;
-      if (files.has(file.path)) fail('NATIVE_RECOVERY_INVALID');
-      files.set(file.path, file);
-    }
-    if (files.size !== publication.files.length) fail('NATIVE_RECOVERY_INVALID');
-    for (const file of publication.files) {
-      const restored = files.get(file.path);
-      if (
-        excludedProjectPath(file.path) ||
-        published.has(file.path) ||
-        !restored ||
-        restored.bytes !== file.bytes ||
-        restored.sha256 !== file.sha256
-      )
-        fail('NATIVE_RECOVERY_INVALID');
-      published.add(file.path);
-    }
-  } catch {
-    fail('NATIVE_RECOVERY_INVALID');
-  }
-};
-const writerPayload = (row) => ({
-  ...executionIdentity(row),
-  ...(row.writerGeneration === undefined ? {} : writerOptions(row)),
-});
-const checkReportIdentity = (row, report) => {
-  // Old pinned servers reject extra status fields and never reported writer
-  // generations. Only rows created before the generation protocol use that
-  // contract. New rows explicitly carry generation 1 and must always echo it.
-  const legacy = row.writerGeneration === undefined && report?.writerGeneration === undefined;
-  if (
-    Object.entries(executionIdentity(row)).some(([key, value]) => report?.[key] !== value) ||
-    (!legacy && report?.writerGeneration !== nativeWriterGeneration(row))
-  )
-    fail('NATIVE_EXECUTION_RUNTIME_MISMATCH');
-};
-const admitted = (row, report) =>
-  report?.sequence === nativeTurnSequence(row) &&
-  (!row.response || report.requestId === row.response.commandId) &&
-  ['preparing', 'running', 'publishing', 'publication_ready'].includes(report.status) &&
-  (report.recovered !== true || report.status === 'publication_ready');
-const priorBoundary = (row, report) =>
-  report?.sequence === row.publication?.sequence &&
-  report?.nativeSessionId === row.publication?.nativeSessionId &&
-  ((report.status === 'publication_ready' &&
-    report.receipt?.id === row.publication.id &&
-    report.interaction?.id === row.interaction?.id) ||
-    (report.status === 'recovery_ready' &&
-      report.recoveryId === row.lastRecoveryId &&
-      report.checkpointId === row.recoveryCheckpoint?.id &&
-      report.recovered === false));
-const ownerErrors = new Set([
-  'native_execution_existing_owner',
-  'native_execution_owner_conflict',
-  'native_execution_reply_conflict',
-  'native_execution_local_record_unavailable',
-  'native_execution_reply_admission_unconfirmed',
-]);
-const statusOwnerErrors = new Set([
-  ...ownerErrors,
-  'native_execution_scope_mismatch',
-  'native_execution_owner_invalid',
-  'native_execution_local_record_invalid',
-  'native_execution_cancelled',
-]);
-// Transport provenance is local controller state, never an agent-supplied
-// property or a diagnostic logger result. Keep the original thrown error so
-// dispatch/recovery behavior outside acknowledged RUNNING status reads stays
-// unchanged.
-const runtimeReadFailures = new WeakMap();
-const markRuntimeReadFailure = (error, kind) => {
-  if (error && (typeof error === 'object' || typeof error === 'function'))
-    runtimeReadFailures.set(error, kind);
-  return error;
-};
-const failRuntimeRead = (code, kind) => {
-  throw markRuntimeReadFailure(Object.assign(new Error(code), { code }), kind);
-};
-const shortTransportRetry = (error) =>
-  error?.code === 'NATIVE_RECOVERY_UNAVAILABLE' ||
-  [
-    'AbortError',
-    'TimeoutError',
-    'ThrottlingException',
-    'TooManyRequestsException',
-    'ServiceUnavailableException',
-    'InternalServerException',
-    'RetryableConflictException',
-  ].includes(error?.name) ||
-  ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE'].includes(error?.code);
-const statusReadFailure = (error) => {
-  if (statusOwnerErrors.has(error?.code)) return null;
-  const kind = runtimeReadFailures.get(error);
-  if (kind === 'OWNER_REJECTED') return null;
-  if (kind) return kind;
-  // Injected SDK ports can throw the same transport errors without going
-  // through our adapter. A report-identity mismatch is never in this set.
-  if (error?.name === 'RuntimeClientError' || shortTransportRetry(error)) return 'SDK_FAILURE';
-  return null;
-};
-const phaseError = (error) => {
-  // A closed fence on a still-active protected row means earlier failure
-  // cleanup was interrupted. Retry stop/persistence, never reopen dispatch.
-  if (error?.code === 'NATIVE_EXECUTION_CANCELLED') return 'native_execution_failed';
-  if (error?.code === 'NATIVE_EXECUTION_RUNTIME_MISMATCH' || ownerErrors.has(error?.code))
-    return 'native_execution_runtime_mismatch';
-  if (
-    [
-      'NATIVE_PUBLICATION_INVALID',
-      'NATIVE_INTERACTION_INVALID',
-      'NATIVE_RECOVERY_INVALID',
-    ].includes(error?.code)
-  )
-    return 'native_execution_publication_invalid';
-  if (['WORKFLOW_SOURCE_FORBIDDEN', 'NATIVE_EXECUTION_FORBIDDEN'].includes(error?.code))
-    return 'native_execution_access_denied';
-  if (error?.code === 'NATIVE_EXECUTION_IMAGE_REVOKED') return 'native_execution_image_revoked';
-  if (
-    [
-      'WORKFLOW_SOURCE_CONFLICT',
-      'WORKFLOW_SOURCE_NOT_FOUND',
-      'NATIVE_EXECUTION_SOURCE_CHANGED',
-    ].includes(error?.code)
-  )
-    return 'native_execution_source_changed';
-  return null;
-};
-const checkedCredentials = (row, material) => {
-  if (!material?.ok) {
-    const code = material?.code;
-    if (code === 'NATIVE_EXECUTION_CREDENTIALS_FORBIDDEN') fail('NATIVE_EXECUTION_FORBIDDEN');
-    if (code === 'NATIVE_EXECUTION_CREDENTIALS_IMAGE_REVOKED')
-      fail('NATIVE_EXECUTION_IMAGE_REVOKED');
-    if (
-      [
-        'NATIVE_EXECUTION_CREDENTIALS_CHANGED',
-        'NATIVE_EXECUTION_SOURCE_CREDENTIAL_CHANGED',
-        'NATIVE_EXECUTION_MODEL_CREDENTIAL_UNAVAILABLE',
-      ].includes(code)
-    )
-      fail('NATIVE_EXECUTION_SOURCE_CHANGED');
-    // Unavailable transport/provider responses are retried for this attempt;
-    // they do not establish that a binding was changed or a model failed.
-    fail('NATIVE_EXECUTION_CREDENTIALS_UNAVAILABLE');
-  }
-  if (
-    Object.entries(executionIdentity(row)).some(([key, value]) => material[key] !== value) ||
-    typeof material.model?.value !== 'string' ||
-    !material.model.value ||
-    material.model.provider !== row.configuration.credentialBinding.provider ||
-    typeof material.git?.username !== 'string' ||
-    !material.git.username ||
-    typeof material.git.password !== 'string' ||
-    !material.git.password
-  )
-    fail('NATIVE_EXECUTION_RUNTIME_MISMATCH');
-  return material;
-};
 
 export const createNativeExecutionSupervisor =
   ({
@@ -255,7 +74,6 @@ export const createNativeExecutionSupervisor =
     publications,
     interactions,
     checkpoints,
-    project,
     fence,
     diagnostics,
     imagePolicy,
@@ -267,16 +85,16 @@ export const createNativeExecutionSupervisor =
     if (!initial) return { pending: false, status: 'missing' };
     const claim = await store.claim({ ...identity, bindingId: initial.bindingId });
     if (claim.kind !== 'claimed') return { pending: claim.kind === 'busy', status: claim.kind };
-    let row = claim.row;
+    const state = { row: claim.row };
     const draft = await preparationStore.get(identity);
     let observation = {};
     const observe = (value) => emitNativeExecutionDiagnostic(diagnostics, value);
     const observedInvoke = async (input) => {
       const phase = nativeDiagnosticPhase(input.payload.command);
       if (['native-start', 'native-continue', 'native-recover'].includes(input.payload.command))
-        recordNativeBoundary(executionIdentity(row), 'dispatchStarted', now(), {
-          sequence: nativeTurnSequence(row),
-          writerGeneration: nativeWriterGeneration(row),
+        recordNativeBoundary(executionIdentity(state.row), 'dispatchStarted', now(), {
+          sequence: nativeTurnSequence(state.row),
+          writerGeneration: nativeWriterGeneration(state.row),
         });
       try {
         const report = await invoke(input);
@@ -285,19 +103,19 @@ export const createNativeExecutionSupervisor =
           input.payload.command === 'native-status' &&
           report?.capabilities?.includes('activity-v1')
         ) {
-          checkReportIdentity(row, report);
-          let after = await activity.cursor(row);
+          checkReportIdentity(state.row, report);
+          let after = await activity.cursor(state.row);
           for (let page = 0; page < 4; page++) {
             await check();
             const batch = await invoke({
-              execution: row,
+              execution: state.row,
               payload: {
                 command: 'native-activity',
-                ...writerPayload(row),
+                ...writerPayload(state.row),
                 after,
               },
             });
-            const persisted = await activity.ingest(row, batch);
+            const persisted = await activity.ingest(state.row, batch);
             // The next pull is the acknowledgment; this cursor exists only
             // after persistence. A failed transaction leaves the prior cursor.
             if (persisted === after && !batch.events?.length) {
@@ -319,7 +137,7 @@ export const createNativeExecutionSupervisor =
               });
           }
         }
-        observation = { phase, ...nativeDiagnosticReport(row, report) };
+        observation = { phase, ...nativeDiagnosticReport(state.row, report) };
         observe({ ...observation, stage: 'report', code: 'REPORT_OBSERVED' });
         return report;
       } catch (error) {
@@ -332,27 +150,28 @@ export const createNativeExecutionSupervisor =
       const latest = await store.get(identity);
       if (
         !latest ||
-        latest.bindingId !== row.bindingId ||
-        latest.version !== row.version ||
-        latest.epoch !== row.epoch ||
-        latest.leaseToken !== row.leaseToken ||
+        latest.bindingId !== state.row.bindingId ||
+        latest.version !== state.row.version ||
+        latest.epoch !== state.row.epoch ||
+        latest.leaseToken !== state.row.leaseToken ||
         latest.leaseExpiresAt <= now() ||
         (!allowCancelled && latest.cancelRequested)
       )
         fail('NATIVE_EXECUTION_LEASE_LOST');
-      if (!draft || draft.bindingId !== row.bindingId) fail('NATIVE_EXECUTION_SOURCE_CHANGED');
+      if (!draft || draft.bindingId !== state.row.bindingId)
+        fail('NATIVE_EXECUTION_SOURCE_CHANGED');
       return latest;
     };
     const check = async () => {
       await current();
-      await authorize({ draft, execution: row });
+      await authorize({ draft, execution: state.row });
       await current();
     };
     const advance = async (patch) => {
-      row = await store.advance({ row, patch });
+      state.row = await store.advance({ row: state.row, patch });
     };
-    const yieldPending = async (status = row.status) => {
-      row = await store.release({ row });
+    const yieldPending = async (status = state.row.status) => {
+      state.row = await store.release({ row: state.row });
       return { pending: true, status };
     };
     const requireRecovery = async (reason) => {
@@ -361,26 +180,26 @@ export const createNativeExecutionSupervisor =
         stage: 'decision',
         code: 'RECOVERY_REQUIRED',
         reason,
-        controlStatus: row.status,
-        dispatchPresent: Boolean(row.dispatch),
-        checkpointPresent: Boolean(row.recoveryCheckpoint),
+        controlStatus: state.row.status,
+        dispatchPresent: Boolean(state.row.dispatch),
+        checkpointPresent: Boolean(state.row.recoveryCheckpoint),
       });
       try {
         await check();
-        const recoveryId = recoveryStopId(row, reason);
+        const recoveryId = recoveryStopId(state.row, reason);
         if (
           reason === 'CHECKPOINT_UNAVAILABLE' &&
-          row.status === 'RECOVERING' &&
-          row.recovery.phase === 'RESTORING'
+          state.row.status === 'RECOVERING' &&
+          state.row.recovery.phase === 'RESTORING'
         ) {
-          const predecessor = await fence.read(executionIdentity(row));
+          const predecessor = await fence.read(executionIdentity(state.row));
           await check();
           if (
             predecessor.state === 'FENCED' &&
-            predecessor.writerGeneration === row.recovery.previousGeneration &&
-            row.recovery.previousGeneration + 1 === nativeWriterGeneration(row) &&
-            ((predecessor.recoveryId === row.recovery.id &&
-              predecessor.reason === row.recovery.reason) ||
+            predecessor.writerGeneration === state.row.recovery.previousGeneration &&
+            state.row.recovery.previousGeneration + 1 === nativeWriterGeneration(state.row) &&
+            ((predecessor.recoveryId === state.row.recovery.id &&
+              predecessor.reason === state.row.recovery.reason) ||
               (predecessor.recoveryId === recoveryId && predecessor.reason === reason))
           ) {
             // RESTORING is protected proof that this predecessor was positively
@@ -388,24 +207,28 @@ export const createNativeExecutionSupervisor =
             // generation closed and replace only the admission episode so a
             // delayed activation CAS cannot reopen it after we block recovery.
             // The deterministic ID also resumes a crash before the table commit.
-            await fence.suspend(executionIdentity(row), {
-              writerGeneration: row.recovery.previousGeneration,
+            await fence.suspend(executionIdentity(state.row), {
+              writerGeneration: state.row.recovery.previousGeneration,
               recoveryId,
               reason,
             });
             await check();
-            row = await store.recoveryRequired({ row, reason, recoveryId });
-            return { pending: false, status: row.status, reason };
+            state.row = await store.recoveryRequired({ row: state.row, reason, recoveryId });
+            return { pending: false, status: state.row.status, reason };
           }
         }
-        await fence.suspend(executionIdentity(row), { ...writerOptions(row), recoveryId, reason });
+        await fence.suspend(executionIdentity(state.row), {
+          ...writerOptions(state.row),
+          recoveryId,
+          reason,
+        });
         await check();
-        const stopped = await stop({ draft, execution: row, recoveryId });
+        const stopped = await stop({ draft, execution: state.row, recoveryId });
         await check();
-        if (stopped?.confirmed !== true || stopped.runtimeSessionId !== row.runtimeSessionId)
+        if (stopped?.confirmed !== true || stopped.runtimeSessionId !== state.row.runtimeSessionId)
           fail('NATIVE_EXECUTION_STOP_UNCONFIRMED');
-        row = await store.recoveryRequired({ row, reason, recoveryId });
-        return { pending: false, status: row.status, reason };
+        state.row = await store.recoveryRequired({ row: state.row, reason, recoveryId });
+        return { pending: false, status: state.row.status, reason };
       } catch (error) {
         if (!shortTransportRetry(error)) throw error;
         await current();
@@ -420,23 +243,23 @@ export const createNativeExecutionSupervisor =
       verifiedPublication,
     ) => {
       if (!checkpoints || !receipt || !interaction) fail('NATIVE_RECOVERY_INVALID');
-      const manifest = await checkpoints.read(executionIdentity(row), receipt, {
+      const manifest = await checkpoints.read(executionIdentity(state.row), receipt, {
         verifyFiles: true,
       });
       if (
         !Number.isSafeInteger(manifest.writerGeneration) ||
         manifest.writerGeneration < 1 ||
-        manifest.writerGeneration > nativeWriterGeneration(row) ||
+        manifest.writerGeneration > nativeWriterGeneration(state.row) ||
         (generation !== undefined && manifest.writerGeneration !== generation) ||
         manifest.sequence !== publication.sequence ||
         manifest.publicationId !== publication.id ||
         manifest.interactionId !== interaction.id ||
         manifest.nativeSessionId !== publication.nativeSessionId ||
-        manifest.harness !== row.configuration.harness ||
-        manifest.packageId !== row.configuration.packageId ||
-        manifest.imageDigest !== row.configuration.image.digest ||
+        manifest.harness !== state.row.configuration.harness ||
+        manifest.packageId !== state.row.configuration.packageId ||
+        manifest.imageDigest !== state.row.configuration.image.digest ||
         manifest.configurationSha256 !==
-          hash(JSON.stringify(executionRuntimeConfiguration(draft, row)))
+          hash(JSON.stringify(executionRuntimeConfiguration(draft, state.row)))
       )
         fail('NATIVE_RECOVERY_INVALID');
       await check();
@@ -444,7 +267,10 @@ export const createNativeExecutionSupervisor =
       if (!publicManifest) {
         try {
           publicManifest = await publications.read(
-            { ...executionIdentity(row), epoch: row.publicationEpoch ?? row.epoch },
+            {
+              ...executionIdentity(state.row),
+              epoch: state.row.publicationEpoch ?? state.row.epoch,
+            },
             publication,
             { verifyFiles: true },
           );
@@ -456,9 +282,9 @@ export const createNativeExecutionSupervisor =
         }
       }
       if (
-        publicManifest.packageId !== row.configuration.packageId ||
-        publicManifest.repository?.commit !== row.sourceCommit ||
-        publicManifest.repository?.branch !== row.sourceBranch
+        publicManifest.packageId !== state.row.configuration.packageId ||
+        publicManifest.repository?.commit !== state.row.sourceCommit ||
+        publicManifest.repository?.branch !== state.row.sourceBranch
       )
         fail('NATIVE_RECOVERY_INVALID');
       verifyPublicProjectFiles(manifest, publicManifest);
@@ -467,18 +293,18 @@ export const createNativeExecutionSupervisor =
     };
     const status = () =>
       observedInvoke({
-        execution: row,
-        payload: { command: 'native-status', ...writerPayload(row) },
+        execution: state.row,
+        payload: { command: 'native-status', ...writerPayload(state.row) },
       });
     try {
-      if (row.cancelRequested) {
+      if (state.row.cancelRequested) {
         await current({ allowCancelled: true });
         // A transport accepted before cancellation can arrive after Stop.
         // This controller-only fence also denies that late start in a new VM.
-        await fence.cancel(executionIdentity(row));
+        await fence.cancel(executionIdentity(state.row));
         // The original session ID remains fixed even after cancellation fences
         // the epoch. Stop uses protected runtime/session pins, never agent text.
-        await stop({ draft, execution: row });
+        await stop({ draft, execution: state.row });
         await advance({ status: 'CANCELLED' });
         return { pending: false, status: 'CANCELLED' };
       }
@@ -488,78 +314,46 @@ export const createNativeExecutionSupervisor =
       // pending graph projection of already-published content still completes.
       if (
         imagePolicy &&
-        ['REQUESTED', 'UPGRADING', 'DISPATCHING', 'RUNNING', 'RECOVERING'].includes(row.status) &&
-        (await imagePolicy.revocation(row.configuration.image.digest))
+        ['REQUESTED', 'UPGRADING', 'DISPATCHING', 'RUNNING', 'RECOVERING'].includes(
+          state.row.status,
+        ) &&
+        (await imagePolicy.revocation(state.row.configuration.image.digest))
       ) {
-        observe({ stage: 'decision', code: 'IMAGE_REVOKED', controlStatus: row.status });
+        observe({ stage: 'decision', code: 'IMAGE_REVOKED', controlStatus: state.row.status });
         await current();
-        await fence.cancel(executionIdentity(row));
-        await stop({ draft, execution: row });
+        await fence.cancel(executionIdentity(state.row));
+        await stop({ draft, execution: state.row });
         await advance({ status: 'FAILED', failureCode: 'native_execution_image_revoked' });
         return { pending: false, status: 'FAILED', failureCode: 'native_execution_image_revoked' };
       }
-      if (['DISPATCHING', 'RUNNING', 'RECOVERING'].includes(row.status) && fence.read) {
+      if (['DISPATCHING', 'RUNNING', 'RECOVERING'].includes(state.row.status) && fence.read) {
         let savedFence;
         try {
-          savedFence = await fence.read(executionIdentity(row));
+          savedFence = await fence.read(executionIdentity(state.row));
         } catch (error) {
           if (!['NoSuchKey', 'NotFound'].includes(error?.name)) throw error;
         }
         if (
           savedFence?.state === 'FENCED' &&
-          savedFence.writerGeneration === nativeWriterGeneration(row) &&
-          savedFence.recoveryId === recoveryStopId(row, savedFence.reason)
+          savedFence.writerGeneration === nativeWriterGeneration(state.row) &&
+          savedFence.recoveryId === recoveryStopId(state.row, savedFence.reason)
         )
           return requireRecovery(savedFence.reason);
       }
-      if (row.projectionStatus === 'pending') {
-        const manifest = await publications.read(
-          {
-            ...executionIdentity(row),
-            epoch: row.publicationEpoch,
-          },
-          row.publication,
-          {
-            verifyFiles: true,
-          },
-        );
-        if (manifest.packageId !== row.configuration.packageId) fail('NATIVE_PUBLICATION_INVALID');
-        const interaction = await readNativePublicationInteraction({
-          draft,
-          row,
-          manifest,
-          interactions,
-        });
-        await check();
-        recordNativeBoundary(executionIdentity(row), 'graphStarted', now());
-        await project({
-          draft,
-          publication: row.publication,
-          manifest,
-          interaction,
-          authorize: check,
-        });
-        recordNativeBoundary(executionIdentity(row), 'graphCompleted', now());
-        row = await store.projected({ row });
-        return {
-          pending: ['DISPATCHING', 'RUNNING', 'RECOVERING'].includes(row.status),
-          status: row.status,
-        };
-      }
-      if (row.status === 'REQUESTED') {
+      if (state.row.status === 'REQUESTED') {
         await advance({ status: 'UPGRADING' });
         return yieldPending();
       }
-      if (row.status === 'UPGRADING') {
-        if (!row.target) {
-          const result = await upgrade({ draft, execution: row, authorize: check });
+      if (state.row.status === 'UPGRADING') {
+        if (!state.row.target) {
+          const result = await upgrade({ draft, execution: state.row, authorize: check });
           if (result.ready) {
-            recordNativeBoundary(executionIdentity(row), 'targetReady', now());
+            recordNativeBoundary(executionIdentity(state.row), 'targetReady', now());
             await advance({ target: result.target });
           }
           return yieldPending();
         }
-        const material = checkedCredentials(row, await credentials(row));
+        const material = checkedCredentials(state.row, await credentials(state.row));
         await check();
         if (!material?.ok || !material.source?.commit || !material.source.branch)
           fail('NATIVE_EXECUTION_SOURCE_CHANGED');
@@ -570,172 +364,53 @@ export const createNativeExecutionSupervisor =
         });
         return yieldPending();
       }
-      if (row.status === 'RECOVERING') {
-        const recovery = row.recovery;
-        try {
-          await verifyCheckpoint(row.recoveryCheckpoint, row.publication, row.interaction);
-        } catch (error) {
-          if (['NATIVE_RECOVERY_INVALID', 'NATIVE_RECOVERY_MISSING'].includes(error.code))
-            return requireRecovery('CHECKPOINT_UNAVAILABLE');
-          throw error;
-        }
-        if (recovery.phase === 'FENCING') {
-          await fence.suspend(executionIdentity(row), {
-            writerGeneration: recovery.previousGeneration,
-            recoveryId: recovery.id,
-            reason: recovery.reason,
-          });
-          await check();
-          // Same AWS session IDs are reusable. A stable per-episode stop token
-          // prevents an old retry from stopping a replacement generation.
-          const stopped = await stop({ draft, execution: row, recoveryId: recovery.id });
-          await check();
-          if (stopped?.confirmed !== true || stopped.runtimeSessionId !== row.runtimeSessionId)
-            fail('NATIVE_EXECUTION_STOP_UNCONFIRMED');
-          row = await store.recoveryStopped({ row });
-          return yieldPending();
-        }
-        await fence.activate(executionIdentity(row), {
-          writerGeneration: nativeWriterGeneration(row),
-          recoveryId: recovery.id,
-          checkpointId: row.recoveryCheckpoint.id,
+      if (state.row.status === 'RECOVERING') {
+        return await reconcileNativeRecovery({
+          state,
+          draft,
+          store,
+          verifyCheckpoint,
+          requireRecovery,
+          fence,
+          check,
+          stop,
+          yieldPending,
+          observedInvoke,
+          status,
         });
-        await check();
-        const ack = await observedInvoke({
-          execution: row,
-          payload: {
-            command: 'native-recover',
-            schemaVersion: 1,
-            ...writerPayload(row),
-            recoveryId: recovery.id,
-            sequence: row.publication.sequence,
-            checkpoint: row.recoveryCheckpoint,
-            publication: row.publication,
-            interaction: row.interaction,
-            configuration: executionRuntimeConfiguration(draft, row),
-            imageDigest: row.configuration.image.digest,
-            package: { candidate: draft.candidate, archiveReceipt: draft.archiveReceipt },
-          },
+      }
+      if (state.row.status === 'DISPATCHING') {
+        return await reconcileNativeDispatch({
+          state,
+          draft,
+          store,
+          fence,
+          status,
+          check,
+          requireRecovery,
+          advance,
+          yieldPending,
+          verifyCheckpoint,
+          credentials,
+          observedInvoke,
+          identity,
+          stop,
         });
-        await check();
-        checkReportIdentity(row, ack);
-        const report = ack.status === 'recovery_ready' ? ack : await status();
-        await check();
-        checkReportIdentity(row, report);
-        if (
-          report.recoveryId !== recovery.id ||
-          report.checkpointId !== row.recoveryCheckpoint.id ||
-          report.sequence !== row.publication.sequence
-        )
-          return requireRecovery('RESTORE_FAILED');
-        if (report.status === 'recovering' && report.recovered === false) return yieldPending();
-        if (
-          report.status !== 'recovery_ready' ||
-          report.recovered !== false ||
-          report.nativeSessionId !== row.publication.nativeSessionId
-        )
-          return requireRecovery('RESTORE_FAILED');
-        row = await store.recovered({ row });
-        return yieldPending();
       }
-      if (row.status === 'DISPATCHING') {
-        await fence.ensureActive(executionIdentity(row), writerOptions(row));
-        // Once delivery has been attempted, never blindly replay a model turn.
-        // Status may prove admission/completion; a cold or conflicting owner
-        // cannot prove that a lost command was never executed.
-        if (row.dispatch) {
-          const report = await status();
-          await check();
-          checkReportIdentity(row, report);
-          if (!admitted(row, report)) return requireRecovery('DELIVERY_UNCERTAIN');
-          if (row.response) row = await store.dispatched({ row });
-          else await advance({ status: 'RUNNING' });
-          return yieldPending();
-        }
-        if (nativeTurnSequence(row) > 1) {
-          const report = await status();
-          await check();
-          checkReportIdentity(row, report);
-          if (!priorBoundary(row, report)) return requireRecovery('DELIVERY_UNCERTAIN');
-          if (report.recovered === true) {
-            if (!row.recoveryCheckpoint) return requireRecovery('CHECKPOINT_UNAVAILABLE');
-            try {
-              await verifyCheckpoint(row.recoveryCheckpoint, row.publication, row.interaction);
-            } catch (error) {
-              if (['NATIVE_RECOVERY_INVALID', 'NATIVE_RECOVERY_MISSING'].includes(error.code))
-                return requireRecovery('CHECKPOINT_UNAVAILABLE');
-              throw error;
-            }
-            row = await store.beginRecovery({ row });
-            return yieldPending();
-          }
-        }
-        const material = checkedCredentials(row, await credentials(row));
-        if (
-          !material?.ok ||
-          material.source?.commit !== row.sourceCommit ||
-          material.source?.branch !== row.sourceBranch
-        )
-          fail('NATIVE_EXECUTION_SOURCE_CHANGED');
-        await check();
-        const configuration = executionRuntimeConfiguration(draft, row);
-        let payload = {
-          command: 'native-start',
-          schemaVersion: 1,
-          ...writerPayload(row),
-          imageDigest: row.configuration.image.digest,
-          sequence: nativeTurnSequence(row),
-          configuration,
-          package: { candidate: draft.candidate, archiveReceipt: draft.archiveReceipt },
-          credentials: { model: material.model, git: material.git },
-        };
-        let response;
-        if (nativeTurnSequence(row) > 1) {
-          if (row.response?.deliveryStatus !== 'pending' || !row.interaction)
-            fail('NATIVE_EXECUTION_RUNTIME_MISMATCH');
-          response = await store.response(row, row.response.interactionId);
-          if (
-            !response ||
-            response.commandId !== row.response.commandId ||
-            response.sequence !== nativeTurnSequence(row) ||
-            response.interactionId !== row.interaction.id ||
-            response.contentSha256 !== row.interactionContentSha256
-          )
-            fail('NATIVE_EXECUTION_RUNTIME_MISMATCH');
-          payload = {
-            command: 'native-continue',
-            schemaVersion: 1,
-            ...writerPayload(row),
-            sequence: response.sequence,
-            requestId: response.commandId,
-            priorInteractionId: response.interactionId,
-            priorPublicationId: row.publication.id,
-            text: response.text,
-            configuration,
-            credentials: { model: material.model, git: material.git },
-          };
-        }
-        await check();
-        row = await store.dispatchAttempted({ row });
-        await check();
-        const result = await observedInvoke({ execution: row, payload });
-        try {
-          await check();
-        } catch (error) {
-          const latest = await store.get(identity);
-          if (latest?.cancelRequested) {
-            await fence.cancel(executionIdentity(latest));
-            await stop({ draft, execution: latest });
-          }
-          throw error;
-        }
-        checkReportIdentity(row, result);
-        if (!admitted(row, result)) fail('NATIVE_EXECUTION_RUNTIME_MISMATCH');
-        if (response) row = await store.dispatched({ row });
-        else await advance({ status: 'RUNNING' });
-        return yieldPending();
+      if (
+        [
+          'AWAITING_USER',
+          'WAITING_FOR_INPUT',
+          'STOPPED',
+          'FAILED',
+          'CANCELLED',
+          'RECOVERY_REQUIRED',
+        ].includes(state.row.status)
+      ) {
+        state.row = await store.release({ row: state.row });
+        return { pending: false, status: state.row.status };
       }
-      if (row.status !== 'RUNNING') fail('NATIVE_EXECUTION_RUNTIME_MISMATCH');
+      if (state.row.status !== 'RUNNING') fail('NATIVE_EXECUTION_RUNTIME_MISMATCH');
       let report;
       try {
         report = await status();
@@ -758,65 +433,31 @@ export const createNativeExecutionSupervisor =
           stage: 'decision',
           code: 'STATUS_READ_RETRY',
           failureClass,
-          controlStatus: row.status,
-          dispatchPresent: Boolean(row.dispatch),
-          checkpointPresent: Boolean(row.recoveryCheckpoint),
+          controlStatus: state.row.status,
+          dispatchPresent: Boolean(state.row.dispatch),
+          checkpointPresent: Boolean(state.row.recoveryCheckpoint),
         });
         return yieldPending();
       }
       await check();
-      checkReportIdentity(row, report);
-      if (report.recovered === true && !admitted(row, report))
+      checkReportIdentity(state.row, report);
+      if (report.recovered === true && !admitted(state.row, report))
         return requireRecovery('DELIVERY_UNCERTAIN');
-      if (report.sequence !== nativeTurnSequence(row)) fail('NATIVE_EXECUTION_RUNTIME_MISMATCH');
+      if (report.sequence !== nativeTurnSequence(state.row))
+        fail('NATIVE_EXECUTION_RUNTIME_MISMATCH');
       if (['preparing', 'running', 'publishing', 'cancelling'].includes(report.status))
         return yieldPending();
       if (report.status === 'publication_ready') {
-        const receipt = report.receipt;
-        const manifest = await publications.read(executionIdentity(row), receipt, {
-          verifyFiles: true,
+        return await verifyCompletedNativeTurn({
+          state,
+          report,
+          store,
+          publications,
+          interactions,
+          check,
+          verifyCheckpoint,
+          yieldPending,
         });
-        if (
-          manifest.packageId !== row.configuration.packageId ||
-          manifest.repository.commit !== row.sourceCommit ||
-          manifest.repository.branch !== row.sourceBranch ||
-          receipt.sequence !== nativeTurnSequence(row)
-        )
-          fail('NATIVE_PUBLICATION_INVALID');
-        await check();
-        const interaction = report.interaction;
-        let interactionContentSha256;
-        if (interaction) {
-          if (!interactions) fail('NATIVE_INTERACTION_INVALID');
-          const body = await interactions.read(executionIdentity(row), interaction);
-          if (
-            body.packageId !== row.configuration.packageId ||
-            body.harness !== row.configuration.harness ||
-            body.sequence !== nativeTurnSequence(row) ||
-            body.publicationId !== receipt.id ||
-            body.nativeSessionId !== receipt.nativeSessionId
-          )
-            fail('NATIVE_INTERACTION_INVALID');
-          interactionContentSha256 = body.contentSha256;
-          await check();
-        }
-        const checkpoint = report.checkpoint;
-        if (checkpoint) {
-          await verifyCheckpoint(
-            checkpoint,
-            receipt,
-            interaction,
-            nativeWriterGeneration(row),
-            manifest,
-          );
-        }
-        row = await store.publish({
-          row,
-          publication: receipt,
-          ...(interaction ? { interaction, interactionContentSha256 } : {}),
-          ...(checkpoint ? { checkpoint } : {}),
-        });
-        return yieldPending();
       }
       // Unknown/cold/stale ownership is not success and never starts a new
       // writer. Recovery is an explicit subsequent control-plane operation.
@@ -824,10 +465,10 @@ export const createNativeExecutionSupervisor =
         ...observation,
         stage: 'decision',
         code: 'RUNTIME_TERMINAL',
-        controlStatus: row.status,
+        controlStatus: state.row.status,
       });
-      await fence.cancel(executionIdentity(row));
-      await stop({ draft, execution: row });
+      await fence.cancel(executionIdentity(state.row));
+      await stop({ draft, execution: state.row });
       await advance({ status: 'FAILED', failureCode: 'native_execution_failed' });
       return { pending: false, status: 'FAILED' };
     } catch (error) {
@@ -840,20 +481,20 @@ export const createNativeExecutionSupervisor =
         ownerErrors.has(error?.code) ||
         error?.name === 'RuntimeClientError'
       ) {
-        if (row.status === 'RECOVERING') return requireRecovery('RESTORE_FAILED');
-        if (row.dispatch && ['DISPATCHING', 'RUNNING'].includes(row.status))
+        if (state.row.status === 'RECOVERING') return requireRecovery('RESTORE_FAILED');
+        if (state.row.dispatch && ['DISPATCHING', 'RUNNING'].includes(state.row.status))
           return requireRecovery('DELIVERY_UNCERTAIN');
-        if (row.status === 'DISPATCHING' && error?.name === 'RuntimeClientError')
+        if (state.row.status === 'DISPATCHING' && error?.name === 'RuntimeClientError')
           return requireRecovery(
-            row.recoveryCheckpoint ? 'SESSION_LOST' : 'CHECKPOINT_UNAVAILABLE',
+            state.row.recoveryCheckpoint ? 'SESSION_LOST' : 'CHECKPOINT_UNAVAILABLE',
           );
       }
       const terminal = phaseError(error);
       if (terminal) {
         try {
           await current();
-          await fence.cancel(executionIdentity(row));
-          await stop({ draft, execution: row });
+          await fence.cancel(executionIdentity(state.row));
+          await stop({ draft, execution: state.row });
           await advance({ status: 'FAILED', failureCode: terminal });
           return { pending: false, status: 'FAILED', failureCode: terminal };
         } catch {
@@ -1062,17 +703,18 @@ export const createNativeExecutionWorker =
         if (!Array.isArray(projects) || !projects.includes(identity.projectId)) continue;
         const diagnostics = createNativeExecutionDiagnostics({ logger, scope: identity });
         const deployment = nativeDeploymentFromEnv(env);
-        const preparationStore = createNativeRuntimeStore({
-          ddb,
-          tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE,
-          deployment,
-        });
-        const store = createNativeExecutionStore({
-          ddb,
-          tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE,
-          preparationStore,
-          leaseMs: 180000,
-        });
+        const authorityOptions = { lambda, functionName: env.NATIVE_AUTHORITY_FUNCTION };
+        const preparationStore = nativeAuthorityPort(
+          'execution',
+          'preparation',
+          ['get'],
+          authorityOptions,
+        );
+        const store = executionObservationPort(authorityOptions);
+        if (env.NATIVE_CANCELLATION_ONLY === 'true') {
+          const row = await store.observeRevocation(identity);
+          if (!row?.cancelRequested) continue;
+        }
         let graphPromise;
         const graph = () =>
           (graphPromise ??= (async () => {
@@ -1109,11 +751,12 @@ export const createNativeExecutionWorker =
           publications,
           interactions,
           diagnostics,
-          activity: createNativeActivityStore({
-            ddb,
-            tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE,
-            broadcast: broadcastToNativeIntentChannel,
-          }),
+          activity: nativeAuthorityPort(
+            'execution',
+            'activity',
+            ['cursor', 'ingest'],
+            authorityOptions,
+          ),
           imagePolicy: createNativeRuntimeImagePolicy({
             ddb,
             tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE,
@@ -1182,7 +825,6 @@ export const createNativeExecutionWorker =
               runtime,
               abortSignal: transportSignal(10000),
             }),
-          project: async (args) => projectNativePublication({ ...args, g: await graph() }),
         });
         const result = await reconcile(identity);
         if (result.pending) {

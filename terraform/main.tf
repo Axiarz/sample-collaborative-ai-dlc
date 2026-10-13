@@ -463,7 +463,7 @@ module "neptune" {
 
 # Lambda CRUD Functions
 module "lambda" {
-  native_preparation_enabled = var.enable_native_preparation
+  native_preparation_enabled = var.native_services_enabled
   source                     = "./modules/api/lambda"
 
   project_name                = var.project_name
@@ -627,8 +627,8 @@ module "api" {
   source_control_lambda_name               = module.lambda.source_control_lambda_name
   workflow_sources_lambda_invoke_arn       = module.lambda.workflow_sources_lambda_invoke_arn
   workflow_sources_lambda_name             = module.lambda.workflow_sources_lambda_name
-  native_preparation_enabled               = var.enable_native_preparation
-  native_execution_enabled                 = var.enable_native_execution
+  native_preparation_enabled               = var.native_services_enabled
+  native_execution_enabled                 = var.native_services_enabled
   native_intents_lambda_invoke_arn         = try(module.native_runs[0].api_invoke_arn, "")
   native_intents_lambda_name               = try(module.native_runs[0].api_function_name, "")
   trackers_lambda_invoke_arn               = module.lambda.trackers_lambda_invoke_arn

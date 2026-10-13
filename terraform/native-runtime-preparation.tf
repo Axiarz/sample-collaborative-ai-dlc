@@ -1,21 +1,35 @@
+
+variable "native_services_enabled" {
+  description = "Deploy native read/reconcile services independently of admission. Removal requires the protected dependency check."
+  type        = bool
+  default     = true
+}
+variable "native_execution_admission_enabled" {
+  description = "Admit new native starts; null inherits enable_native_execution for backward configuration compatibility"
+  type        = bool
+  default     = null
+}
+locals {
+  native_execution_admission = var.native_execution_admission_enabled == null ? var.enable_native_execution : var.native_execution_admission_enabled
+}
 variable "enable_native_preparation" {
-  description = "Enable the dev native draft/workspace preparation pilot; does not enable model dispatch"
+  description = "Admit new dev native drafts; false drains while native services remain deployed"
   type        = bool
   default     = false
 }
 
 variable "enable_native_execution" {
-  description = "Opt in to connected native execution in dev for the preparation project allowlist"
+  description = "Legacy alias for new execution admission only; false never removes existing-run services"
   type        = bool
   default     = false
 }
 
 resource "terraform_data" "native_execution_configuration" {
-  count = var.enable_native_execution ? 1 : 0
+  count = local.native_execution_admission ? 1 : 0
   lifecycle {
     precondition {
       condition = (
-        var.environment == "dev" && var.enable_native_preparation &&
+        var.environment == "dev" && var.native_services_enabled && var.enable_native_preparation &&
         var.enable_native_workflow_sources && var.enable_native_package_jobs &&
         length(var.native_preparation_project_ids) > 0
       )
@@ -43,14 +57,14 @@ variable "native_preparation_existing_https_rule_id" {
 # Existing deployments keep the same rule and connectivity during migration.
 # New installations create the standalone rule normally.
 import {
-  for_each = var.enable_native_preparation && var.native_preparation_existing_https_rule_id != null ? { existing = var.native_preparation_existing_https_rule_id } : {}
+  for_each = var.native_services_enabled && var.native_preparation_existing_https_rule_id != null ? { existing = var.native_preparation_existing_https_rule_id } : {}
   to       = module.native_runs[0].aws_vpc_security_group_egress_rule.runtime_https
   id       = each.value
 }
 
 module "native_runs" {
   source = "./modules/compute/native-runs"
-  count  = var.enable_native_preparation ? 1 : 0
+  count  = var.native_services_enabled ? 1 : 0
 
   project_name                        = var.project_name
   environment                         = var.environment
@@ -72,7 +86,10 @@ module "native_runs" {
   connections_table_arn               = module.dynamodb.connections_table_arn
   websocket_endpoint                  = replace(module.realtime.websocket_api_endpoint, "wss://", "https://")
   websocket_execution_arn             = module.realtime.websocket_execution_arn
-  execution_enabled                   = var.enable_native_execution
+  execution_enabled                   = local.native_execution_admission
+  preparation_admission_enabled       = var.enable_native_preparation
+  cognito_user_pool_id                = module.auth.user_pool_id
+  cognito_client_id                   = module.auth.user_pool_client_id
   native_packages_bucket_name         = module.s3.native_packages_bucket_name
   native_packages_bucket_arn          = module.s3.native_packages_bucket_arn
   source_control_bindings_table_name  = module.git.source_control_bindings_table_name
@@ -113,4 +130,25 @@ output "native_execution_queue_url" {
 }
 output "native_execution_worker_function_name" {
   value = try(module.native_runs[0].execution_worker_function_name, null)
+}
+
+# Deliberate decommission is a read-only, paginated protected inventory check.
+# An arbitrary operator boolean is not evidence that dependencies are gone.
+data "external" "native_decommission" {
+  count   = var.native_services_enabled ? 0 : 1
+  program = ["node", "${path.module}/../scripts/native-dependencies.mjs", "--terraform"]
+  query = {
+    table           = "${var.project_name}-native-runs-${var.environment}"
+    admissionClosed = tostring(!var.enable_native_preparation && !local.native_execution_admission)
+  }
+}
+resource "terraform_data" "native_decommission" {
+  count = var.native_services_enabled ? 0 : 1
+  input = data.external.native_decommission[0].result
+  lifecycle {
+    precondition {
+      condition     = data.external.native_decommission[0].result.empty == "true"
+      error_message = "Native decommission requires zero protected records, including readable history."
+    }
+  }
 }

@@ -200,6 +200,7 @@ describe('native execution API with real protected storage', () => {
     const f = fixture();
     expect(await f.api.status(f.prepared, f.recheck)).toEqual({
       executionAvailable: true,
+      admissionEnabled: true,
       execution: null,
     });
     const result = await f.api.start(f.prepared, ACTOR, 'api-start-one', f.recheck);
@@ -271,7 +272,7 @@ describe('native execution API with real protected storage', () => {
     expect(f.row()).toBeUndefined();
     await f.api.start(f.prepared, ACTOR, 'enabled', f.recheck);
     expect(await disabled.cancel(f.prepared, f.recheck)).toMatchObject({
-      executionAvailable: false,
+      executionAvailable: true,
       execution: { status: 'CANCEL_REQUESTED', epoch: 2 },
     });
   });
@@ -288,7 +289,9 @@ describe('native execution API with real protected storage', () => {
       stop: { state: 'PENDING' },
     });
     expect(await f.api.cancel(f.prepared, f.recheck)).toEqual(first);
-    expect(await f.api.start(f.prepared, 'second-member', 'retry', f.recheck)).toEqual(first);
+    expect(await f.api.start(f.prepared, 'second-member', 'retry', f.recheck)).toMatchObject({
+      execution: first.execution,
+    });
     expect(f.row()).toEqual(row);
     expect(f.configure).toHaveBeenCalledTimes(1);
   });

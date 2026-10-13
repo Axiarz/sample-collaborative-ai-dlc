@@ -2473,6 +2473,59 @@ module "discussions_lambda" {
   }
 }
 
+# Only the platform runtime may submit Quorum observations; no API route.
+module "discussion_result" {
+  source  = "terraform-aws-modules/lambda/aws"
+  version = "~> 8.0"
+
+  function_name = "${var.project_name}-discussion-result-${var.environment}"
+  handler       = "assist-result.handler"
+  runtime       = "nodejs24.x"
+  timeout       = 30
+
+  source_path = [
+    {
+      path = "${path.module}/../../../../lambda/discussions"
+      commands = [
+        "cd ../.. && npm run build -w discussions",
+        ":zip lambda/discussions/.build",
+      ]
+    }
+  ]
+  hash_extra = local.shared_sources_hash
+
+  create_role = false
+  lambda_role = aws_iam_role.discussions.arn
+
+  vpc_subnet_ids         = var.private_subnet_ids
+  vpc_security_group_ids = [aws_security_group.lambda.id]
+
+  environment_variables = {
+    POWERTOOLS_SERVICE_NAME             = local.powertools_service_name
+    POWERTOOLS_LOG_LEVEL                = var.powertools_log_level
+    POWERTOOLS_LOGGER_LOG_EVENT         = tostring(var.powertools_log_event)
+    NEPTUNE_ENDPOINT                    = var.neptune_endpoint
+    ENVIRONMENT                         = var.environment
+    CORS_ALLOWED_ORIGINS                = var.cors_allowed_origins
+    REALTIME_SECRET_PARAM               = var.realtime_doc_secret_param_name
+    LOCKS_TABLE                         = var.discussion_locks_table_name
+    READ_STATE_TABLE                    = var.discussion_read_state_table_name
+    V2_PROCESS_TABLE                    = var.v2_executions_table_name
+    NATIVE_RUNTIME_BINDINGS_TABLE       = var.native_preparation_enabled ? "${var.project_name}-native-runs-${var.environment}" : ""
+    NATIVE_EXECUTION_PUBLICATION_BUCKET = var.native_preparation_enabled ? local.native_publication_bucket_name : ""
+    NATIVE_RUNTIME_ACCOUNT_ID           = data.aws_caller_identity.current.account_id
+    CONNECTIONS_TABLE                   = var.connections_table_name
+    WEBSOCKET_ENDPOINT                  = var.websocket_api_endpoint_https
+    AGENTCORE_RUNTIME_ARN               = var.agentcore_runtime_arn
+    AGENT_SETTINGS_SSM_PREFIX           = "/${var.project_name}/${var.environment}"
+    AGENT_CREDENTIAL_METADATA_FUNCTION  = local.credential_metadata_function_arn
+    AGENT_CREDENTIAL_GRANT_SECRET_PARAM = var.agent_credential_grant_secret_param_name
+    # Takeover-safety invariant: must match `timeout` above; the
+    # lambda asserts message-guard pending window (120 s) > this at init.
+    LAMBDA_TIMEOUT_SECONDS = "30"
+  }
+}
+
 # Cognito Users Lambda (lists users from Cognito)
 module "cognito_users_lambda" {
   source  = "terraform-aws-modules/lambda/aws"

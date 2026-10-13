@@ -36,28 +36,30 @@ locals {
     }]
   })
   base_environment = {
-    NATIVE_PREPARATION_ENABLED        = "true"
-    NATIVE_PREPARATION_PROJECT_IDS    = jsonencode(var.project_ids)
-    NATIVE_RUNTIME_BINDINGS_TABLE     = aws_dynamodb_table.bindings.name
-    NATIVE_RUNTIME_ACCOUNT_ID         = local.account_id
-    AWS_PARTITION                     = local.partition
-    NATIVE_RUNTIME_FILE_SYSTEM_ID     = aws_efs_file_system.runs.id
-    NATIVE_RUNTIME_IMAGE_URI          = "${var.image_repository_url}@${var.image_digest}"
-    NATIVE_RUNTIME_IMAGE_DIGEST       = var.image_digest
-    NATIVE_RUNTIME_SUBNET_IDS         = jsonencode(var.runtime_subnet_ids)
-    NATIVE_RUNTIME_SECURITY_GROUP_IDS = jsonencode([aws_security_group.runtimes.id])
-    NATIVE_RUNTIME_ROLE_BOUNDARY_ARN  = aws_iam_policy.runtime_boundary.arn
-    NATIVE_RUNTIME_ECR_REPOSITORY_ARN = var.image_repository_arn
-    NATIVE_RUNTIME_QUEUE_URL          = aws_sqs_queue.provisioning.url
-    POWERTOOLS_SERVICE_NAME           = "native-runtime-control"
-    POWERTOOLS_LOG_LEVEL              = "INFO"
+    NATIVE_PREPARATION_ENABLED           = "true"
+    NATIVE_PREPARATION_ADMISSION_ENABLED = tostring(var.preparation_admission_enabled)
+    NATIVE_AUTHORITY_FUNCTION            = "arn:${local.partition}:lambda:${local.region}:${local.account_id}:function:${local.name}-authority"
+    NATIVE_PREPARATION_PROJECT_IDS       = jsonencode(var.project_ids)
+    NATIVE_RUNTIME_BINDINGS_TABLE        = aws_dynamodb_table.bindings.name
+    NATIVE_RUNTIME_ACCOUNT_ID            = local.account_id
+    AWS_PARTITION                        = local.partition
+    NATIVE_RUNTIME_FILE_SYSTEM_ID        = aws_efs_file_system.runs.id
+    NATIVE_RUNTIME_IMAGE_URI             = "${var.image_repository_url}@${var.image_digest}"
+    NATIVE_RUNTIME_IMAGE_DIGEST          = var.image_digest
+    NATIVE_RUNTIME_SUBNET_IDS            = jsonencode(var.runtime_subnet_ids)
+    NATIVE_RUNTIME_SECURITY_GROUP_IDS    = jsonencode([aws_security_group.runtimes.id])
+    NATIVE_RUNTIME_ROLE_BOUNDARY_ARN     = aws_iam_policy.runtime_boundary.arn
+    NATIVE_RUNTIME_ECR_REPOSITORY_ARN    = var.image_repository_arn
+    NATIVE_RUNTIME_QUEUE_URL             = aws_sqs_queue.provisioning.url
+    POWERTOOLS_SERVICE_NAME              = "native-runtime-control"
+    POWERTOOLS_LOG_LEVEL                 = "INFO"
   }
 }
 
 resource "terraform_data" "configuration" {
   lifecycle {
     precondition {
-      condition     = var.environment == "dev" && length(var.project_ids) > 0 && length(var.runtime_subnet_ids) > 0
+      condition     = length(var.runtime_subnet_ids) > 0 && (!var.preparation_admission_enabled || (var.environment == "dev" && length(var.project_ids) > 0))
       error_message = "Native preparation is a dev pilot and requires explicit project IDs and VPC subnets."
     }
   }
@@ -66,10 +68,12 @@ resource "terraform_data" "configuration" {
 # Control-plane authority. No runtime role receives access to this table.
 # Unfinished runs must not expire when optional debug archives expire.
 resource "aws_dynamodb_table" "bindings" {
-  name         = local.name
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "pk"
-  range_key    = "sk"
+  name             = local.name
+  billing_mode     = "PAY_PER_REQUEST"
+  stream_enabled   = true
+  stream_view_type = "NEW_AND_OLD_IMAGES"
+  hash_key         = "pk"
+  range_key        = "sk"
   attribute {
     name = "pk"
     type = "S"
@@ -223,7 +227,7 @@ resource "aws_iam_policy" "runtime_boundary" {
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
         Resource = local.logs_arn
       }
-    ], var.execution_enabled ? local.execution_runtime_boundary_statements : [])
+    ], local.execution_runtime_boundary_statements)
   })
   tags = var.tags
 }
@@ -271,6 +275,13 @@ resource "aws_iam_role_policy_attachment" "worker_basic" {
 resource "aws_iam_role_policy" "api" {
   role = aws_iam_role.api.id
   policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Action = ["lambda:InvokeFunction"], Resource = "${local.base_environment.NATIVE_AUTHORITY_FUNCTION}:commands" }]
+  })
+}
+resource "aws_iam_role_policy" "authority" {
+  role = aws_iam_role.authority.id
+  policy = jsonencode({
     Version = "2012-10-17"
     Statement = concat([
       {
@@ -280,7 +291,7 @@ resource "aws_iam_role_policy" "api" {
       },
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+        Action   = ["dynamodb:GetItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.bindings.arn
       },
       {
@@ -298,7 +309,7 @@ resource "aws_iam_role_policy" "api" {
         Action   = ["sqs:SendMessage"]
         Resource = aws_sqs_queue.provisioning.arn
       }
-    ], [for statement in local.execution_api_statements : statement if var.execution_enabled])
+    ], local.authority_write_statements, local.execution_api_statements)
   })
 }
 
@@ -309,8 +320,8 @@ resource "aws_iam_role_policy" "worker" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]
-        Resource = aws_dynamodb_table.bindings.arn
+        Action   = ["lambda:InvokeFunction"]
+        Resource = "${local.base_environment.NATIVE_AUTHORITY_FUNCTION}:preparation"
       },
       {
         Effect   = "Allow"

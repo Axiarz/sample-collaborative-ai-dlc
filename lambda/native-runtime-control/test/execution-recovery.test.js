@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { describe, expect, it } from 'vitest';
 import { nativePublicationScope } from '../../shared/native-publication.js';
-import { nativeExecutionView } from '../execution-api.js';
+import { createNativeExecutionApi, nativeExecutionView } from '../execution-api.js';
 import { executionIdentity } from '../execution-runtime.js';
 import { nativeWriterGeneration } from '../execution-store.js';
 import { executionFixture } from './execution-fixtures.js';
@@ -88,6 +88,28 @@ const pendingReply = async ({ capture = true } = {}) => {
 const rejection = (suffix = 'CONFLICT') => ({ code: `NATIVE_EXECUTION_${suffix}` });
 
 describe('protected native recovery and response admission', () => {
+  it('serves cold recovery with admission disabled and preserves the in-flight accepted answer', async () => {
+    const f = await pendingReply();
+    const required = await f.store.recoveryRequired({ row: f.pending, reason: 'RESTORE_FAILED' });
+    const original = structuredClone(f.row());
+    const api = createNativeExecutionApi({
+      enabled: false,
+      store: f.store,
+      enqueue: async () => {},
+    });
+    const result = await api.recover(
+      f.prepared,
+      {
+        requestId: randomUUID(),
+        recoveryId: required.recovery.id,
+      },
+      async () => {},
+    );
+    expect(result.execution.status).toBe('RECOVERING');
+    expect(f.row().configuration).toEqual(original.configuration);
+    expect(f.row().response).toEqual(original.response);
+    expect(f.row().recoveryCheckpoint).toEqual(original.recoveryCheckpoint);
+  });
   it('restores a waiting point while preserving the session, reply, pins and history', async () => {
     const f = await pendingReply();
     const original = f.pending;

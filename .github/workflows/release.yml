@@ -36,6 +36,15 @@ jobs:
             exit 1
           fi
 
+      - name: Install architecture tooling
+        run: npm ci
+
+      - name: Verify and generate release architecture
+        run: |
+          npm run architecture:check
+          npm run test:native-wiring
+          npm run architecture:map
+
       - name: Validate release version
         env:
           VERSION: ${{ inputs.version }}
@@ -59,7 +68,7 @@ jobs:
           if [[ "$VERSION" == *-* ]]; then
             args+=(--prerelease)
           fi
-          gh release create "${args[@]}"
+          gh release create "${args[@]}" reports/architecture/native.json reports/architecture/native.html
 
   deploy-demo:
     name: Deploy release to demo

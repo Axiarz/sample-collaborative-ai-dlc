@@ -84,11 +84,22 @@ if (deletionProtectionOnly) {
   process.exit(0);
 }
 
+const nativeRemovalVerified = (plan.resource_changes || []).some(
+  (change) =>
+    change.address === 'data.external.native_decommission[0]' &&
+    change.change?.after?.result?.empty === 'true' &&
+    change.change?.after?.result?.records === '0' &&
+    change.change?.after?.query?.admissionClosed === 'true',
+);
+const removesProtectedNativeService = (change) =>
+  change.address.startsWith('module.native_runs[') && !nativeRemovalVerified;
+
 const rejected = (plan.resource_changes || []).filter(
   (change) =>
     destructive(change) &&
     ((protectedTypes.has(change.type) && !expectedRetirement(change)) ||
-      deletesPinnedRuntimeImage(change)),
+      deletesPinnedRuntimeImage(change) ||
+      removesProtectedNativeService(change)),
 );
 const expected = (plan.resource_changes || []).filter(
   (change) => destructive(change) && expectedRetirement(change),

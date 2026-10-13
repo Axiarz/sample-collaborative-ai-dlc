@@ -730,21 +730,25 @@ export const assistDiscussion = async (event, res) => {
   };
 
   const messageId = assistMessageIdFor(requestId);
+  const attemptId = randomUUID();
   const failMessage = async (detail = '') => {
     const updatedAt = new Date().toISOString();
     const content = detail
       ? `${failedAssistContent(command)}\n\n${detail}`
       : failedAssistContent(command);
-    await query((g) =>
+    const accepted = await query((g) =>
       updateAssistMessageVertex(g, {
         discussionId,
         scope,
         messageId,
         content,
         assistStatus: 'failed',
+        requestId,
+        attemptId,
         updatedAt,
       }),
     );
+    if (!accepted) return null;
     const vertex = await query((g) => fetchMessageInDiscussion(g, discussionId, messageId));
     const failed = mapMessage(vertex);
     await broadcastToScope(scope, {
@@ -819,6 +823,7 @@ export const assistDiscussion = async (event, res) => {
           discussionId,
           messageId,
           requestId,
+          attemptId,
           assistCommand: command,
           instructions,
           selectedMessageIds,
@@ -861,19 +866,23 @@ export const assistDiscussion = async (event, res) => {
 
   if (existing) {
     const updatedAt = new Date().toISOString();
-    await query((g) =>
+    const accepted = await query((g) =>
       updateAssistMessageVertex(g, {
         discussionId,
         scope,
         messageId,
         content: pendingAssistContent(command),
         assistStatus: 'running',
+        requestId,
+        attemptId,
+        previousAttemptId: getVal(existing, 'assist_attempt_id'),
         updatedAt,
       }),
     );
     const retried = mapMessage(
       await query((g) => fetchMessageInDiscussion(g, discussionId, messageId)),
     );
+    if (!accepted) return res(202, { requestId, message: retried });
     await broadcastToScope(scope, {
       action: 'discussion.message',
       sprintId: scope.rootId,
@@ -927,6 +936,7 @@ export const assistDiscussion = async (event, res) => {
     requestedBy: caller.sub,
     requestedByName: caller.displayName,
     assistStatus: 'running',
+    attemptId,
     mentions: [],
     redacted: false,
     createdAt,

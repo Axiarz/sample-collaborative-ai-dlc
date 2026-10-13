@@ -162,6 +162,11 @@ describe('native discussion assist', () => {
     const mkdirFn = vi.fn(async () => undefined);
     const start = createDiscussionAssistStart({
       openGraph: async () => graph.g,
+      acceptResult: async (result) => ({
+        id: result.messageId,
+        content: result.content,
+        assistStatus: result.status,
+      }),
       store,
       broadcast,
       broadcastNative,

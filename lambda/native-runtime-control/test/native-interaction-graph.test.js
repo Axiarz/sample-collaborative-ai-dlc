@@ -4,7 +4,9 @@ import {
   projectNativePublication,
   readNativePublicationInteraction,
 } from '../publication-graph.js';
-import { createNativeExecutionSupervisor } from '../execution-worker.js';
+import { createNativeProjector } from '../projection-worker.js';
+import { createNativeProjectionStore, nativeProjectionStatus } from '../projection-store.js';
+import { TABLE } from './fixtures.js';
 import { createNativeExecutionApi } from '../execution-api.js';
 import { executionIdentity } from '../execution-runtime.js';
 import { serialFixture } from './execution-serial-fixtures.js';
@@ -46,7 +48,14 @@ const setup = async (options = {}) => {
     stop: vi.fn(),
     fence: { cancel: vi.fn(), ensureActive: vi.fn() },
   };
-  const run = createNativeExecutionSupervisor(ports);
+  const projectionStore = createNativeProjectionStore({
+    ddb: f.ddb,
+    tableName: TABLE,
+    execution: f.store,
+    preparation: f.preparationStore,
+    now: f.now,
+  });
+  const run = createNativeProjector({ ...ports, store: projectionStore });
   const nextTurn = async () => {
     await f.respond();
     const { row } = await f.store.claim(f.bindingIdentity);
@@ -86,7 +95,7 @@ describe('verified native interaction graph integration', () => {
         title: 'AI-DLC response',
       },
     });
-    expect(f.row().projectionStatus).toBe('complete');
+    expect(await nativeProjectionStatus(f.ddb, TABLE, f.row())).toBe('complete');
     expect(f.ports.invoke).not.toHaveBeenCalled();
     expect(f.ports.credentials).not.toHaveBeenCalled();
     expect(JSON.stringify([graph, [...f.graph.vertices.values()]])).not.toMatch(
@@ -172,14 +181,16 @@ describe('verified native interaction graph integration', () => {
     expect(f.row().publication.sequence).toBe(1);
   });
 
-  it('does not project after losing the protected lease during immutable interaction loading', async () => {
+  it('projects only the already committed revision when cancellation races immutable loading', async () => {
     const f = await setup();
     f.interactionHooks.afterRead = async () => {
       await f.store.cancel(f.bindingIdentity);
     };
-    await expect(f.run(f.identity)).rejects.toMatchObject({ code: 'NATIVE_EXECUTION_LEASE_LOST' });
-    expect(f.graph.writes).toEqual([]);
-    expect(f.ports.project).not.toHaveBeenCalled();
+    await f.run(f.identity);
+    expect(f.row().status).toBe('CANCEL_REQUESTED');
+    expect(f.row().epoch).toBe(2);
+    expect(await nativeProjectionStatus(f.ddb, TABLE, f.row())).toBe('complete');
+    expect(f.ports.invoke).not.toHaveBeenCalled();
   });
 
   it('rechecks project membership after loading the immutable interaction', async () => {
@@ -197,12 +208,11 @@ describe('verified native interaction graph integration', () => {
     await expect(f.api.graph(f.prepared, f.recheck)).rejects.toMatchObject({
       code: 'NATIVE_INTERACTION_INVALID',
     });
-    await f.run(f.identity);
+    await expect(f.run(f.identity)).rejects.toMatchObject({ code: 'NATIVE_INTERACTION_INVALID' });
     expect(f.ports.project).not.toHaveBeenCalled();
     expect(f.graph.writes).toEqual([]);
     expect(f.row()).toMatchObject({
-      status: 'FAILED',
-      failureCode: 'native_execution_publication_invalid',
+      status: 'AWAITING_USER',
     });
   });
 
@@ -214,7 +224,7 @@ describe('verified native interaction graph integration', () => {
     await expect(f.api.graph(f.prepared, f.recheck)).rejects.toMatchObject({
       code: 'NATIVE_INTERACTION_INVALID',
     });
-    await f.run(f.identity);
+    await expect(f.run(f.identity)).rejects.toMatchObject({ code: 'NATIVE_INTERACTION_INVALID' });
     expect(f.graph.writes).toEqual([]);
     expect(f.ports.project).not.toHaveBeenCalled();
   });
@@ -330,8 +340,8 @@ describe('verified native interaction graph integration', () => {
         },
       };
       f.graph.vertices.set(node.id, structuredClone(existing));
-      await f.run(f.identity);
-      expect(f.row().failureCode).toBe('native_execution_publication_invalid');
+      await expect(f.run(f.identity)).rejects.toThrow();
+      expect(f.row().status).toBe('AWAITING_USER');
       expect(f.graph.vertices.get(node.id)).toEqual(existing);
       expect(f.graph.writes.filter((write) => write.id === node.id)).toEqual([]);
       expect(f.graph.edges.size).toBe(0);

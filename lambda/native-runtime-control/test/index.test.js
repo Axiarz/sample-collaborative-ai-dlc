@@ -1,7 +1,7 @@
 import { SendMessageCommand } from '@aws-sdk/client-sqs';
 import { QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { describe, expect, it, vi } from 'vitest';
-import { createNativeRuntimeLambda } from '../index.js';
+import { createNativeRuntimeLambda } from '../command-service.js';
 import {
   ACTOR,
   DEPLOYMENT,
@@ -145,12 +145,12 @@ describe('native REST host and SQS boundary', () => {
     expect(f.connection.close).toHaveBeenCalledTimes(2);
   });
 
-  it('treats a missing SQS acknowledgement as retryable failure without rolling back', async () => {
+  it('accepts durable preparation despite a missing fast notification acknowledgement', async () => {
     const f = fixture();
     await f.handler(event());
     f.sqs.send.mockResolvedValue({});
     const response = await f.handler(event('prepare'));
-    expect(response.statusCode).toBe(503);
+    expect(response.statusCode).toBe(202);
     expect(f.read().status).toBe('PREPARING');
   });
 

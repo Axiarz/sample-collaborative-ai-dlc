@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { GetCommand, QueryCommand, ScanCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { createNativeExecutionStore, nativeExecutionKey } from '../execution-store.js';
 import { nativeRuntimeBindingKey } from '../../shared/native-runtime-binding.js';
 import { canonicalJson } from '../policies.js';
@@ -77,9 +77,9 @@ export const executionFixture = () => {
           existing ?? {},
           operation.ExpressionAttributeNames?.[absent[1]] ?? absent[1],
         );
-      const match = /^(#[A-Za-z0-9]+) (=|>|<=) (:[A-Za-z0-9]+)$/.exec(clause);
+      const match = /^(#?[A-Za-z0-9]+) (=|>|<=) (:[A-Za-z0-9]+)$/.exec(clause);
       if (!match) throw new Error(`Unknown test condition ${clause}`);
-      const left = existing?.[operation.ExpressionAttributeNames[match[1]]];
+      const left = existing?.[operation.ExpressionAttributeNames?.[match[1]] ?? match[1]];
       const right = operation.ExpressionAttributeValues[match[3]];
       return match[2] === '='
         ? isDeepStrictEqual(left, right)
@@ -92,6 +92,19 @@ export const executionFixture = () => {
     async send(command) {
       await hooks.before?.(command);
       if (command instanceof GetCommand) return { Item: read(command.input.Key) };
+      if (command instanceof ScanCommand) return { Items: [...rows.values()].map(clone) };
+      if (command instanceof QueryCommand) {
+        const values = command.input.ExpressionAttributeValues;
+        return {
+          Items: [...rows.values()]
+            .filter(
+              (r) => r.pk === values[':pk'] && r.sk >= values[':after'] && r.sk <= values[':end'],
+            )
+            .sort((a, b) => a.sk.localeCompare(b.sk))
+            .slice(0, command.input.Limit)
+            .map(clone),
+        };
+      }
       if (!(command instanceof TransactWriteCommand))
         throw new Error('Unexpected authority operation');
       const operations = command.input.TransactItems.map((v) => v.Put ?? v.ConditionCheck);

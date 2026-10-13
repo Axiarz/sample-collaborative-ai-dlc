@@ -308,6 +308,7 @@ export const createMessageVertex = async (g, { discussionId, scope, message }) =
     .property('discussion_id', discussionId)
     .property(scope.idProp, scope.rootId);
   if (message.requestId) t = t.property('request_id', message.requestId);
+  if (message.attemptId) t = t.property('assist_attempt_id', message.attemptId);
   if (message.command) t = t.property('command', message.command);
   if (message.requestedBy) t = t.property('requested_by', message.requestedBy);
   if (message.requestedByName) t = t.property('requested_by_name', message.requestedByName);
@@ -322,19 +323,66 @@ export const createMessageVertex = async (g, { discussionId, scope, message }) =
     .next();
 };
 
+const assistAttempt = (query, attemptId) =>
+  attemptId ? query.has('assist_attempt_id', attemptId) : query.not(__.has('assist_attempt_id'));
+const unredacted = (query) => query.not(__.has('redacted', 'true')).not(__.has('redacted', true));
+
 export const updateAssistMessageVertex = async (
   g,
-  { discussionId, scope, messageId, content, assistStatus, updatedAt },
+  {
+    discussionId,
+    scope,
+    messageId,
+    content,
+    assistStatus,
+    updatedAt,
+    requestId,
+    attemptId,
+    previousAttemptId,
+  },
 ) => {
-  await g
-    .V()
-    .has('DiscussionMessage', 'id', messageId)
-    .has('discussion_id', discussionId)
-    .has(scope.idProp, scope.rootId)
+  let query = unredacted(
+    g
+      .V()
+      .has('DiscussionMessage', 'id', messageId)
+      .has('discussion_id', discussionId)
+      .has(scope.idProp, scope.rootId),
+  );
+  if (requestId) query = query.has('request_id', requestId);
+  query = assistAttempt(query, assistStatus === 'running' ? previousAttemptId : attemptId).has(
+    'assist_status',
+    assistStatus === 'running' ? 'failed' : 'running',
+  );
+  if (attemptId) query = query.property(cardinality.single, 'assist_attempt_id', attemptId);
+  const result = await query
     .property(cardinality.single, 'content', content)
     .property(cardinality.single, 'assist_status', assistStatus)
     .property(cardinality.single, 'updated_at', updatedAt)
+    .valueMap()
     .next();
+  return result.done ? null : result.value;
+};
+
+export const acceptAssistResult = async (g, result) => {
+  const query = assistAttempt(
+    unredacted(
+      g
+        .V()
+        .has('DiscussionMessage', 'id', result.messageId)
+        .has('discussion_id', result.discussionId)
+        .has(result.native ? 'native_discussion_root' : 'intent_id', result.intentId)
+        .has('request_id', result.requestId)
+        .has('assist_status', 'running'),
+    ),
+    result.attemptId,
+  );
+  const accepted = await query
+    .property(cardinality.single, 'content', result.content)
+    .property(cardinality.single, 'assist_status', result.status)
+    .property(cardinality.single, 'updated_at', new Date().toISOString())
+    .valueMap()
+    .next();
+  return accepted.done ? null : accepted.value;
 };
 
 export const fetchProjectMemberIds = async (g, projectId) => {

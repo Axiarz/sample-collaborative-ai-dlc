@@ -44,3 +44,10 @@ variable "connections_table_name" { type = string }
 variable "connections_table_arn" { type = string }
 variable "websocket_endpoint" { type = string }
 variable "websocket_execution_arn" { type = string }
+
+variable "preparation_admission_enabled" {
+  type    = bool
+  default = false
+}
+variable "cognito_user_pool_id" { type = string }
+variable "cognito_client_id" { type = string }

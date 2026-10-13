@@ -1,3 +1,4 @@
+import { submitDiscussionAssistResult } from '../../shared/discussion-assist-result.js';
 import { runCredentialJob } from '../credential-session.js';
 // discussion-assist-start — async Quorum responses for intent discussions.
 //
@@ -35,7 +36,6 @@ const logger = new Logger({
   persistentKeys: { component: 'agentcore', module: 'discussion-assist-start' },
 });
 
-const { cardinality } = gremlin.process;
 const __ = gremlin.process.statics;
 
 const CONTEXT_LIMIT = 32 * 1024;
@@ -57,7 +57,7 @@ const COMMAND_INSTRUCTIONS = {
   ask: 'Answer the requester instructions directly, using the discussion and intent context when relevant.',
 };
 
-const jobKey = (p) => `${p.intentId}:${p.discussionId}:${p.requestId}`;
+const jobKey = (p) => `${p.intentId}:${p.discussionId}:${p.requestId}:${p.attemptId ?? 'legacy'}`;
 // Fixed, never payload-selected: native threads live under their own root.
 const NATIVE_ID_PROP = 'native_discussion_root';
 const scopeProp = (native) => (native ? NATIVE_ID_PROP : 'intent_id');
@@ -406,37 +406,9 @@ const buildPrompt = async ({
   return parts.join('\n\n').slice(0, CONTEXT_LIMIT);
 };
 
-const updateAssistMessage = async ({
-  g,
-  intentId,
-  discussionId,
-  messageId,
-  content,
-  status,
-  native = false,
-}) => {
-  const updatedAt = new Date().toISOString();
-  await g
-    .V()
-    .has('DiscussionMessage', 'id', messageId)
-    .has('discussion_id', discussionId)
-    .has(scopeProp(native), intentId)
-    .property(cardinality.single, 'content', content)
-    .property(cardinality.single, 'assist_status', status)
-    .property(cardinality.single, 'updated_at', updatedAt)
-    .next();
-  const r = await g
-    .V()
-    .has('DiscussionMessage', 'id', messageId)
-    .has('discussion_id', discussionId)
-    .has(scopeProp(native), intentId)
-    .valueMap()
-    .next();
-  return r.done ? null : mapMessage(r.value);
-};
-
 export const createDiscussionAssistStart = ({
   openGraph,
+  acceptResult = submitDiscussionAssistResult,
   store,
   broadcast = async () => {},
   broadcastNative = async () => {},
@@ -562,11 +534,12 @@ export const createDiscussionAssistStart = ({
         });
         let message;
         if (out.ok) {
-          message = await updateAssistMessage({
-            g,
+          message = await acceptResult({
             intentId,
             discussionId,
             messageId,
+            requestId,
+            ...(payload.attemptId ? { attemptId: payload.attemptId } : {}),
             content: out.text,
             status: 'completed',
             native,
@@ -602,11 +575,12 @@ export const createDiscussionAssistStart = ({
               errorTail: cliErrorTail(out.sample),
             });
           }
-          message = await updateAssistMessage({
-            g,
+          message = await acceptResult({
             intentId,
             discussionId,
             messageId,
+            requestId,
+            ...(payload.attemptId ? { attemptId: payload.attemptId } : {}),
             content: `Quorum could not ${assistCommand} this discussion. Retry when the assistant is available.`,
             status: 'failed',
             native,
@@ -626,11 +600,12 @@ export const createDiscussionAssistStart = ({
         log(`job failed (${key}):`, err?.message ?? err);
         if (g) {
           try {
-            const message = await updateAssistMessage({
-              g,
+            const message = await acceptResult({
               intentId,
               discussionId,
               messageId,
+              requestId,
+              ...(payload.attemptId ? { attemptId: payload.attemptId } : {}),
               content: `Quorum could not ${assistCommand} this discussion. Retry when the assistant is available.`,
               status: 'failed',
               native,

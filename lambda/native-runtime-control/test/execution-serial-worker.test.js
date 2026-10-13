@@ -119,7 +119,7 @@ describe('serial controller publication and continuation', () => {
       interaction: { sequence: 2 },
     });
     await f.run(f.identity);
-    expect(f.ports.project).toHaveBeenCalledTimes(2);
+    expect(f.ports.project).not.toHaveBeenCalled();
     expect((await f.api.interaction(f.prepared, f.recheck)).messages[0].text).toBe(
       'Question 2: what should change?',
     );
@@ -130,16 +130,14 @@ describe('serial controller publication and continuation', () => {
     );
   });
 
-  it('projects the previous snapshot before delivering a response accepted during graph lag', async () => {
+  it('dispatches an accepted response while projection is unavailable', async () => {
     const f = await fixture();
     await f.firstTurn({ project: false });
     await f.respond();
-    const before = f.ports.invoke.mock.calls.length;
-    expect(await f.run(f.identity)).toMatchObject({ pending: true, status: 'DISPATCHING' });
-    expect(f.ports.invoke).toHaveBeenCalledTimes(before);
-    expect(f.row().projectionStatus).toBe('complete');
-    await f.run(f.identity);
-    expect(f.row().status).toBe('RUNNING');
+    f.ports.project.mockRejectedValue(new Error('Graph unavailable'));
+    expect(await f.run(f.identity)).toMatchObject({ pending: true, status: 'RUNNING' });
+    expect(f.row().projectionStatus).toBe('pending');
+    expect(f.ports.project).not.toHaveBeenCalled();
     expect(f.ports.invoke.mock.calls.at(-1)[0].payload.command).toBe('native-continue');
   });
 

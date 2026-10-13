@@ -197,6 +197,13 @@ export const projectNativePublication = async ({
       query = query.has(key, value).filter(__.properties(key).count().is(1));
     }
     query = query
+      .filter(
+        __.or(
+          __.not(__.has('native_publication_sequence')),
+          __.has('native_publication_sequence', gremlin.process.P.lte(publication.sequence)),
+        ),
+      )
+      .property(cardinality.single, 'native_publication_sequence', publication.sequence)
       .property(cardinality.single, 'publication_id', publication.id)
       .property(cardinality.single, 'title', node.label);
     if (node.artifactId) query = query.property(cardinality.single, 'artifact_id', node.artifactId);
@@ -213,6 +220,7 @@ export const projectNativePublication = async ({
     await g
       .E(id)
       .fold()
+      .filter(__.V(intentVertexId(draft)).has('native_publication_sequence', publication.sequence))
       .coalesce(
         __.unfold(),
         __.V(edge.source).addE(edge.label).to(__.V(edge.target)).property(t.id, id),
@@ -224,7 +232,10 @@ export const projectNativePublication = async ({
     // The protected publication history retains old exact bytes. Neptune is
     // the current projection: disconnect superseded files/questions/responses only when
     // both the parent and target still prove this execution's unique scope.
-    let parent = g.V(intentVertexId(draft)).hasLabel('Intent');
+    let parent = g
+      .V(intentVertexId(draft))
+      .hasLabel('Intent')
+      .has('native_publication_sequence', publication.sequence);
     for (const [key, value] of Object.entries({ id: intentVertexId(draft), ...protectedScope })) {
       parent = parent.has(key, value).filter(__.properties(key).count().is(1));
     }

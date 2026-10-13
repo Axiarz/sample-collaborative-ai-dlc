@@ -2,12 +2,9 @@
 # deployment modules prevents changing IAM policies from deferring filenames
 # until apply, so every archive can be built and independently reviewed first.
 module "packages" {
-  source  = "terraform-aws-modules/lambda/aws"
-  version = "~> 8.0"
-  for_each = toset(concat(
-    ["api", "worker"],
-    var.execution_enabled ? ["execution-worker", "execution-credentials"] : []
-  ))
+  source          = "terraform-aws-modules/lambda/aws"
+  version         = "~> 8.0"
+  for_each        = toset(["api", "worker", "execution-worker", "execution-credentials", "authority", "wakeup", "projection-worker"])
   create_function = false
   create_role     = false
   runtime         = "nodejs24.x"

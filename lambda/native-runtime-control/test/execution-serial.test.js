@@ -126,9 +126,9 @@ describe('serial native interaction authority', () => {
     const f = await waiting();
     const request = f.replyRequest();
     f.enqueue.mockRejectedValueOnce(new Error('Queue unavailable'));
-    await expect(f.api.respond(f.prepared, 'member-one', request, f.recheck)).rejects.toThrow(
-      'Queue',
-    );
+    await expect(
+      f.api.respond(f.prepared, 'member-one', request, f.recheck),
+    ).resolves.toMatchObject({ execution: { status: 'DISPATCHING' } });
     const commandId = f.row().response.commandId;
     const retry = await f.api.respond(f.prepared, 'member-one', request, f.recheck);
     expect(retry).toMatchObject({
@@ -223,7 +223,7 @@ describe('serial native interaction authority', () => {
     expect(f.row().interactionEpoch).toBe(1);
   });
 
-  it('checks membership and the execution opt-in before accepting input', async () => {
+  it('checks membership while admission shutdown preserves existing replies', async () => {
     const f = await waiting();
     const request = f.replyRequest();
     f.authorization.member = false;
@@ -233,11 +233,11 @@ describe('serial native interaction authority', () => {
     f.authorization.member = true;
     await expect(
       f.makeApi(false).respond(f.prepared, 'member-one', request, f.recheck),
-    ).rejects.toMatchObject({ code: 'NATIVE_EXECUTION_DISABLED' });
+    ).resolves.toMatchObject({ execution: { status: 'DISPATCHING' } });
     expect((await f.makeApi(false).interaction(f.prepared, f.recheck)).id).toBe(
       request.interactionId,
     );
-    expect(f.row().status).toBe('AWAITING_USER');
+    expect(f.row().status).toBe('DISPATCHING');
   });
 
   it('does not accept a second command while the first continuation is pending', async () => {

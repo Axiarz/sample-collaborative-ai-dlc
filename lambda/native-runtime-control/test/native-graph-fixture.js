@@ -21,12 +21,16 @@ export const memoryGraph = () => {
           : 1;
       return count === instructions[2][1];
     }
+    if (instructions[0]?.[0] === 'V')
+      return predicate(instructions.slice(1), vertices.get(instructions[0][1]));
     return instructions.every(([name, ...args]) => {
+      if (name === 'or') return args.some((arg) => predicate(steps(arg), vertex));
       if (name === 'inV') return true;
       if (name === 'hasLabel') return args.includes(vertex.label);
       if (name === 'has') {
         if (args.length === 1) return Object.hasOwn(vertex.properties, args[0]);
         const value = vertex.properties[args[0]];
+        if (args[1]?.operator === 'lte') return value <= args[1].value;
         return Array.isArray(value) ? value.includes(args[1]) : value === args[1];
       }
       if (name === 'filter') return predicate(steps(args[0]), vertex);
@@ -90,6 +94,8 @@ export const memoryGraph = () => {
       },
       next: async () => {
         await hooks.before?.({ kind, id, properties, alternatives });
+        if (kind === 'E' && !filters.every((filter) => filter(null)))
+          return { done: true, value: null };
         if (alternatives) {
           const insert = steps(alternatives[1]);
           if (kind === 'V' && !vertices.has(id)) {

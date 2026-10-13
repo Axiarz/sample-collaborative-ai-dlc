@@ -64,6 +64,20 @@ If you want a fast inner-loop preview locally, install [`semgrep`](https://semgr
 
 The [internal testing guide](docs/development/testing.md) documents the deterministic AgentCore test project and the manual, credentialed local E2E for Claude, Kiro, and OpenCode. The E2E runs real models and is not part of CI.
 
+## Native architecture changes
+
+Native is the direction for new methodology execution. Maintain supported v2
+security, correctness, recovery, replay, compatibility and necessary integration;
+new v2 methodology features require a scoped architecture exception rather than
+a parallel feature roadmap. See the [ownership and upgrade contract](docs/development/native-architecture.md).
+
+For writer, accepted-command, fence, lifecycle or replay/protocol changes, describe
+the owner, allowed callers, atomic transition, stale/duplicate/failure behavior,
+and retained-run compatibility in the PR. Include relevant regression evidence
+and any narrow complexity/policy exception. The architecture review gate requires
+an independent declared reviewer's approval of the current head. Large mechanical
+or generated diffs need review context rather than an arbitrary size exemption.
+
 ## Contributing via Pull Requests
 
 Contributions via pull requests are much appreciated. Before sending us a pull request, please ensure that:

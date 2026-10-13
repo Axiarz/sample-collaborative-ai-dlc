@@ -163,20 +163,117 @@ const validReply = (value) =>
   !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value.text) &&
   Buffer.from(value.text, 'utf8').toString('utf8') === value.text;
 
-export const createNativeRuntimeApi =
-  ({
-    enabled = false,
-    allowedProjectIds = [],
-    store,
-    workflowSources,
-    jobs,
-    getMembershipSnapshot,
-    listNativeIntents,
-    enqueue,
-    image,
-    execution,
-  } = {}) =>
-  async (event) => {
+const suffixFor = (resource, params) => {
+  if (resource === COLLECTION || resource === ITEM) return '';
+  if (resource === FILE) return `/files/${params.fileId}`;
+  return '/' + resource.split('/').at(-1);
+};
+const outputCursor = (event) => {
+  let after = 0;
+  {
+    const single = event.queryStringParameters ?? {};
+    const multi = event.multiValueQueryStringParameters ?? {};
+    if (
+      !record(single) ||
+      !record(multi) ||
+      Object.keys(single).some((k) => k !== 'afterSeq') ||
+      Object.entries(multi).some(
+        ([k, v]) =>
+          k !== 'afterSeq' ||
+          !Array.isArray(v) ||
+          v.length !== 1 ||
+          (single[k] !== undefined && single[k] !== v[0]),
+      )
+    )
+      fail('INVALID');
+    const raw = single.afterSeq ?? multi.afterSeq?.[0] ?? '0';
+    if (
+      typeof raw !== 'string' ||
+      !/^(0|[1-9][0-9]{0,15})$/.test(raw) ||
+      !Number.isSafeInteger(Number(raw))
+    )
+      fail('INVALID');
+    after = Number(raw);
+  }
+  return after;
+};
+export const createNativeRuntimeApi = ({
+  enabled = false,
+  admissionEnabled = enabled,
+  allowedProjectIds = [],
+  store,
+  workflowSources,
+  jobs,
+  getMembershipSnapshot,
+  listNativeIntents,
+  enqueue,
+  image,
+  execution,
+} = {}) => {
+  const collectionRead = async ({ listing, projectId, before, recheck, response }) => {
+    if (listing) {
+      const page = await listNativeIntents({
+        projectId,
+        projectIdentity: before.projectIdentity,
+        ...listing,
+      });
+      if (page.rows.some((row) => row.projectIdentity !== before.projectIdentity))
+        fail('FORBIDDEN');
+      await recheck();
+      return response(200, {
+        items: page.rows.map(nativeIntentSummary),
+        nextCursor: page.nextCursor,
+      });
+    }
+    await recheck();
+    return response(200, {
+      preparationEnabled: admissionEnabled === true,
+      executionEnabled: execution?.enabled === true,
+    });
+  };
+  const executionCommand = async ({
+    start,
+    userResponse,
+    recover,
+    row,
+    actorId,
+    input,
+    recheck,
+    before,
+    response,
+  }) => {
+    if (!execution)
+      return reply(response, 503, 'NATIVE_EXECUTION_DISABLED', 'Native execution is disabled');
+    const details = start
+      ? await execution.start(row, actorId, input.requestId, recheck)
+      : userResponse
+        ? await execution.respond(row, actorId, input, recheck, {
+            membershipId: before.membershipId,
+            projectIdentity: before.projectIdentity,
+          })
+        : recover
+          ? await execution.recover(row, input, recheck)
+          : await execution.cancel(row, recheck);
+    return response(202, { ...nativeIntentView(row), ...details });
+  };
+  const committedRead = async ({ event, file, row, params, recheck, response }) => {
+    if (!execution)
+      return reply(
+        response,
+        404,
+        'NATIVE_PUBLICATION_NOT_FOUND',
+        'No native files have been published yet',
+      );
+    const result = file
+      ? await execution.file(row, params.fileId, recheck)
+      : event.resource === GRAPH
+        ? await execution.graph(row, recheck)
+        : event.resource === INTERACTION
+          ? await execution.interaction(row, recheck)
+          : await execution.publication(row, recheck);
+    return response(200, result);
+  };
+  return async (event) => {
     const response = buildResponse(event, { methods: 'GET,POST,OPTIONS' });
     const collection = event?.resource === COLLECTION;
     const preparation = event?.resource === PREPARE;
@@ -241,27 +338,7 @@ export const createNativeRuntimeApi =
       return invalid();
     const { projectId, intentId } = params;
     const outputRead = event.resource === OUTPUTS;
-    const suffix = outputRead
-      ? '/outputs'
-      : preparation
-        ? '/prepare'
-        : start
-          ? '/start'
-          : cancel
-            ? '/cancel'
-            : recover
-              ? '/recover'
-              : userResponse
-                ? '/response'
-                : event.resource === INTERACTION
-                  ? '/interaction'
-                  : file
-                    ? `/files/${params.fileId}`
-                    : event.resource === PUBLICATION
-                      ? '/publication'
-                      : event.resource === GRAPH
-                        ? '/graph'
-                        : '';
+    const suffix = suffixFor(event.resource, params);
     const expectedPath = `/api/projects/${projectId}/native-intents${collection ? '' : `/${intentId}`}${suffix}`;
     if (event.path !== undefined && event.path !== expectedPath) return invalid();
     if (
@@ -277,32 +354,7 @@ export const createNativeRuntimeApi =
       );
     let input;
     try {
-      let after = 0;
-      if (outputRead) {
-        const single = event.queryStringParameters ?? {};
-        const multi = event.multiValueQueryStringParameters ?? {};
-        if (
-          !record(single) ||
-          !record(multi) ||
-          Object.keys(single).some((k) => k !== 'afterSeq') ||
-          Object.entries(multi).some(
-            ([k, v]) =>
-              k !== 'afterSeq' ||
-              !Array.isArray(v) ||
-              v.length !== 1 ||
-              (single[k] !== undefined && single[k] !== v[0]),
-          )
-        )
-          return invalid();
-        const raw = single.afterSeq ?? multi.afterSeq?.[0] ?? '0';
-        if (
-          typeof raw !== 'string' ||
-          !/^(0|[1-9][0-9]{0,15})$/.test(raw) ||
-          !Number.isSafeInteger(Number(raw))
-        )
-          return invalid();
-        after = Number(raw);
-      }
+      const after = outputRead ? outputCursor(event) : 0;
       const listing = outputRead ? null : nativeListQuery(event, { collection, projectId });
       if (collection && event.httpMethod === 'POST') {
         if (typeof event.body !== 'string') return invalid();
@@ -367,27 +419,8 @@ export const createNativeRuntimeApi =
         )
           fail('FORBIDDEN');
       };
-      if (collection && event.httpMethod === 'GET') {
-        if (listing) {
-          const page = await listNativeIntents({
-            projectId,
-            projectIdentity: before.projectIdentity,
-            ...listing,
-          });
-          if (page.rows.some((row) => row.projectIdentity !== before.projectIdentity))
-            fail('FORBIDDEN');
-          await recheck();
-          return response(200, {
-            items: page.rows.map(nativeIntentSummary),
-            nextCursor: page.nextCursor,
-          });
-        }
-        await recheck();
-        return response(200, {
-          preparationEnabled: true,
-          executionEnabled: execution?.enabled === true,
-        });
-      }
+      if (collection && event.httpMethod === 'GET')
+        return await collectionRead({ listing, projectId, before, recheck, response });
       const authorizeSource = (request) =>
         workflowSources.getAuthorizedBinding({
           projectId,
@@ -406,6 +439,13 @@ export const createNativeRuntimeApi =
         return pins;
       };
       if (collection) {
+        if (!admissionEnabled && !(await store.get({ projectId, executionId: input.intentId })))
+          return reply(
+            response,
+            503,
+            'NATIVE_PREPARATION_DISABLED',
+            'New native drafts are disabled',
+          );
         const pins = await readPins(input);
         const created = await store.create({
           projectId,
@@ -426,38 +466,20 @@ export const createNativeRuntimeApi =
         if (!execution?.outputs) return response(200, { outputs: [], nextAfter: null });
         return response(200, await execution.outputs(row, after, recheck));
       }
-      if (start || cancel || userResponse || recover) {
-        if (!execution)
-          return reply(response, 503, 'NATIVE_EXECUTION_DISABLED', 'Native execution is disabled');
-        const details = start
-          ? await execution.start(row, actorId, input.requestId, recheck)
-          : userResponse
-            ? await execution.respond(row, actorId, input, recheck, {
-                membershipId: before.membershipId,
-                projectIdentity: before.projectIdentity,
-              })
-            : recover
-              ? await execution.recover(row, input, recheck)
-              : await execution.cancel(row, recheck);
-        return response(202, { ...nativeIntentView(row), ...details });
-      }
-      if ([PUBLICATION, FILE, GRAPH, INTERACTION].includes(event.resource)) {
-        if (!execution)
-          return reply(
-            response,
-            404,
-            'NATIVE_PUBLICATION_NOT_FOUND',
-            'No native files have been published yet',
-          );
-        const result = file
-          ? await execution.file(row, params.fileId, recheck)
-          : event.resource === GRAPH
-            ? await execution.graph(row, recheck)
-            : event.resource === INTERACTION
-              ? await execution.interaction(row, recheck)
-              : await execution.publication(row, recheck);
-        return response(200, result);
-      }
+      if (start || cancel || userResponse || recover)
+        return await executionCommand({
+          start,
+          userResponse,
+          recover,
+          row,
+          actorId,
+          input,
+          recheck,
+          before,
+          response,
+        });
+      if ([PUBLICATION, FILE, GRAPH, INTERACTION].includes(event.resource))
+        return await committedRead({ event, file, row, params, recheck, response });
       if (!preparation)
         return response(200, {
           ...nativeIntentView(row),
@@ -478,7 +500,7 @@ export const createNativeRuntimeApi =
         try {
           await enqueue(identity);
         } catch {
-          fail('UNAVAILABLE');
+          // Committed PREPARING state is delivered by the stream bridge.
         }
       }
       return response(row.status === 'PREPARING' ? 202 : 200, {
@@ -495,3 +517,4 @@ export const createNativeRuntimeApi =
       return nativePreparationInternalError(event);
     }
   };
+};

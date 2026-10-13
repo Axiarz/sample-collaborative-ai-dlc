@@ -103,9 +103,9 @@ describe('connected native supervisor', () => {
     });
     expect(f.ports.project).not.toHaveBeenCalled();
     await f.reconcile(f.identity);
-    expect(f.row().projectionStatus).toBe('complete');
+    expect(f.row().projectionStatus).toBe('pending');
     await f.reconcile(f.identity);
-    expect(f.ports.project).toHaveBeenCalledTimes(1);
+    expect(f.ports.project).not.toHaveBeenCalled();
     expect(
       f.ports.invoke.mock.calls.filter(([v]) => v.payload.command === 'native-start'),
     ).toHaveLength(1);
@@ -180,16 +180,16 @@ describe('connected native supervisor', () => {
     expect(f.ports.stop).toHaveBeenCalled();
   });
 
-  it('retains committed files if graph projection fails and retries only projection', async () => {
+  it('leaves committed projection to its independent worker', async () => {
     const f = await make();
     await f.dispatch();
     await f.reconcile(f.identity);
     f.ports.project.mockRejectedValueOnce(new Error('graph temporarily unavailable'));
-    await expect(f.reconcile(f.identity)).rejects.toThrow();
+    await expect(f.reconcile(f.identity)).resolves.toMatchObject({ pending: false });
     expect(f.row()).toMatchObject({ publication: f.publication, projectionStatus: 'pending' });
     f.tick();
     await f.reconcile(f.identity);
-    expect(f.row().projectionStatus).toBe('complete');
+    expect(f.row().projectionStatus).toBe('pending');
     expect(
       f.ports.invoke.mock.calls.filter(([v]) => v.payload.command === 'native-start'),
     ).toHaveLength(1);
@@ -393,7 +393,7 @@ describe('administrator image revocation in the supervisor', () => {
     expect(f.ports.invoke).not.toHaveBeenCalled();
   });
 
-  it('still completes a pending projection of already-committed results', async () => {
+  it('leaves committed results readable when a revoked image has pending projection', async () => {
     const f = await make();
     await f.dispatch();
     await f.reconcile(f.identity);
@@ -403,8 +403,8 @@ describe('administrator image revocation in the supervisor', () => {
       imagePolicy: revokedPolicy(new Set([f.row().configuration.image.digest])),
     });
     await reconcile(f.identity);
-    expect(f.row().projectionStatus).toBe('complete');
-    expect(f.ports.project).toHaveBeenCalledTimes(1);
+    expect(f.row().projectionStatus).toBe('pending');
+    expect(f.ports.project).not.toHaveBeenCalled();
   });
 });
 

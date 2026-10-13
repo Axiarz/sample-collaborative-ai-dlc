@@ -71,5 +71,8 @@ jobs:
       - name: Verify SSO plan output privacy
         run: node --test ../scripts/test/terraform-sso-privacy.test.mjs
 
+      - name: Native owner policies and admission drain (mock providers)
+        run: terraform test -filter=tests/native-architecture.tftest.hcl
+
       - name: Yjs configuration tests (mock providers)
         run: terraform test -filter=tests/yjs.tftest.hcl

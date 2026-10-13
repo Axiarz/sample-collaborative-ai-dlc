@@ -428,6 +428,7 @@ resource "aws_iam_role_policy" "agentcore" {
           Resource = [
             local.credential_broker_function_arn,
             local.source_control_function_arn,
+            "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-discussion-result-${var.environment}",
           ]
         },
         {
@@ -728,6 +729,7 @@ resource "aws_security_group" "agentcore" {
 
 locals {
   runtime_environment_variables = {
+    DISCUSSION_RESULT_FUNCTION       = "arn:${data.aws_partition.current.partition}:lambda:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-discussion-result-${var.environment}"
     V2_WORKSPACE_DIR                 = "/mnt/workspace"
     V2_PROCESS_TABLE                 = aws_dynamodb_table.v2_executions.name
     BLOCKS_TABLE                     = var.blocks_table_name
