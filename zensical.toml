@@ -36,7 +36,6 @@ nav = [
   { "Development" = [
     "development/demo-deployment.md",
     "development/testing.md",
-    "development/native-architecture.md",
   ] },
   { "Roadmap" = "roadmap/index.md" },
 ]
@@ -77,3 +76,9 @@ admonition = {}
 custom_fences = [
   { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
 ]
+
+[extra]
+# Zensical 0.0.39 has no built-in exclude_docs support. scripts/build-docs.py
+# filters these exact docs-relative paths before building the public site.
+# Direct `zensical serve` remains a local preview, including working drafts.
+draft_docs = ["concepts/native-execution.md"]

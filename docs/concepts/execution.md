@@ -1,6 +1,6 @@
 # Execution Model
 
-This page explains what happens when an intent runs: the orchestration, the agent runtime, git handling, human interaction, and the artifact graph. For the component-level system view see [Architecture](architecture.md); for the day-to-day UI see [Observing intents](../using-the-platform/intent-observability.md).
+This page explains what happens when an intent runs with the **platform (v2) backend**: the orchestration, the agent runtime, git handling, human interaction, and the artifact graph. For the component-level system view see [Architecture](architecture.md); for the day-to-day UI see [Observing intents](../using-the-platform/intent-observability.md).
 
 ## The intent lifecycle
 

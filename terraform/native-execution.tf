@@ -38,7 +38,7 @@ variable "enable_native_package_jobs" {
 }
 
 variable "native_package_jobs_host_qualified" {
-  description = "Technical qualification gate for package imports; see native-package-import-checkpoint.md before changing"
+  description = "Technical qualification gate for package imports; see docs/concepts/native-execution.md#package-integrity before changing"
   type        = bool
   default     = false
 }

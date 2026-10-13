@@ -1,6 +1,6 @@
 # Workflows and Building Blocks
 
-The AI-DLC methodology is not hard-coded into the platform. It is imported as data — a library of **building blocks** — and composed into executable **workflows**. This page explains the model; for the hands-on authoring guide see [Managing workflows](../using-the-platform/workflows.md).
+In the platform (v2) backend, the AI-DLC methodology is imported as data — a library of **building blocks** — and composed into executable **workflows**. This page explains the model; for the hands-on authoring guide see [Managing workflows](../using-the-platform/workflows.md).
 
 ## Building blocks
 

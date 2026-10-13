@@ -69,7 +69,8 @@ The [internal testing guide](docs/development/testing.md) documents the determin
 Native is the direction for new methodology execution. Maintain supported v2
 security, correctness, recovery, replay, compatibility and necessary integration;
 new v2 methodology features require a scoped architecture exception rather than
-a parallel feature roadmap. See the [ownership and upgrade contract](docs/development/native-architecture.md).
+a parallel feature roadmap. See [Native execution](docs/concepts/native-execution.md),
+the repository working document (not yet published on the documentation site).
 
 For writer, accepted-command, fence, lifecycle or replay/protocol changes, describe
 the owner, allowed callers, atomic transition, stale/duplicate/failure behavior,
@@ -77,6 +78,21 @@ and retained-run compatibility in the PR. Include relevant regression evidence
 and any narrow complexity/policy exception through the repository's existing PR
 review process. Large mechanical or generated diffs need review context rather
 than an arbitrary size exemption.
+
+`architecture/native-owners.json` declares native aggregate owners and allowed
+callers. Run `npm run architecture:check`, `npm run test:native-wiring`, and
+`node --test scripts/test/native-architecture.test.mjs` for changes to these
+boundaries. The structural complexity check counts `1 + if + ternary + loops +
+non-default switch cases + catch` per function; boolean operators do not count.
+New native functions must score at most 20 and existing hotspots must not
+increase. Any exception names the function, maximum, and reason in the owner
+manifest for review through the existing PR process.
+
+`npm run architecture:map` generates ignored JSON/HTML reports under
+`reports/architecture/` with source hashes, owners, imports, IAM declarations,
+complexity, and compatibility provenance. Release maps require a clean HEAD;
+`npm run architecture:map -- --allow-dirty` labels a local preview. These checks
+do not establish deployed IAM behavior or live retained-runtime compatibility.
 
 ## Contributing via Pull Requests
 

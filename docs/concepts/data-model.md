@@ -1,6 +1,6 @@
 # Data model
 
-The platform has three core persistence models:
+The platform (v2) backend has three core persistence models:
 
 - The **Neptune knowledge graph** holds durable development knowledge and
   traceability: requirements, decisions, artifacts, derived items, provenance,

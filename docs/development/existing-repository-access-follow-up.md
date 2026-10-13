@@ -8,8 +8,7 @@ requiring existing projects to confirm access again.
 
 This concerns application code repositories that a project accesses through
 someone's connected GitHub, GitLab or Bitbucket account. It is separate from
-the read-only AI-DLC workflow-source bindings in the
-[native execution plan](native-execution-plan.md).
+the read-only AI-DLC workflow-source bindings used by native execution.
 
 The existing code already attempts to revoke project access when an account
 is disconnected. However, an application binding identifies the person and

@@ -37,5 +37,5 @@
     "Silent repinning or fresh conversations as recovery",
     "Cross-engine session migration without an explicit verified conversion"
   ],
-  "liveQualification": "docs/development/native-architecture.md"
+  "liveQualification": "docs/concepts/native-execution.md#recovery-compatibility-and-operation"
 }

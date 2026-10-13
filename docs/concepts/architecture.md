@@ -104,7 +104,8 @@ This is why the Yjs server is on ECS rather than Lambda or API Gateway WebSocket
 
 ## Agent runtime
 
-The asynchronous path. What happens after the user starts an intent from the UI.
+The asynchronous path for the **platform (v2) backend**. This section describes
+its stage scheduler, runtime commands, and delivery flow.
 
 ```mermaid
 flowchart TB

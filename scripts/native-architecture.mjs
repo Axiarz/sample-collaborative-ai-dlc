@@ -53,7 +53,7 @@ if (baselineRef) {
       throw new Error('Release architecture map requires one clean HEAD');
     const head = git('rev-parse', 'HEAD');
     const compatibility = JSON.parse(
-      readFileSync('docs/development/native-compatibility.json', 'utf8'),
+      readFileSync('architecture/native-compatibility.json', 'utf8'),
     );
     const provenance = compatibility.tuples.map((tuple) => ({
       tuple: tuple.id,

@@ -332,7 +332,7 @@ describe('native package policy candidates: local context evaluation only', () =
     }
   });
   it('does not exempt header-less PutObject context for multipart-related requests', () => {
-    // Operation mappings are documented in native-package-policy-review.md;
+    // Storage contract: docs/concepts/native-execution.md#package-integrity;
     // real S3 context still needs live verification. No multipart exemption.
     const context = {
       ...conditions,

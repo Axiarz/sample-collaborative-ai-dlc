@@ -52,7 +52,7 @@ export const renderNativePackagePolicies = async ({ bucketArn, publisherRoleArn 
     qualification: 'unverified',
     // A local policy/context test does not establish which context keys S3
     // supplies for each API, nor validate the provider's deployed behavior.
-    // Documentation evidence: docs/development/native-package-policy-review.md.
+    // Storage contract: docs/concepts/native-execution.md#package-integrity.
     requiredChecks: [
       'Live S3 condition-key and multipart/copy semantics (documentation reviewed 2026-09-21)',
       'Terraform and IAM policy validation',

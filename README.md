@@ -434,15 +434,19 @@ terraform -chdir=terraform output -raw application_url
 Documentation is built with [Zensical](https://zensical.org/) and deployed to GitHub Pages. To serve locally:
 
 ```bash
-uv sync --group docs
+uv sync --frozen --group docs
 uv run zensical serve
 ```
 
 To build:
 
 ```bash
-uv run zensical build
+uv run python scripts/build-docs.py
 ```
+
+Public builds exclude the repository's working drafts before generating pages
+and search. The local server includes those drafts for preview; use the build
+script, as CI does, when preparing the public site.
 
 ## Testing and code quality
 

@@ -8,6 +8,8 @@ on:
       - 'docs/**'
       - 'zensical.toml'
       - 'pyproject.toml'
+      - 'uv.lock'
+      - 'scripts/build-docs.py'
   workflow_dispatch:
 
 permissions:
@@ -34,10 +36,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: uv sync --group docs
+        run: uv sync --frozen --group docs
 
       - name: Build documentation
-        run: uv run zensical build
+        run: uv run python scripts/build-docs.py
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:

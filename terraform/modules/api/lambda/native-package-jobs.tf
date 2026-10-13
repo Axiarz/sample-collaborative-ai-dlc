@@ -122,7 +122,7 @@ variable "native_package_jobs_max_receive_count" {
 
 locals {
   # Dev storage evidence, 2026-09-22, run 2995f24c-c750-4a1d-b1c1-9eac45e1c819:
-  # docs/development/native-storage-probe-checkpoint.md
+  # Storage contract: docs/concepts/native-execution.md#package-integrity.
   # All 20 cases completed: 18 PASS; INITIAL_CREATE_REUSED and
   # CONDITION_NOT_IMPLEMENTED remain inconclusive. Reviewed policies match;
   # final inventories contain only the original fixture and no multipart uploads.
@@ -278,7 +278,7 @@ resource "aws_iam_role_policy" "native_package_jobs_pipe" {
 
 # Documentation reviewed 2026-09-22; live dispatch remains UNQUALIFIED.
 # AWS's filtering guide excludes eventName although its DynamoDB tutorial uses
-# it. Filter the documented record data instead; see native-package-dispatch-review.md.
+# it. Filter record data; the worker still rechecks the protected job.
 # Duplicate QUEUED pointers remain safe because the worker claims the protected
 # job conditionally. The pointer never carries actor/credential/package authority.
 #
