@@ -33,14 +33,48 @@ variable "powertools_log_event" {
   default     = false
 }
 
+variable "kms_key_arn" {
+  description = "Optional existing customer-managed KMS key ARN. Leave empty to use service-owned encryption."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.kms_key_arn == "" || can(regex("^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$", var.kms_key_arn))
+    error_message = "kms_key_arn must be a full KMS key ARN (aliases are not accepted)."
+  }
+}
+
+variable "deletion_protection" {
+  description = "Protect durable DynamoDB tables and the Neptune cluster from deletion"
+  type        = bool
+  default     = true
+}
+
+variable "backup_retention_period" {
+  description = "Number of days to retain automated Neptune backups"
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.backup_retention_period >= 7 && var.backup_retention_period <= 35
+    error_message = "backup_retention_period must be between 7 and 35 days."
+  }
+}
+
+variable "skip_final_snapshot" {
+  description = "Skip the final Neptune snapshot during deletion. Keep false for recoverable teardown."
+  type        = bool
+  default     = false
+}
+
 variable "lambda_vpc_scope" {
-  description = "Lambda VPC placement scope: required keeps only private-resource Lambdas in the VPC; public-egress also routes selected public-service traffic through NAT"
+  description = "Lambda VPC placement scope: required keeps only private-resource Lambdas in the VPC; public-egress adds selected public-service Lambdas; all places every Lambda in the VPC"
   type        = string
   default     = "required"
 
   validation {
-    condition     = contains(["required", "public-egress"], var.lambda_vpc_scope)
-    error_message = "lambda_vpc_scope must be one of: required, public-egress."
+    condition     = contains(["required", "public-egress", "all"], var.lambda_vpc_scope)
+    error_message = "lambda_vpc_scope must be one of: required, public-egress, all."
   }
 }
 
@@ -48,6 +82,17 @@ variable "bedrock_model" {
   description = "Bedrock inference profile ID for the primary model. E.g. us.anthropic.claude-sonnet-4-6"
   type        = string
   default     = "us.anthropic.claude-sonnet-4-6"
+}
+
+variable "bedrock_region" {
+  description = "AWS region for Bedrock inference and model discovery. Empty uses aws_region. Bedrock API keys are regional, so set this when the key or model access lives outside the deployment region; bedrock_model and model selections must then use this region's geo prefix (us./eu./apac.) or global."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.bedrock_region == "" || can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]$", var.bedrock_region))
+    error_message = "bedrock_region must be empty or an AWS region name such as us-east-1."
+  }
 }
 
 variable "codex_model" {
@@ -62,11 +107,32 @@ variable "aidlc_repo_ref" {
   default     = "83ed7a812c4024904f2c5e4d744e28077e0a5acd"
 }
 
+variable "aidlc_release_pinning" {
+  description = "Pin new intents to the immutable AI-DLC release published for the resolved ref (issue #482). \"on\" or \"off\"; existing intents are unaffected either way."
+  type        = string
+  default     = "off"
+
+  validation {
+    condition     = contains(["on", "off"], var.aidlc_release_pinning)
+    error_message = "aidlc_release_pinning must be \"on\" or \"off\"."
+  }
+}
+
 variable "docker_build_args" {
   description = "Optional arguments for local Docker image builds, such as HTTP_PROXY, HTTPS_PROXY, and NO_PROXY. Sensitive values are hidden in CLI output but remain stored in Terraform state."
   type        = map(string)
   default     = {}
   sensitive   = true
+}
+
+# ---------------------------------------------------------------------------
+# AWS WAF (optional)
+# ---------------------------------------------------------------------------
+
+variable "enable_waf" {
+  description = "Create AWS WAF web ACLs for CloudFront and the regional API Gateway/Cognito resources"
+  type        = bool
+  default     = false
 }
 
 # ---------------------------------------------------------------------------
@@ -173,4 +239,48 @@ variable "route53_zone_id" {
   description = "Route53 hosted zone ID in this account. When set, Terraform creates the A/AAAA alias records for app_domain plus app_domain_aliases and, if acm_certificate_arn is empty, the certificate validation records. Leave empty to manage DNS externally and use the dns_target output."
   type        = string
   default     = ""
+}
+
+# ---------------------------------------------------------------------------
+# Cognito managed-login domain (optional)
+#
+# Enterprise SSO redirects through the Cognito managed-login domain, which
+# defaults to a generated *.amazoncognito.com prefix. auth_domain provisions a
+# custom hostname; auth_domain_active selects it after DNS and IdP preparation.
+# Cognito requires the parent of auth_domain to resolve through a DNS A record
+# before it accepts the domain; a subdomain of app_domain satisfies that.
+# ---------------------------------------------------------------------------
+
+variable "auth_domain" {
+  description = "Custom hostname to provision for Cognito managed login (e.g. auth.aidlc.example.com). The generated domain remains active until auth_domain_active is true."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.auth_domain == "" || can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", var.auth_domain))
+    error_message = "auth_domain must be a bare lowercase hostname without scheme, port or path (e.g. auth.aidlc.example.com)."
+  }
+}
+
+variable "auth_domain_active" {
+  description = "Use the provisioned custom domain for login and federation outputs. Set true only after its DNS resolves and the custom OIDC/SAML callback URLs are registered with the IdP. False keeps the generated domain active."
+  type        = bool
+  default     = false
+}
+
+variable "auth_route53_zone_id" {
+  description = "Public Route53 hosted zone containing auth_domain. Creates its A/AAAA alias records when both values are set. Independent of the application's route53_zone_id; empty leaves auth DNS externally managed."
+  type        = string
+  default     = ""
+}
+
+variable "auth_certificate_arn" {
+  description = "ARN of an issued us-east-1 ACM certificate covering auth_domain. Empty reuses acm_certificate_arn, which must then cover auth_domain as well."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.auth_certificate_arn == "" || can(regex("^arn:aws[a-z-]*:acm:us-east-1:[0-9]{12}:certificate/", var.auth_certificate_arn))
+    error_message = "auth_certificate_arn must be an ACM certificate ARN in us-east-1 — Cognito custom domains only accept certificates from that region."
+  }
 }

@@ -93,6 +93,7 @@ resource "aws_api_gateway_deployment" "main" {
     aws_api_gateway_integration.agent_settings_get,
     aws_api_gateway_integration.agent_settings_put,
     aws_api_gateway_integration.agent_verify_mcp_post,
+    aws_api_gateway_integration.agent_authentication_setup_post,
     aws_api_gateway_integration.project_agent_credentials_get,
     aws_api_gateway_integration.project_agent_credentials_put,
     aws_api_gateway_integration.project_agent_capabilities_get,
@@ -180,6 +181,7 @@ resource "aws_api_gateway_deployment" "main" {
     module.cors_agent_capabilities,
     module.cors_agent_settings,
     module.cors_agent_verify_mcp,
+    module.cors_agent_authentication_setup,
     # Every method must have its integration BEFORE the deployment is
     # created, or the first apply that introduces a route fails with
     # "No integration defined for method" (the deployment races the new
@@ -199,6 +201,9 @@ resource "aws_api_gateway_deployment" "main" {
     aws_api_gateway_integration.bitbucket_callback_get,
     aws_api_gateway_integration.bitbucket_repos_get,
     aws_api_gateway_integration.bitbucket_status_get,
+    aws_api_gateway_integration.codecommit_status_get,
+    aws_api_gateway_integration.codecommit_connect_info_get,
+    aws_api_gateway_integration.codecommit_repos_post,
     aws_api_gateway_integration.bitbucket_disconnect_delete,
     aws_api_gateway_integration.bitbucket_repos_branches_get,
     aws_api_gateway_integration.bitbucket_repos_tree_get,
@@ -215,6 +220,12 @@ resource "aws_api_gateway_deployment" "main" {
     aws_api_gateway_integration.migrate_tracker_post,
     aws_api_gateway_integration.project_agents_get,
     aws_api_gateway_integration.workflow,
+    aws_api_gateway_integration.aidlc_release,
+    module.cors_aidlc_releases,
+    module.cors_aidlc_release,
+    module.cors_aidlc_release_channels,
+    module.cors_aidlc_release_channel,
+    module.cors_aidlc_release_profiles,
     module.cors_block_item,
     module.cors_block_item_body,
     module.cors_block_item_script,
@@ -228,6 +239,9 @@ resource "aws_api_gateway_deployment" "main" {
     module.cors_bitbucket_callback,
     module.cors_bitbucket_repos,
     module.cors_bitbucket_status,
+    module.cors_codecommit_status,
+    module.cors_codecommit_connect_info,
+    module.cors_codecommit_repos,
     module.cors_bitbucket_disconnect,
     module.cors_bitbucket_repos_branches,
     module.cors_bitbucket_repos_tree,
@@ -258,6 +272,7 @@ resource "aws_api_gateway_deployment" "main" {
     module.cors_intent_start,
     module.cors_intent_cancel,
     module.cors_intent_rewind,
+    module.cors_intent_resume,
     module.cors_intent_repair,
     module.cors_intent_compose,
     module.cors_intent_compose_report_upload,
@@ -499,6 +514,16 @@ resource "aws_api_gateway_deployment" "main" {
       # redeployed, so OPTIONS/GET 403'd (surfacing as a CORS preflight error).
       jsonencode({ for k, v in aws_api_gateway_method.workflow : k => v.id }),
       jsonencode({ for k, v in aws_api_gateway_integration.workflow : k => v.id }),
+      # AI-DLC release registry (issue #482 Phase 4/5) — same rule as the
+      # workflow map above: hash the whole route map so any future addition
+      # forces a stage redeployment instead of silently 403'ing OPTIONS/GET.
+      aws_api_gateway_resource.aidlc_releases.id,
+      aws_api_gateway_resource.aidlc_release.id,
+      aws_api_gateway_resource.aidlc_release_channels.id,
+      aws_api_gateway_resource.aidlc_release_channel.id,
+      aws_api_gateway_resource.aidlc_release_profiles.id,
+      jsonencode({ for k, v in aws_api_gateway_method.aidlc_release : k => v.id }),
+      jsonencode({ for k, v in aws_api_gateway_integration.aidlc_release : k => v.id }),
       aws_api_gateway_resource.intents.id,
       aws_api_gateway_resource.intents_metrics.id,
       aws_api_gateway_resource.intent.id,
@@ -509,6 +534,7 @@ resource "aws_api_gateway_deployment" "main" {
       aws_api_gateway_resource.intent_start.id,
       aws_api_gateway_resource.intent_cancel.id,
       aws_api_gateway_resource.intent_rewind.id,
+      aws_api_gateway_resource.intent_resume.id,
       aws_api_gateway_resource.intent_repair.id,
       aws_api_gateway_resource.intent_realtime_token.id,
       aws_api_gateway_resource.intent_gates.id,
@@ -576,6 +602,9 @@ resource "aws_api_gateway_deployment" "main" {
       aws_api_gateway_resource.agent_capabilities.id,
       aws_api_gateway_resource.agent_settings.id,
       aws_api_gateway_resource.agent_verify_mcp.id,
+      aws_api_gateway_resource.agent_authentication_setup.id,
+      aws_api_gateway_method.agent_authentication_setup_post.id,
+      aws_api_gateway_integration.agent_authentication_setup_post.id,
       aws_api_gateway_resource.users_me.id,
       aws_api_gateway_resource.user_agent_credentials.id,
       aws_api_gateway_method.user_agent_credentials_get.id,
@@ -594,6 +623,13 @@ resource "aws_api_gateway_deployment" "main" {
       aws_api_gateway_resource.bitbucket_repos_owner_repo.id,
       aws_api_gateway_resource.bitbucket_repos_pulls_comments.id,
       aws_api_gateway_method.bitbucket_callback_get.authorization,
+      # CodeCommit routes — same rationale: new resources must force a stage
+      # redeploy or the live stage 403s their preflight.
+      aws_api_gateway_resource.codecommit.id,
+      aws_api_gateway_resource.codecommit_status.id,
+      aws_api_gateway_resource.codecommit_connect_info.id,
+      aws_api_gateway_resource.codecommit_repos.id,
+      aws_api_gateway_method.codecommit_repos_post.http_method,
     ]))
   }
 }
@@ -628,6 +664,13 @@ resource "aws_api_gateway_stage" "main" {
       responseLength = "$context.responseLength"
     })
   }
+}
+
+resource "aws_wafv2_web_acl_association" "stage" {
+  count = var.waf_enabled ? 1 : 0
+
+  resource_arn = aws_api_gateway_stage.main.arn
+  web_acl_arn  = var.web_acl_arn
 }
 
 # CORS Configuration for OPTIONS method

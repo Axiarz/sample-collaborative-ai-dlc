@@ -2,11 +2,13 @@ import { api } from './api';
 import type { GitProvider } from './gitProvider';
 import type { SourceControlAuthType } from './sourceControl';
 
+export type WorkflowSourceProvider = Exclude<GitProvider, 'codecommit'>;
+
 export type WorkflowSourceAuthType = 'public' | SourceControlAuthType;
 
 export interface WorkflowSource {
   sourceId: string;
-  provider: GitProvider;
+  provider: WorkflowSourceProvider;
   repository: string;
   revision: string;
   status: 'active' | 'invalid';
@@ -22,7 +24,7 @@ export interface WorkflowSourceList {
 }
 
 export interface WorkflowSourceSelection {
-  provider: GitProvider;
+  provider: WorkflowSourceProvider;
   repository: string;
   authType: WorkflowSourceAuthType;
   confirmDelegation?: boolean;

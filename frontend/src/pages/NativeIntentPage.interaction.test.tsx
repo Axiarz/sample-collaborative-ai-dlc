@@ -22,7 +22,10 @@ import type {
 const transport = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn() }));
 // Shared drafts: in-memory Yjs relay + textarea stand-in (see test/collaborationFakes).
 vi.mock('@/hooks/useYjsDocument', async () => await import('@/test/collaborationFakes'));
-vi.mock('@/components/CollaborativeTextarea', async () => await import('@/test/collaborationFakes'));
+vi.mock(
+  '@/components/CollaborativeTextarea',
+  async () => await import('@/test/collaborationFakes'),
+);
 vi.mock('@/services/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/api')>()),
   api: transport,
@@ -231,15 +234,9 @@ it('renders actual ordered text and composer tables without a fake artifact or v
   expect(readFile).not.toHaveBeenCalled();
   expect(textbox).not.toHaveAttribute('readonly');
   expect(screen.getByText('AI-DLC is waiting for your reply.')).toBeInTheDocument();
-  expect(
-    screen.getByText(/one member sends it to continue this session/),
-  ).toBeInTheDocument();
+  expect(screen.getByText(/one member sends it to continue this session/)).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Send reply' })).toBeDisabled();
-  for (const name of [
-    'Edit artifacts',
-    'Create unit PR',
-    'Delete intent',
-  ]) {
+  for (const name of ['Edit artifacts', 'Create unit PR', 'Delete intent']) {
     expect(screen.getByRole('button', { name })).toBeDisabled();
   }
   expect(transport.post).not.toHaveBeenCalled();

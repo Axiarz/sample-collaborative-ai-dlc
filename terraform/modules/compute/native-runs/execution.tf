@@ -433,8 +433,8 @@ module "execution_worker" {
     SOURCE_CONTROL_BINDINGS_TABLE         = var.source_control_bindings_table_name
     NATIVE_EXECUTION_QUEUE_URL            = aws_sqs_queue.execution[0].url
     NATIVE_EXECUTION_CREDENTIALS_FUNCTION = module.execution_credentials[0].lambda_function_arn
-    CONNECTIONS_TABLE                    = var.connections_table_name
-    WEBSOCKET_ENDPOINT                   = var.websocket_endpoint
+    CONNECTIONS_TABLE                     = var.connections_table_name
+    WEBSOCKET_ENDPOINT                    = var.websocket_endpoint
     POWERTOOLS_LOGGER_LOG_EVENT           = "false"
   })
   cloudwatch_logs_retention_in_days = 7

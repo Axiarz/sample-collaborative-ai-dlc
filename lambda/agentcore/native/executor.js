@@ -18,7 +18,11 @@ import { resolveKiroPromptEvidence } from './kiro-prompt.js';
 import { kiroAssistantHash } from './kiro-acp-turn.js';
 import { runNativeCommand } from './command-runner.js';
 import { recordNativeBoundary } from '../../shared/native-lifecycle.js';
-import { createNativeActivityLog, readNativeActivitySpool, NATIVE_ACTIVITY_CAPABILITY } from './activity.js';
+import {
+  createNativeActivityLog,
+  readNativeActivitySpool,
+  NATIVE_ACTIVITY_CAPABILITY,
+} from './activity.js';
 import {
   captureNativeInitializationBaseline,
   inspectNativeInitialization,
@@ -95,7 +99,7 @@ export const nativeFirstTurnPrompt = ({ harness, request } = {}) => {
 // contract (aidlc-orchestrate.ts Branch 8) is to re-run `next` with the choice:
 // `next compose` reaches the composer (Branch 4c), `--scope` creation (9a).
 const NATIVE_INTAKE_ANSWER_INSTRUCTION =
-  ' If the question was the engine\'s plan offer made before any workflow state exists ' +
+  " If the question was the engine's plan offer made before any workflow state exists " +
   '(no aidlc-state.md yet), then when the user replies, record their choice by re-running ' +
   'the engine with the chosen plan in front of the original request text, passed unchanged ' +
   'as one shell-safe argument: `aidlc engine orchestrate next compose <original request>` for ' +
@@ -114,7 +118,7 @@ const NATIVE_PENDING_SPEC_INSTRUCTION =
   'directory, replacing any earlier file: {"version":1,"questions":[{"prompt":"...","header":"...",' +
   '"multiSelect":false,"options":[{"label":"...","description":"..."}]}]}. Use the exact option ' +
   'labels from the spec, without numbers, letters or "(Recommended)", and keep rendering the ' +
-  'question normally in your response. The user\'s reply will contain the exact selected ' +
+  "question normally in your response. The user's reply will contain the exact selected " +
   'label(s); record it with the workflow command that question requires.';
 
 /** Stage held at an engine approval gate ([?]) in this snapshot, or null. */
@@ -134,7 +138,9 @@ export const nativeGateFromSnapshot = (snapshot) => {
     const stages = [...state.matchAll(/^- \*\*Current Stage\*\*:\s*([a-z][a-z0-9-]*)[ \t]*$/gm)];
     if (stages.length !== 1) return null;
     const stage = stages[0][1];
-    const held = state.split(/\r?\n/).filter((line) => line.startsWith(`- [?] ${stage} `) || line === `- [?] ${stage}`);
+    const held = state
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith(`- [?] ${stage} `) || line === `- [?] ${stage}`);
     return held.length === 1 ? { stage } : null;
   } catch {
     return null;
@@ -646,14 +652,25 @@ export const createNativeExecutor = ({
   };
   const activityLog = () => {
     current.report.activityProtocol = NATIVE_ACTIVITY_CAPABILITY;
-    return current.activity ??= createNativeActivityLog({ writerGeneration: current.writerGeneration, spoolDirectory: join(ownerDirectory, 'activity') });
+    return (current.activity ??= createNativeActivityLog({
+      writerGeneration: current.writerGeneration,
+      spoolDirectory: join(ownerDirectory, 'activity'),
+    }));
   };
   const timing = (boundary) => {
     current.report.timings ??= {};
     current.report.timings[boundary] = Date.now();
-    recordNativeBoundary(current.identity, boundary, current.report.timings[boundary], {sequence:current.report.sequence,writerGeneration:current.writerGeneration});
+    recordNativeBoundary(current.identity, boundary, current.report.timings[boundary], {
+      sequence: current.report.sequence,
+      writerGeneration: current.writerGeneration,
+    });
   };
-  const report = () => structuredClone({ ...current.report, recovered: false, capabilities: [NATIVE_ACTIVITY_CAPABILITY] });
+  const report = () =>
+    structuredClone({
+      ...current.report,
+      recovered: false,
+      capabilities: [NATIVE_ACTIVITY_CAPABILITY],
+    });
   const persist = () => writeJson(join(ownerDirectory, 'status.json'), current.report, true);
   const checkpoint = async (status, extra = {}) => {
     current.report = { ...current.report, ...extra, status, updatedAt: Date.now() };
@@ -702,7 +719,10 @@ export const createNativeExecutor = ({
   const execute = async (payload) => {
     current.executing = true;
     current.report.timings = { accepted: current.report.updatedAt };
-    recordNativeBoundary(current.identity, 'accepted', current.report.updatedAt, {sequence:current.report.sequence,writerGeneration:current.writerGeneration});
+    recordNativeBoundary(current.identity, 'accepted', current.report.updatedAt, {
+      sequence: current.report.sequence,
+      writerGeneration: current.writerGeneration,
+    });
     let activityTurn;
     try {
       timing('preparationStarted');
@@ -763,8 +783,12 @@ export const createNativeExecutor = ({
         ),
         ...(prepared.forbiddenBytes ?? []),
       ];
-      activityTurn = activityLog().turn({ sequence: current.report.sequence,
-        harness: configuration.harness, forbiddenBytes, signal });
+      activityTurn = activityLog().turn({
+        sequence: current.report.sequence,
+        harness: configuration.harness,
+        forbiddenBytes,
+        signal,
+      });
       activityTurn.lifecycle({ title: 'Preparing native harness' });
       timing('installationStarted');
       // Kept only in the hot owner for subsequent credential leak checks.
@@ -1088,7 +1112,9 @@ export const createNativeExecutor = ({
         }
       }
     } finally {
-      activityTurn?.close({ failed: !['publication_ready', 'recovery_ready'].includes(current.report.status) });
+      activityTurn?.close({
+        failed: !['publication_ready', 'recovery_ready'].includes(current.report.status),
+      });
       current.executing = false;
     }
   };
@@ -1175,7 +1201,9 @@ export const createNativeExecutor = ({
           ...identity,
           writerGeneration,
           status: 'publication_ready',
-          ...(saved.activityProtocol === NATIVE_ACTIVITY_CAPABILITY ? { capabilities: [NATIVE_ACTIVITY_CAPABILITY] } : {}),
+          ...(saved.activityProtocol === NATIVE_ACTIVITY_CAPABILITY
+            ? { capabilities: [NATIVE_ACTIVITY_CAPABILITY] }
+            : {}),
           nativeSessionId: saved.nativeSessionId,
           outcome: saved.outcome,
           receipt: saved.receipt,
@@ -1757,14 +1785,22 @@ export const createNativeExecutor = ({
   const activity = async (value) => {
     const identity = validateIdentity(value);
     const writerGeneration = generationOf(value);
-    if (!Number.isSafeInteger(value.after) || value.after < 0) fail('native_execution_request_invalid');
+    if (!Number.isSafeInteger(value.after) || value.after < 0)
+      fail('native_execution_request_invalid');
     if (current) {
-      if (!sameIdentity(current.identity, identity) || current.writerGeneration !== writerGeneration)
+      if (
+        !sameIdentity(current.identity, identity) ||
+        current.writerGeneration !== writerGeneration
+      )
         fail('native_execution_owner_conflict');
       return { ...identity, ...activityLog().pull(value.after) };
     }
     await readExisting(identity, writerGeneration);
-    const saved = readNativeActivitySpool({ spoolDirectory: join(directoryForGeneration(writerGeneration), 'activity'), writerGeneration, after: value.after });
+    const saved = readNativeActivitySpool({
+      spoolDirectory: join(directoryForGeneration(writerGeneration), 'activity'),
+      writerGeneration,
+      after: value.after,
+    });
     if (!saved) fail('native_execution_local_record_unavailable');
     return { ...identity, ...saved };
   };

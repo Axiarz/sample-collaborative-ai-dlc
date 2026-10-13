@@ -62,11 +62,11 @@ identity, version and policy contract.
 
 ## Harness-specific rendering and qualification
 
-| Harness | Pinned rendering contract |
-| --- | --- |
-| Codex | `request_user_input` when available; numbered prose fallback for headless/unavailable tool. Tool supports 1–3 questions, 2–3 options each; exact selected labels are recorded. |
-| Claude | `AskUserQuestion` renders the spec. |
-| Kiro CLI | Numbered prose plus exactly one final Other option; no structured-question tool is assumed. |
+| Harness  | Pinned rendering contract                                                                                                                                                      |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Codex    | `request_user_input` when available; numbered prose fallback for headless/unavailable tool. Tool supports 1–3 questions, 2–3 options each; exact selected labels are recorded. |
+| Claude   | `AskUserQuestion` renders the spec.                                                                                                                                            |
+| Kiro CLI | Numbered prose plus exactly one final Other option; no structured-question tool is assumed.                                                                                    |
 
 Kiro ACP `session/update` assistant and tool events are now projected through
 the same native privacy and backpressure boundary, while the final result

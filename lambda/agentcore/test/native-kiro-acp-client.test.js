@@ -48,7 +48,7 @@ describe('bounded Kiro ACP transport', () => {
     let active = 0;
     let peak = 0;
     const { client, input, sent } = fixture({
-      onUpdate: async params => {
+      onUpdate: async (params) => {
         peak = Math.max(peak, ++active);
         await tick();
         seen.push(params.update.text);
@@ -62,7 +62,7 @@ describe('bounded Kiro ACP transport', () => {
     expect(await prompt).toEqual({ stopReason: 'end_turn' });
     expect(seen).toEqual(Array.from({ length: 9 }, (_, i) => String(i)));
     expect(peak).toBe(1);
-    expect(sent.find(packet => packet.id === 'permission-1')).toMatchObject({
+    expect(sent.find((packet) => packet.id === 'permission-1')).toMatchObject({
       result: { outcome: { outcome: 'cancelled' } },
     });
   });
@@ -72,15 +72,18 @@ describe('bounded Kiro ACP transport', () => {
     const releases = [];
     const seen = [];
     const { client } = fixture({
-      input, maxInputBytes: null, maxOutputBytes: null,
-      onUpdate: params => new Promise(resolve => {
-        seen.push(Number(params.update.text.slice(0, 3)));
-        releases.push(resolve);
-      }),
+      input,
+      maxInputBytes: null,
+      maxOutputBytes: null,
+      onUpdate: (params) =>
+        new Promise((resolve) => {
+          seen.push(Number(params.update.text.slice(0, 3)));
+          releases.push(resolve);
+        }),
     });
     let produced = 0;
     let settled = false;
-    const prompt = client.request('session/prompt', {}, { timeoutMs: null }).then(value => {
+    const prompt = client.request('session/prompt', {}, { timeoutMs: null }).then((value) => {
       settled = true;
       return value;
     });
@@ -110,7 +113,12 @@ describe('bounded Kiro ACP transport', () => {
   it('releases a pressure-paused producer on cancellation without processing queued or late updates', async () => {
     const input = new PassThrough({ highWaterMark: 1024 });
     let release;
-    const onUpdate = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    const onUpdate = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
     const { client, sent } = fixture({ input, onUpdate, maxInputBytes: null });
     const prompt = caught(client.request('session/prompt', {}, { timeoutMs: null }));
     const producer = (async () => {
@@ -127,7 +135,7 @@ describe('bounded Kiro ACP transport', () => {
     release();
     await tick();
     expect(onUpdate).toHaveBeenCalledTimes(1);
-    expect(sent.filter(packet => packet.method === 'session/prompt')).toHaveLength(1);
+    expect(sent.filter((packet) => packet.method === 'session/prompt')).toHaveLength(1);
     expect(sent.at(-1)).toMatchObject({ method: 'session/cancel' });
     expect(input.listenerCount('readable')).toBe(0);
     expect(input.readableFlowing).toBe(true);
@@ -138,10 +146,15 @@ describe('bounded Kiro ACP transport', () => {
     let release;
     const { client, input } = fixture({
       defaultTimeoutMs: 5,
-      onUpdate: () => new Promise(resolve => { release = resolve; }),
+      onUpdate: () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
     });
     let settled = false;
-    const prompt = client.request('session/prompt', {}, { timeoutMs: null }).then(() => { settled = true; });
+    const prompt = client.request('session/prompt', {}, { timeoutMs: null }).then(() => {
+      settled = true;
+    });
     input.write(wire(update('held')) + wire(response(1)));
     await vi.advanceTimersByTimeAsync(60_000);
     expect(settled).toBe(false);

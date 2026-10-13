@@ -64,7 +64,12 @@ describe('getRealtimeToken builds the right token path per scope', () => {
     const channel = `native-intent:${PID}:${UUID}`;
     expect(scopeTargetForChannel(channel)).toEqual(native);
     let release!: (value: { token: string; exp: number; scopes: string[] }) => void;
-    post.mockReturnValueOnce(new Promise(resolve => { release = resolve; }))
+    post
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+      )
       .mockResolvedValueOnce({ token: 'other', exp: Date.now() / 1000 + 600, scopes: [] })
       .mockResolvedValueOnce({ token: 'platform', exp: Date.now() / 1000 + 600, scopes: [] });
     const first = getRealtimeToken(native);
@@ -74,8 +79,12 @@ describe('getRealtimeToken builds the right token path per scope', () => {
     expect((await first).token).toBe('native');
     expect((await getRealtimeToken(native)).token).toBe('native');
     expect(post).toHaveBeenCalledTimes(3);
-    expect(post).toHaveBeenCalledWith(`/projects/${PID}/intents/${UUID}/realtime-token`, { executionBackend: 'native' });
-    expect(post).toHaveBeenCalledWith(`/projects/${UUID}/intents/${UUID}/realtime-token`, { executionBackend: 'native' });
+    expect(post).toHaveBeenCalledWith(`/projects/${PID}/intents/${UUID}/realtime-token`, {
+      executionBackend: 'native',
+    });
+    expect(post).toHaveBeenCalledWith(`/projects/${UUID}/intents/${UUID}/realtime-token`, {
+      executionBackend: 'native',
+    });
     [native, other, platform].forEach(invalidateRealtimeToken);
   });
 
@@ -103,8 +112,14 @@ describe('revision-specific native reply draft tokens', () => {
   });
   it('requests exactly the interaction/turn and never shares a cache entry across revisions', async () => {
     const base = { intentId: UUID, projectId: PID, executionBackend: 'native' as const };
-    const turn2 = { ...base, document: { kind: 'reply' as const, interactionId: 'a'.repeat(64), sequence: 2 } };
-    const turn3 = { ...base, document: { kind: 'reply' as const, interactionId: 'b'.repeat(64), sequence: 3 } };
+    const turn2 = {
+      ...base,
+      document: { kind: 'reply' as const, interactionId: 'a'.repeat(64), sequence: 2 },
+    };
+    const turn3 = {
+      ...base,
+      document: { kind: 'reply' as const, interactionId: 'b'.repeat(64), sequence: 3 },
+    };
     await getRealtimeToken(turn2);
     await getRealtimeToken(turn3);
     await getRealtimeToken(base);
@@ -114,7 +129,9 @@ describe('revision-specific native reply draft tokens', () => {
       executionBackend: 'native',
       document: { kind: 'reply', interactionId: 'a'.repeat(64), sequence: 2 },
     });
-    expect(post).toHaveBeenNthCalledWith(3, `/projects/${PID}/intents/${UUID}/realtime-token`, { executionBackend: 'native' });
+    expect(post).toHaveBeenNthCalledWith(3, `/projects/${PID}/intents/${UUID}/realtime-token`, {
+      executionBackend: 'native',
+    });
     [turn2, turn3, base].forEach(invalidateRealtimeToken);
   });
 });

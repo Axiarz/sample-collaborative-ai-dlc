@@ -145,6 +145,16 @@ locals {
   agentcore_subnet_azs = slice(local.agentcore_az_names, 0, min(2, length(local.agentcore_az_names)))
 }
 
+module "dynamodb_kms_runtime_access" {
+  source = "../../security/dynamodb-kms-runtime-access"
+
+  kms_key_arn = var.kms_key_arn
+  dns_suffix  = local.dns_suffix
+  role_names = {
+    agentcore = aws_iam_role.agentcore.name
+  }
+}
+
 # ---------------------------------------------------------------------------
 # ECR + ARM64 image build (AgentCore Runtime requires arm64)
 # ---------------------------------------------------------------------------
@@ -261,12 +271,20 @@ data "aws_ecr_image" "agentcore" {
 # ---------------------------------------------------------------------------
 
 resource "aws_dynamodb_table" "v2_executions" {
-  name           = "${var.project_name}-v2-executions-${var.environment}"
-  billing_mode   = local.billing_mode
-  hash_key       = "pk"
-  range_key      = "sk"
-  read_capacity  = local.read_capacity
-  write_capacity = local.write_capacity
+  name                        = "${var.project_name}-v2-executions-${var.environment}"
+  billing_mode                = local.billing_mode
+  hash_key                    = "pk"
+  range_key                   = "sk"
+  read_capacity               = local.read_capacity
+  write_capacity              = local.write_capacity
+  deletion_protection_enabled = var.deletion_protection
+
+  # Only ephemeral authentication selection/invocation records set this field.
+  # Historical execution records are retained unchanged.
+  ttl {
+    attribute_name = "agentAuthTtl"
+    enabled        = true
+  }
 
   attribute {
     name = "pk"
@@ -346,6 +364,15 @@ resource "aws_dynamodb_table" "v2_executions" {
     }
   }
 
+  server_side_encryption {
+    enabled     = var.kms_key_arn != ""
+    kms_key_arn = var.kms_key_arn != "" ? var.kms_key_arn : null
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
   tags = var.tags
 }
 
@@ -402,6 +429,13 @@ resource "aws_iam_role_policy" "agentcore" {
             local.credential_broker_function_arn,
             local.source_control_function_arn,
           ]
+        },
+        {
+          # General runtime hardening: application credentials cannot assume another role.
+          # Credential acquisition belongs to the broker.
+          Effect   = "Deny"
+          Action   = ["sts:AssumeRole"]
+          Resource = "*"
         },
         {
           Effect   = "Allow"
@@ -711,11 +745,13 @@ locals {
     NATIVE_INTERACTION_PROBE_ENABLED = tostring(var.enable_native_interaction_probe)
     POWERTOOLS_SERVICE_NAME          = var.powertools_service_name
     POWERTOOLS_LOG_LEVEL             = var.powertools_log_level
+    BEDROCK_REGION                   = var.bedrock_region
   }
 }
 
 resource "awscc_bedrockagentcore_runtime" "stage_executor" {
   depends_on = [
+    aws_iam_role_policy.agentcore,
     terraform_data.native_efs_probe_configuration,
     aws_efs_mount_target.native_probe,
     aws_efs_file_system_policy.native_probe,

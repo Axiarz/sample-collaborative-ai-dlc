@@ -14,6 +14,8 @@ import {
   executionCapabilityReason,
   executionGateResponseReason,
 } from '@/lib/executionCapabilities';
+import { buildUnitBranchItems, type UnitBranchItem } from '@/components/intent/CodeSection';
+import { UnitBranchEntry } from '@/components/intent/UnitBranchEntry';
 
 // Map a v2 HUMAN# gate to the right editor, keyed by the intent collaboration
 // scope. `question` gates render the structured QuestionEditor; approval and
@@ -26,7 +28,10 @@ import {
 const engineGateStatusFor = (opt: string): GateAnswer['status'] =>
   /^(reject|request-changes)/i.test(opt)
     ? 'rejected'
-    : /^(approve|accept-as-is)/i.test(opt)
+    : // `override-and-approve` IS an approval: the human accepted the blocking
+      // findings on the record. Recording it as a plain answer would leave the
+      // gate — and the intent badge — reading as undecided.
+      /^(approve|accept-as-is|override-and-approve)/i.test(opt)
       ? 'approved'
       : 'answered';
 
@@ -71,6 +76,23 @@ export function GateCard({ gate, projectId, intentId, userName, onAnswer }: Gate
       createdAt: gate.createdAt ?? '',
     };
   }, [gate]);
+  const walkingSkeletonBranch = useMemo<UnitBranchItem | null>(() => {
+    if (!gate.prompt?.startsWith('Walking skeleton') || !gate.unitSlug) return null;
+    return (
+      (detail
+        ? buildUnitBranchItems(detail).find(
+            (item) =>
+              item.unitSlug === gate.unitSlug &&
+              (gate.sectionIndex == null || item.sectionIndex === gate.sectionIndex),
+          )
+        : null) ?? {
+        sectionIndex: gate.sectionIndex ?? null,
+        unitSlug: gate.unitSlug,
+        branch: null,
+        targets: [],
+      }
+    );
+  }, [detail, gate.prompt, gate.sectionIndex, gate.unitSlug]);
 
   if (gate.kind === 'validation') {
     const stageArtifacts =
@@ -86,6 +108,14 @@ export function GateCard({ gate, projectId, intentId, userName, onAnswer }: Gate
               The agent finished this stage and produced {stageArtifacts.length} artifact
               {stageArtifacts.length === 1 ? '' : 's'}. Review them and approve or request changes.
             </p>
+            {gate.loopBackReason && (
+              <p className="mt-1 text-xs text-amber-600 dark:text-amber-500">
+                The agent recommends revising the generated code: {gate.loopBackReason}
+                {gate.loopBackStatus !== 'offered' && gate.loopBackNote
+                  ? ` ${gate.loopBackNote}`
+                  : ''}
+              </p>
+            )}
           </div>
           {stageArtifacts.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
@@ -176,6 +206,10 @@ export function GateCard({ gate, projectId, intentId, userName, onAnswer }: Gate
       ? gate.options.filter((o): o is string => typeof o === 'string')
       : [];
     const offersRevision = options.some((o) => /^request-changes/i.test(o));
+    const prompt =
+      walkingSkeletonBranch?.branch && gate.prompt
+        ? gate.prompt.replace(` (branch ${walkingSkeletonBranch.branch})`, '')
+        : gate.prompt;
     return (
       <Card>
         <CardContent className="space-y-2 py-3">
@@ -184,7 +218,13 @@ export function GateCard({ gate, projectId, intentId, userName, onAnswer }: Gate
               unit {gate.unitSlug}
             </Badge>
           )}
-          <p className="whitespace-pre-line text-sm">{gate.prompt || 'Approval required'}</p>
+          <p className="whitespace-pre-line text-sm">{prompt || 'Approval required'}</p>
+          {walkingSkeletonBranch && (
+            <UnitBranchEntry
+              item={walkingSkeletonBranch}
+              className="border border-border/60 bg-muted/20"
+            />
+          )}
           {responseBlocked && <p className="text-xs text-muted-foreground">{responseBlocked}</p>}
           {offersRevision && (
             <div className="space-y-1 rounded-md border border-dashed px-3 py-2">

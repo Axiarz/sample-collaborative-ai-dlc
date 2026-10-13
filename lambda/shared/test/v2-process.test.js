@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { LOOP_BACK_LIMIT } from '../stage-loopback.js';
 import { mockClient } from 'aws-sdk-client-mock';
 import {
   BatchWriteCommand,
@@ -38,6 +39,9 @@ import {
   buildTrackerSyncRow,
   executionTypeStateIndex,
   HUMAN_TASK_STATUSES,
+  HUMAN_TASK_ANSWER_STATUSES,
+  isHumanTaskAnswerStatus,
+  humanTaskMatchesOwner,
   STEERING_KINDS,
   STEERING_STATUSES,
   UNIT_STATES,
@@ -126,6 +130,36 @@ describe('v2-process-keys', () => {
     });
   });
 
+  it('defines one answer-status and legacy-compatible ownership contract for human gates', () => {
+    expect(HUMAN_TASK_ANSWER_STATUSES).toEqual(['answered', 'approved', 'rejected']);
+    expect(HUMAN_TASK_ANSWER_STATUSES.every(isHumanTaskAnswerStatus)).toBe(true);
+    expect(isHumanTaskAnswerStatus('pending')).toBe(false);
+    expect(isHumanTaskAnswerStatus('superseded')).toBe(false);
+
+    const owner = {
+      stageInstanceId: 'si-a',
+      unitSlug: 'auth',
+      sectionIndex: 2,
+    };
+    expect(humanTaskMatchesOwner({ task: owner, ...owner })).toBe(true);
+    expect(humanTaskMatchesOwner({ task: { ...owner, sectionIndex: null }, ...owner })).toBe(true);
+    expect(humanTaskMatchesOwner({ task: owner, ...owner, sectionIndex: null })).toBe(true);
+    expect(
+      humanTaskMatchesOwner({
+        task: owner,
+        ...owner,
+        sectionIndex: 3,
+      }),
+    ).toBe(false);
+    expect(
+      humanTaskMatchesOwner({
+        task: owner,
+        ...owner,
+        unitSlug: 'catalog',
+      }),
+    ).toBe(false);
+  });
+
   it('builds a question human-task carrying the structured payload', () => {
     const row = buildHumanTaskRow({
       executionId: 'e1',
@@ -178,7 +212,7 @@ describe('createProcessStore', () => {
   });
 
   it('createExecution writes META guarded against overwrite', async () => {
-    ddb.on(PutCommand).resolves({});
+    ddb.on(TransactWriteCommand).resolves({});
     await store.createExecution({
       executionId: 'e1',
       projectId: 'p1',
@@ -187,9 +221,44 @@ describe('createProcessStore', () => {
       workflowId: 'w',
       workflowVersion: 1,
     });
-    const call = ddb.commandCalls(PutCommand)[0].args[0].input;
+    const call = ddb.commandCalls(TransactWriteCommand)[0].args[0].input.TransactItems[0].Put;
     expect(call.Item.sk).toBe('META');
     expect(call.ConditionExpression).toContain('attribute_not_exists(pk)');
+  });
+
+  it('createExecution reports an existing META row as ConditionalCheckFailedException', async () => {
+    ddb.on(TransactWriteCommand).rejects(
+      Object.assign(new Error('Transaction cancelled'), {
+        name: 'TransactionCanceledException',
+        CancellationReasons: [
+          { Code: 'ConditionalCheckFailed' },
+          { Code: 'None' },
+          { Code: 'None' },
+        ],
+      }),
+    );
+    const input = {
+      executionId: 'e1',
+      projectId: 'p1',
+      intentId: 'i1',
+      status: 'CREATED',
+      workflowId: 'w',
+      workflowVersion: 1,
+    };
+    await expect(store.createExecution(input)).rejects.toMatchObject({
+      name: 'ConditionalCheckFailedException',
+    });
+
+    ddb.reset();
+    ddb.on(TransactWriteCommand).rejects(
+      Object.assign(new Error('Transaction cancelled'), {
+        name: 'TransactionCanceledException',
+        CancellationReasons: [{ Code: 'None' }, { Code: 'ConditionalCheckFailed' }],
+      }),
+    );
+    await expect(store.createExecution(input)).rejects.toMatchObject({
+      name: 'TransactionCanceledException',
+    });
   });
 
   it('opts into strongly consistent META reads only when requested', async () => {
@@ -204,6 +273,29 @@ describe('createProcessStore', () => {
     expect(eventual).not.toHaveProperty('ConsistentRead');
     expect(consistent).toMatchObject({
       Key: executionMetaKey('e1'),
+      ConsistentRead: true,
+    });
+  });
+
+  it('opts into strongly consistent stage and human-gate reads only when requested', async () => {
+    ddb.on(GetCommand).resolves({ Item: { executionId: 'e1' } });
+
+    await store.getStage('e1', 'si-1');
+    await store.getStage('e1', 'si-1', { consistentRead: true });
+    await store.getHumanTask('e1', 'h1');
+    await store.getHumanTask('e1', 'h1', { consistentRead: true });
+
+    const [eventualStage, consistentStage, eventualGate, consistentGate] = ddb
+      .commandCalls(GetCommand)
+      .map((call) => call.args[0].input);
+    expect(eventualStage).not.toHaveProperty('ConsistentRead');
+    expect(consistentStage).toMatchObject({
+      Key: stageKey('e1', 'si-1'),
+      ConsistentRead: true,
+    });
+    expect(eventualGate).not.toHaveProperty('ConsistentRead');
+    expect(consistentGate).toMatchObject({
+      Key: humanTaskKey('e1', 'h1'),
       ConsistentRead: true,
     });
   });
@@ -283,6 +375,32 @@ describe('createProcessStore', () => {
         failure: { code: '', message: 'Missing code.' },
       }),
     ).rejects.toThrow('failure must be {code, message} or null');
+  });
+
+  it('replaces MCP settings with the launch CAS and removes the legacy fallback', async () => {
+    ddb.on(UpdateCommand).resolves({ Attributes: {} });
+    await store.updateExecution({
+      executionId: 'e1',
+      projectId: 'p1',
+      startedAt: 'T',
+      status: 'CREATED',
+      fromStatus: 'FAILED',
+      mcpServersByTier: { global: {}, project: {} },
+    });
+    const input = ddb.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.ConditionExpression).toContain('#status = :fromStatus');
+    expect(input.ExpressionAttributeValues[':mcp']).toEqual({ global: {}, project: {} });
+    expect(input.UpdateExpression).toContain('REMOVE customMcpServers');
+  });
+
+  it('refuses to replace MCP settings outside a conditional launch', async () => {
+    await expect(
+      store.updateExecution({
+        executionId: 'e1',
+        mcpServersByTier: { global: {}, project: {} },
+      }),
+    ).rejects.toThrow('MCP settings can only be replaced during a conditional launch');
+    expect(ddb.commandCalls(UpdateCommand)).toHaveLength(0);
   });
 
   it('persists a validated workspace classification', async () => {
@@ -440,6 +558,10 @@ describe('createProcessStore', () => {
     expect(input.ExpressionAttributeValues[':scb']).toBe('cb-2');
     expect(input.UpdateExpression).toContain('aidlcRepoRef = :aidlcRepoRef');
     expect(input.ExpressionAttributeValues[':aidlcRepoRef']).toBe('a'.repeat(40));
+    expect(ddb.commandCalls(GetCommand)[0].args[0].input).toMatchObject({
+      Key: stageKey('e1', 'si-1'),
+      ConsistentRead: true,
+    });
   });
 
   it('resumeStageRow tolerates a missing/unparsable park stamp (waitMs unchanged, no NaN)', async () => {
@@ -499,6 +621,45 @@ describe('createProcessStore', () => {
     expect(input.ConditionExpression).toBe('#status = :pending');
   });
 
+  it('answers with attached steering in one transaction', async () => {
+    ddb.on(TransactWriteCommand).resolves({});
+
+    const result = await store.answerHumanTaskWithSteering({
+      executionId: 'e1',
+      humanTaskId: 'h1',
+      status: 'answered',
+      answer: { choice: 'A' },
+      answeredBy: 'u1',
+      steering: {
+        kind: 'gate-steer',
+        message: 'Use the event bus.',
+        targetGateId: 'h1',
+        createdBy: 'u1',
+      },
+    });
+
+    expect(result).toMatchObject({
+      answered: { humanTaskId: 'h1', status: 'answered' },
+      steering: {
+        steerId: 'st-id-1',
+        status: 'pending',
+        message: 'Use the event bus.',
+        targetGateId: 'h1',
+      },
+    });
+    const transaction = ddb.commandCalls(TransactWriteCommand)[0].args[0].input.TransactItems;
+    expect(transaction).toHaveLength(2);
+    expect(transaction[0].Update).toMatchObject({
+      Key: humanTaskKey('e1', 'h1'),
+      ConditionExpression: '#status = :pending',
+    });
+    expect(transaction[1].Put).toMatchObject({
+      Item: expect.objectContaining({ sk: 'STEER#T#st-id-1' }),
+      ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
+    });
+    expect(ddb.commandCalls(GetCommand)).toHaveLength(0);
+  });
+
   it('listEvents queries the EVENT# prefix time-ordered and drains pagination', async () => {
     // The PR fan-in reads this to detect recorded git activity — a dropped
     // page could hide a push failure (the 2026-07 lost-work signal).
@@ -517,6 +678,12 @@ describe('createProcessStore', () => {
     expect(input.KeyConditionExpression).toBe('pk = :pk AND begins_with(sk, :p)');
     expect(input.ExpressionAttributeValues[':p']).toBe('EVENT#');
     expect(ddb.commandCalls(QueryCommand)).toHaveLength(2);
+  });
+
+  it('listEvents uses a consistent read when requested', async () => {
+    ddb.on(QueryCommand).resolves({ Items: [] });
+    await store.listEvents('e1', { consistentRead: true });
+    expect(ddb.commandCalls(QueryCommand)[0].args[0].input.ConsistentRead).toBe(true);
   });
 
   it('getExecutionRecords groups rows by SK prefix', async () => {
@@ -586,6 +753,7 @@ describe('createProcessStore', () => {
       pk: 'EXEC#e1',
       sk: `EVENT#T#${String(i).padStart(2, '0')}`,
     }));
+    ddb.on(GetCommand).resolves({});
     ddb.on(QueryCommand).resolves({ Items: keys });
     ddb.on(BatchWriteCommand).resolves({ UnprocessedItems: {} });
     const { deleted } = await store.deleteExecution('e1');
@@ -604,6 +772,14 @@ describe('createProcessStore', () => {
   });
 
   it('deleteExecution retries UnprocessedItems until the batch fully lands', async () => {
+    ddb.on(GetCommand).resolves({
+      Item: {
+        pk: 'EXEC#e1',
+        sk: 'META',
+        projectId: 'p1',
+        credentialBinding: { provider: 'bedrock', source: 'user', userId: 'u1' },
+      },
+    });
     ddb.on(QueryCommand).resolves({
       Items: [
         { pk: 'EXEC#e1', sk: 'META' },
@@ -620,9 +796,21 @@ describe('createProcessStore', () => {
     const batches = ddb.commandCalls(BatchWriteCommand).map((c) => c.args[0].input);
     expect(batches).toHaveLength(2);
     expect(batches[1].RequestItems['v2-proc']).toEqual(leftover);
+    const transaction = ddb.commandCalls(TransactWriteCommand).at(-1).args[0].input;
+    expect(transaction.TransactItems.map(({ Delete }) => Delete.Key.pk)).toEqual([
+      'EXEC#e1',
+      'AGENTAUTH#SCOPE#space#p1',
+      'AGENTAUTH#SCOPE#user#u1',
+    ]);
+    expect(
+      batches
+        .flatMap((batch) => batch.RequestItems['v2-proc'])
+        .every(({ DeleteRequest }) => DeleteRequest.Key.sk !== 'META'),
+    ).toBe(true);
   });
 
   it('deleteExecution is a no-op on an empty partition', async () => {
+    ddb.on(GetCommand).resolves({});
     ddb.on(QueryCommand).resolves({ Items: [] });
     const { deleted } = await store.deleteExecution('gone');
     expect(deleted).toBe(0);
@@ -844,6 +1032,43 @@ describe('createProcessStore', () => {
 });
 
 describe('buildExecutionMeta intent-config + DRAFT', () => {
+  it('pins the immutable AI-DLC release alongside the ref and the block pins', () => {
+    const methodologyRelease = {
+      releaseId: 'aidlc:83ed7a812c4024904f2c5e4d744e28077e0a5acd',
+      sourceSha: '83ed7a812c4024904f2c5e4d744e28077e0a5acd',
+      importerRevision: 1,
+      closureDigest: 'b'.repeat(64),
+      catalogKey: 'aidlc-releases/v1/83ed7a812c4024904f2c5e4d744e28077e0a5acd/i1/catalog.json',
+      manifestKey: 'aidlc-releases/v1/83ed7a812c4024904f2c5e4d744e28077e0a5acd/i1/manifest.json',
+    };
+    const pinned = buildExecutionMeta({
+      executionId: 'e1',
+      projectId: 'p1',
+      intentId: 'i1',
+      workflowId: 'aidlc-v2',
+      workflowVersion: 1,
+      startedAt: 'T',
+      aidlcRepoRef: '83ed7a812c4024904f2c5e4d744e28077e0a5acd',
+      methodologyPins: { AGENT: { 'agent-x': { tenantId: 'SYSTEM', version: 1 } } },
+      methodologyRelease,
+    });
+    const unpinned = buildExecutionMeta({
+      executionId: 'e2',
+      projectId: 'p1',
+      intentId: 'i2',
+      workflowId: 'aidlc-v2',
+      workflowVersion: 1,
+      startedAt: 'T',
+    });
+
+    expect(pinned.methodologyRelease).toEqual(methodologyRelease);
+    expect(pinned.aidlcRepoRef).toBe('83ed7a812c4024904f2c5e4d744e28077e0a5acd');
+    expect(pinned.methodologyPins).toEqual({
+      AGENT: { 'agent-x': { tenantId: 'SYSTEM', version: 1 } },
+    });
+    expect(unpinned).not.toHaveProperty('methodologyRelease');
+  });
+
   it('carries prompt/branch/baseBranch/repos and supports DRAFT status', () => {
     const meta = buildExecutionMeta({
       executionId: 'e1',
@@ -1018,13 +1243,19 @@ describe('steering store methods', () => {
     expect(input.ConditionExpression).toContain('attribute_not_exists(pk)');
   });
 
-  it('listPendingSteering queries GSI2 by TYPE#STEER#STATE#pending', async () => {
-    ddb.on(QueryCommand).resolves({ Items: [{ sk: 'STEER#T#st-1', steerId: 'st-1' }] });
+  it('listPendingSteering strongly reads the execution partition and filters pending rows', async () => {
+    ddb.on(QueryCommand).resolves({
+      Items: [
+        { sk: 'STEER#T#st-1', steerId: 'st-1', status: 'pending' },
+        { sk: 'STEER#T#st-2', steerId: 'st-2', status: 'consumed' },
+      ],
+    });
     const rows = await store.listPendingSteering('e1');
     expect(rows).toHaveLength(1);
     const input = ddb.commandCalls(QueryCommand)[0].args[0].input;
-    expect(input.IndexName).toBe('GSI2');
-    expect(input.ExpressionAttributeValues[':p']).toBe('TYPE#STEER#STATE#pending#');
+    expect(input.IndexName).toBeUndefined();
+    expect(input.ConsistentRead).toBe(true);
+    expect(input.ExpressionAttributeValues[':p']).toBe('STEER#');
   });
 
   it('markSteeringConsumed is a CAS on pending; a lost race returns null', async () => {
@@ -1078,6 +1309,13 @@ describe('steering store methods', () => {
     expect(input.UpdateExpression).toContain('revisedAt = :ts');
   });
 
+  it('getStage strongly reads a row when requested', async () => {
+    ddb.on(GetCommand).resolves({ Item: { stageInstanceId: 'si-1', attempt: 2 } });
+    const row = await store.getStage('e1', 'si-1', { consistentRead: true });
+    expect(row).toMatchObject({ stageInstanceId: 'si-1', attempt: 2 });
+    expect(ddb.commandCalls(GetCommand)[0].args[0].input.ConsistentRead).toBe(true);
+  });
+
   it('resetStageRow flips a stage back to PENDING with attempt+1 and a cleared session', async () => {
     ddb.on(GetCommand).resolves({ Item: { stageInstanceId: 'si-1', attempt: 1, cli: 'claude' } });
     ddb.on(UpdateCommand).resolves({ Attributes: { state: 'PENDING', attempt: 2 } });
@@ -1088,6 +1326,228 @@ describe('steering store methods', () => {
     expect(input.ExpressionAttributeValues[':attempt']).toBe(2);
     expect(input.UpdateExpression).toContain('cliSessionId = :null');
     expect(input.ExpressionAttributeValues[':g2sk']).toBe('TYPE#STAGE#STATE#PENDING#si-1');
+  });
+
+  it('stores the loop-back tally on META and applies a committed loop-back only once', async () => {
+    let stageRow = { stageInstanceId: 'si-1', state: 'SUCCEEDED', attempt: 1 };
+    let metaRow = { executionId: 'e1', loopBackCount: 0, loopBackIds: [] };
+    ddb.on(GetCommand).callsFake((input) => ({
+      Item: input.Key.sk === 'META' ? { ...metaRow } : { ...stageRow },
+    }));
+    ddb.on(TransactWriteCommand).callsFake(({ TransactItems }) => {
+      const [stage, meta] = TransactItems.map((item) => item.Update);
+      const stageValues = stage.ExpressionAttributeValues;
+      const metaValues = meta.ExpressionAttributeValues;
+      // Enforce the META condition the way DynamoDB would.
+      if (metaRow.loopBackIds.includes(metaValues[':loopBackId'])) {
+        throw Object.assign(new Error('cancelled'), { name: 'TransactionCanceledException' });
+      }
+      stageRow = {
+        ...stageRow,
+        state: 'PENDING',
+        attempt: stageValues[':attempt'],
+      };
+      metaRow = {
+        ...metaRow,
+        loopBackCount: metaRow.loopBackCount + 1,
+        loopBackIds: [...metaRow.loopBackIds, metaValues[':loopBackId']],
+      };
+      return {};
+    });
+
+    const first = await store.resetStageRow({
+      executionId: 'e1',
+      stageInstanceId: 'si-1',
+      loopBackId: 'eg-validation-si-bt-0-run-1',
+    });
+    await store.putStage({
+      executionId: 'e1',
+      stageInstanceId: 'si-1',
+      stageId: 'code-generation',
+    });
+    const replay = await store.resetStageRow({
+      executionId: 'e1',
+      stageInstanceId: 'si-1',
+      loopBackId: 'eg-validation-si-bt-0-run-1',
+    });
+
+    expect(first).toMatchObject({ loopBackCount: 1, attempt: 2 });
+    expect(replay).toMatchObject({ loopBackCount: 1, attempt: 2 });
+    expect(metaRow).toMatchObject({
+      loopBackCount: 1,
+      loopBackIds: ['eg-validation-si-bt-0-run-1'],
+    });
+    // The replay is resolved by the cancelled transaction, not by a META pre-read.
+    expect(ddb.commandCalls(TransactWriteCommand)).toHaveLength(2);
+    const transaction = ddb.commandCalls(TransactWriteCommand)[0].args[0].input.TransactItems;
+    expect(transaction[0].Update).toMatchObject({
+      ConditionExpression: 'attribute_exists(pk) AND attempt = :oldAttempt',
+      ExpressionAttributeValues: expect.objectContaining({ ':oldAttempt': 1 }),
+    });
+    expect(transaction[1].Update).toMatchObject({
+      ConditionExpression: expect.stringContaining('loopBackCount < :limit'),
+      UpdateExpression: expect.stringContaining(
+        'loopBackCount = if_not_exists(loopBackCount, :zero) + :one',
+      ),
+    });
+    expect(transaction[1].Update.ConditionExpression).toContain(
+      'NOT contains(loopBackIds, :loopBackId)',
+    );
+    expect(transaction[1].Update.ExpressionAttributeValues[':limit']).toBe(LOOP_BACK_LIMIT);
+    const replacedStage = ddb.commandCalls(PutCommand)[0].args[0].input.Item;
+    expect(replacedStage).not.toHaveProperty('loopBackCount');
+    expect(replacedStage).not.toHaveProperty('lastLoopBackId');
+    expect(await store.getExecution('e1', { consistentRead: true })).toMatchObject({
+      loopBackCount: 1,
+    });
+  });
+
+  it('guards the recommending stage’s reset like the target’s, without a second tally', async () => {
+    const stageRow = { stageInstanceId: 'si-bt', state: 'SUCCEEDED', attempt: 1 };
+    ddb.on(GetCommand).resolves({ Item: stageRow });
+    ddb.on(UpdateCommand).resolves({ Attributes: { ...stageRow, state: 'PENDING', attempt: 2 } });
+
+    const reset = await store.resetStageRow({
+      executionId: 'e1',
+      stageInstanceId: 'si-bt',
+      loopBackId: 'eg-validation-si-bt-0-run-1',
+      countsAgainstCap: false,
+    });
+    expect(reset).toMatchObject({ state: 'PENDING', attempt: 2 });
+
+    // Read consistently, exactly like the target's reset: a stale row would be the
+    // very thing the attempt condition below is defending against.
+    expect(ddb.commandCalls(GetCommand)[0].args[0].input.ConsistentRead).toBe(true);
+    const { input } = ddb.commandCalls(UpdateCommand)[0].args[0];
+    expect(input.ConditionExpression).toBe('attribute_exists(pk) AND attempt = :oldAttempt');
+    expect(input.ExpressionAttributeValues[':oldAttempt']).toBe(1);
+    expect(input.ExpressionAttributeValues[':attempt']).toBe(2);
+    // Stamped so a replay of this durable step recognises its own earlier write.
+    expect(input.UpdateExpression).toContain('lastLoopBackId = :loopBackId');
+    expect(input.ExpressionAttributeValues[':loopBackId']).toBe('eg-validation-si-bt-0-run-1');
+    // The cap counts DECISIONS, not rows, so this reset never touches META.
+    expect(ddb.commandCalls(TransactWriteCommand)).toHaveLength(0);
+  });
+
+  it('treats a replayed recommending-stage reset as already applied', async () => {
+    ddb.on(GetCommand).resolves({
+      Item: {
+        stageInstanceId: 'si-bt',
+        state: 'PENDING',
+        attempt: 2,
+        lastLoopBackId: 'eg-validation-si-bt-0-run-1',
+      },
+    });
+
+    const replay = await store.resetStageRow({
+      executionId: 'e1',
+      stageInstanceId: 'si-bt',
+      loopBackId: 'eg-validation-si-bt-0-run-1',
+      countsAgainstCap: false,
+    });
+
+    expect(replay).toMatchObject({ attempt: 2 });
+    // The attempt is bumped once per loop-back however often the step re-drives.
+    expect(ddb.commandCalls(UpdateCommand)).toHaveLength(0);
+    expect(ddb.commandCalls(TransactWriteCommand)).toHaveLength(0);
+  });
+
+  // The target's replay REPORTS the tally, so it must read META the way every other
+  // loop-back read on this path does. An eventually consistent read can hand back a
+  // count from before this decision's own transaction, which is the number the
+  // orchestrator renders as "loop-back N of 3".
+  it('reads META consistently when a replayed target reset reports the tally', async () => {
+    const stageRow = {
+      stageInstanceId: 'si-cg',
+      state: 'PENDING',
+      attempt: 2,
+      lastLoopBackId: 'eg-validation-si-bt-0-run-1',
+    };
+    const metaRow = {
+      executionId: 'e1',
+      loopBackCount: 1,
+      loopBackIds: ['eg-validation-si-bt-0-run-1'],
+    };
+    ddb.on(GetCommand).callsFake((input) => ({
+      Item: input.Key.sk === 'META' ? { ...metaRow } : { ...stageRow },
+    }));
+
+    const replay = await store.resetStageRow({
+      executionId: 'e1',
+      stageInstanceId: 'si-cg',
+      loopBackId: 'eg-validation-si-bt-0-run-1',
+    });
+
+    expect(replay).toMatchObject({ attempt: 2, loopBackCount: 1 });
+    const reads = ddb.commandCalls(GetCommand).map((call) => call.args[0].input);
+    expect(reads.find((input) => input.Key.sk === 'META')).toMatchObject({ ConsistentRead: true });
+    expect(reads.every((input) => input.ConsistentRead === true)).toBe(true);
+    // Nothing is re-applied: the attempt is bumped once per decision.
+    expect(ddb.commandCalls(UpdateCommand)).toHaveLength(0);
+    expect(ddb.commandCalls(TransactWriteCommand)).toHaveLength(0);
+  });
+
+  it('returns null when a stale read loses the attempt condition, so the caller fails closed', async () => {
+    // The row moved between the read and the write: another writer already used
+    // attempt 2, and reusing it would leave this pass's receipts reachable.
+    ddb.on(GetCommand).resolves({ Item: { stageInstanceId: 'si-bt', attempt: 1 } });
+    ddb
+      .on(UpdateCommand)
+      .rejects(
+        Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' }),
+      );
+
+    expect(
+      await store.resetStageRow({
+        executionId: 'e1',
+        stageInstanceId: 'si-bt',
+        loopBackId: 'eg-validation-si-bt-0-run-1',
+        countsAgainstCap: false,
+      }),
+    ).toBeNull();
+  });
+
+  it('records and clears the loop-back recommendation on the stage row', async () => {
+    ddb.on(UpdateCommand).resolves({});
+    const where = { executionId: 'e1', stageInstanceId: 'si-1' };
+    await store.setLoopBackRecommendation({
+      ...where,
+      reason: 'generated code ignores the contract',
+    });
+    await store.setLoopBackRecommendation({ ...where, reason: null });
+    const [set, clear] = ddb.commandCalls(UpdateCommand).map((call) => call.args[0].input);
+    expect(set).toMatchObject({
+      Key: stageKey('e1', 'si-1'),
+      UpdateExpression: 'SET loopBackRecommendation = :reason',
+      ConditionExpression: 'attribute_exists(pk)',
+      ExpressionAttributeValues: { ':reason': 'generated code ignores the contract' },
+    });
+    expect(clear).toMatchObject({
+      Key: stageKey('e1', 'si-1'),
+      UpdateExpression: 'REMOVE loopBackRecommendation',
+      ConditionExpression: 'attribute_exists(pk)',
+    });
+    expect(clear).not.toHaveProperty('ExpressionAttributeValues');
+  });
+
+  // Stamped by the target's re-run after it archived both rewound stages, so a
+  // replayed re-run recognises its own completed archive and does not version the
+  // heads pass 1 has since written.
+  it('stamps the loop-back archive marker on the stage row', async () => {
+    ddb.on(UpdateCommand).resolves({});
+
+    await store.markLoopBackArchived({
+      executionId: 'e1',
+      stageInstanceId: 'si-cg',
+      loopBackId: 'eg-validation-si-bt-0-run-1',
+    });
+
+    expect(ddb.commandCalls(UpdateCommand)[0].args[0].input).toMatchObject({
+      Key: stageKey('e1', 'si-cg'),
+      UpdateExpression: 'SET loopBackArchiveId = :loopBackId',
+      ConditionExpression: 'attribute_exists(pk)',
+      ExpressionAttributeValues: { ':loopBackId': 'eg-validation-si-bt-0-run-1' },
+    });
   });
 
   it('resetStageRow is a no-op (null) for a stage that never ran', async () => {
@@ -1111,6 +1571,54 @@ describe('steering store methods', () => {
     const reset = await store.resetStageRow({ executionId: 'e1', stageInstanceId: 'si-1' });
     expect(reset).toBeNull();
     expect(ddb.commandCalls(UpdateCommand)).toHaveLength(0);
+  });
+
+  // A rewind/retry must start the checkpoint ladder's bounded
+  // repair budget fresh, not arrive already "used up" from the prior attempt.
+  it('resetStageRow zeroes summaryRepairAttempts and planApprovalRepairAttempts on a rewind/retry', async () => {
+    ddb.on(GetCommand).resolves({
+      Item: {
+        stageInstanceId: 'si-1',
+        attempt: 1,
+        summaryRepairAttempts: 1,
+        planApprovalRepairAttempts: 1,
+      },
+    });
+    ddb.on(UpdateCommand).resolves({
+      Attributes: {
+        state: 'PENDING',
+        attempt: 2,
+        summaryRepairAttempts: 0,
+        planApprovalRepairAttempts: 0,
+      },
+    });
+    const reset = await store.resetStageRow({ executionId: 'e1', stageInstanceId: 'si-1' });
+    expect(reset).toMatchObject({ summaryRepairAttempts: 0, planApprovalRepairAttempts: 0 });
+    const input = ddb.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain('summaryRepairAttempts = :zero');
+    expect(input.UpdateExpression).toContain('planApprovalRepairAttempts = :zero');
+    expect(input.ExpressionAttributeValues[':zero']).toBe(0);
+  });
+
+  // A row can be otherwise "clean" PENDING (the interrupted-rewind replay guard
+  // above) yet still carry a non-zero repair counter; that must NOT be treated as
+  // already reset, or the counter would never clear.
+  it('resetStageRow does not short-circuit a PENDING row that still carries a stale repair counter', async () => {
+    ddb.on(GetCommand).resolves({
+      Item: {
+        stageInstanceId: 'si-1',
+        state: 'PENDING',
+        attempt: 2,
+        startedAt: null,
+        cliSessionId: null,
+        runtimeError: null,
+        summaryRepairAttempts: 1,
+      },
+    });
+    ddb.on(UpdateCommand).resolves({ Attributes: { state: 'PENDING', attempt: 3 } });
+    const reset = await store.resetStageRow({ executionId: 'e1', stageInstanceId: 'si-1' });
+    expect(reset).not.toBeNull();
+    expect(ddb.commandCalls(UpdateCommand)).toHaveLength(1);
   });
 
   it('updateExecution supports the orchestrator ownership CAS (ifOrchestratorRunId)', async () => {
@@ -1869,5 +2377,110 @@ describe('quorum edit rows', () => {
     });
     const records = await store.getExecutionRecords('e1', { includeOutputs: false });
     expect(records.quorumEdits.map((q) => q.editId)).toEqual(['qe-1']);
+  });
+});
+
+describe('buildExecutionMeta — unpinned row shape', () => {
+  it('writes no release or resume fields for an unpinned intent', () => {
+    const meta = buildExecutionMeta({
+      executionId: 'e1',
+      projectId: 'p1',
+      intentId: 'i1',
+      status: 'RUNNING',
+      workflowId: 'aidlc-v2',
+      workflowVersion: 1,
+      startedAt: '2026-01-01T00:00:00.000Z',
+    });
+    expect(meta).not.toHaveProperty('methodologyRelease');
+    expect(meta).not.toHaveProperty('resumeRequired');
+  });
+});
+
+describe('createProcessStore — resume marker', () => {
+  const ddb = mockClient(DynamoDBDocumentClient);
+  let store;
+  beforeEach(() => {
+    ddb.reset();
+    ddb.on(UpdateCommand).resolves({ Attributes: {} });
+    store = createProcessStore({ ddb, tableName: 'v2-proc', clock: () => 'T' });
+  });
+
+  it('removes the marker instead of writing a null attribute', async () => {
+    await store.updateExecution({ executionId: 'e1', resumeRequired: null });
+    const input = ddb.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toMatch(/ REMOVE (.*, )?resumeRequired\b/);
+    expect(input.UpdateExpression).not.toMatch(/SET .*resumeRequired =/);
+  });
+
+  it('sets the marker when one is given', async () => {
+    const marker = { humanTaskId: 'h1', callbackId: 'cb-1', answeredAt: 'T' };
+    await store.updateExecution({ executionId: 'e1', resumeRequired: marker });
+    const input = ddb.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain('resumeRequired = :rsr');
+    expect(input.ExpressionAttributeValues[':rsr']).toEqual(marker);
+  });
+});
+
+describe('createProcessStore — repair counter per validation revision', () => {
+  const ddb = mockClient(DynamoDBDocumentClient);
+  let store;
+  beforeEach(() => {
+    ddb.reset();
+    store = createProcessStore({ ddb, tableName: 'v2-proc', clock: () => 'T' });
+  });
+
+  it('raises the counter only while it is below the target', async () => {
+    ddb.on(UpdateCommand).resolves({ Attributes: {} });
+
+    await expect(
+      store.raiseStageCounter({
+        executionId: 'e1',
+        stageInstanceId: 'si-1',
+        field: 'summaryRepairAttempts',
+        to: 2,
+      }),
+    ).resolves.toBe(true);
+    const input = ddb.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain('#f = :to');
+    expect(input.ConditionExpression).toBe('attribute_not_exists(#f) OR #f < :to');
+    expect(input.ExpressionAttributeValues[':to']).toBe(2);
+  });
+
+  it('reports a counter already at the target instead of raising it', async () => {
+    ddb
+      .on(UpdateCommand)
+      .rejects(
+        Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' }),
+      );
+
+    await expect(
+      store.raiseStageCounter({
+        executionId: 'e1',
+        stageInstanceId: 'si-1',
+        field: 'summaryRepairAttempts',
+        to: 2,
+      }),
+    ).resolves.toBe(false);
+  });
+});
+
+describe('createProcessStore — clearing the resume marker of one gate', () => {
+  const ddb = mockClient(DynamoDBDocumentClient);
+  let store;
+  beforeEach(() => {
+    ddb.reset();
+    ddb.on(UpdateCommand).resolves({ Attributes: {} });
+    store = createProcessStore({ ddb, tableName: 'v2-proc', clock: () => 'T' });
+  });
+
+  it('clears the marker only while it still names that gate', async () => {
+    await store.updateExecution({
+      executionId: 'e1',
+      resumeRequired: null,
+      ifResumeRequiredFor: 'h1',
+    });
+    const input = ddb.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.ConditionExpression).toContain('resumeRequired.humanTaskId = :ifRrh');
+    expect(input.ExpressionAttributeValues[':ifRrh']).toBe('h1');
   });
 });

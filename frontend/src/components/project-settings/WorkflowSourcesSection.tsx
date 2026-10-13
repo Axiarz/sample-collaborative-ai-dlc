@@ -5,16 +5,16 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { SettingsCard } from '@/components/settings/SettingsCard';
 import { WorkflowPackageImport } from './WorkflowPackageImport';
-import type { GitProvider } from '@/services/gitProvider';
 import {
   isWorkflowSourceApiDisabled,
   workflowSourcesService,
   type WorkflowSource,
+  type WorkflowSourceProvider,
   type WorkflowSourceAuthType,
   type WorkflowSourceList,
 } from '@/services/workflowSources';
 
-const PROVIDERS: GitProvider[] = ['github', 'gitlab', 'bitbucket'];
+const PROVIDERS: WorkflowSourceProvider[] = ['github', 'gitlab', 'bitbucket'];
 const LABELS = { github: 'GitHub', gitlab: 'GitLab', bitbucket: 'Bitbucket' };
 const selectStyle = 'h-9 w-full rounded-md border border-input bg-background px-3 text-sm';
 const errorMessage = (error: unknown, fallback: string) =>
@@ -38,7 +38,7 @@ export function WorkflowSourcesSection({ projectId, canEdit }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<WorkflowSource | null>(null);
-  const [provider, setProvider] = useState<GitProvider>('github');
+  const [provider, setProvider] = useState<WorkflowSourceProvider>('github');
   const [repository, setRepository] = useState('awslabs/aidlc-workflows');
   const [authType, setAuthType] = useState<WorkflowSourceAuthType>('public');
   const [confirmed, setConfirmed] = useState(false);
@@ -270,7 +270,7 @@ export function WorkflowSourcesSection({ projectId, canEdit }: Props) {
                   value={provider}
                   disabled={formDisabled || editing !== null}
                   onChange={(event) => {
-                    const value = event.target.value as GitProvider;
+                    const value = event.target.value as WorkflowSourceProvider;
                     if (!PROVIDERS.includes(value)) return;
                     setProvider(value);
                     setAuthType('public');

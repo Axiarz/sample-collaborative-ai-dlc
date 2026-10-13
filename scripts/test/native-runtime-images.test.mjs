@@ -3,7 +3,10 @@ import test from 'node:test';
 import { requiredPins, scopeHash } from '../native-runtime-images.mjs';
 
 const REPO = '123456789012.dkr.ecr.us-east-1.amazonaws.com/aidlc-agentcore-dev';
-const pin = (hex) => ({ uri: `${REPO}@sha256:${hex.repeat(64)}`, digest: `sha256:${hex.repeat(64)}` });
+const pin = (hex) => ({
+  uri: `${REPO}@sha256:${hex.repeat(64)}`,
+  digest: `sha256:${hex.repeat(64)}`,
+});
 const row = (id, status, image, extra = {}) => ({
   sk: 'EXECUTION',
   scope: { projectId: 'project-one', executionId: id },

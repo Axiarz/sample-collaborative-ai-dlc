@@ -248,7 +248,9 @@ export const invokeDiscussionAssist = async ({ intentId, payload }) => {
 // never in the isolated native writer, and receives only the verified context
 // in its payload. Native records never select this target.
 const nativeDiscussionSessionIdFor = (rootId, discussionId) =>
-  `aidlc-discuss-native-${createHash('sha256').update(JSON.stringify([rootId, discussionId])).digest('hex')}`;
+  `aidlc-discuss-native-${createHash('sha256')
+    .update(JSON.stringify([rootId, discussionId]))
+    .digest('hex')}`;
 
 export const invokeNativeDiscussionAssist = async ({ scope, payload }) => {
   const agentRuntimeArn = process.env.AGENTCORE_RUNTIME_ARN || '';

@@ -102,15 +102,15 @@ See the [dispatch review](native-package-dispatch-review.md).
 Local evidence under `/tmp/aidlc-plan-tools/` (raw job records contain private
 actor/revision fields and must not be copied into documentation):
 
-| Evidence | File |
-| --- | --- |
-| Applied dispatch fix, exact template and running delivery | `native-dispatch-fix-deployed-20260923.json` |
-| Fresh normal UI import, successful job and worker observations; no replay | `native-normal-import-live-20260923.json` |
-| Activation and exact deployed worker hash | `native-first-import-deployed-20260923.json` |
-| Historical initial job and stalled normal invocation | `native-first-import-live-20260923-initial.json` |
-| Historical diagnostic replay of the same job | `native-first-import-canonical-replay-20260923.json` |
-| Historical replay-completed job, queue and worker observations | `native-first-import-live-20260923-completed.json` |
-| Earlier independent exact-version archive verification | `native-first-import-archive-verification-20260923.json` |
+| Evidence                                                                  | File                                                     |
+| ------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Applied dispatch fix, exact template and running delivery                 | `native-dispatch-fix-deployed-20260923.json`             |
+| Fresh normal UI import, successful job and worker observations; no replay | `native-normal-import-live-20260923.json`                |
+| Activation and exact deployed worker hash                                 | `native-first-import-deployed-20260923.json`             |
+| Historical initial job and stalled normal invocation                      | `native-first-import-live-20260923-initial.json`         |
+| Historical diagnostic replay of the same job                              | `native-first-import-canonical-replay-20260923.json`     |
+| Historical replay-completed job, queue and worker observations            | `native-first-import-live-20260923-completed.json`       |
+| Earlier independent exact-version archive verification                    | `native-first-import-archive-verification-20260923.json` |
 
 ## Current deployment — dispatch fix applied and verified
 
@@ -144,13 +144,13 @@ SHA256: `84385df47007f2fb911cbca88bff5e54451ff1cbd3decd6903b010b2409c0599`.
 
 The reviewed full plan, without resource targeting, contained these cloud changes:
 
-| Resource | Change |
-| --- | --- |
-| Workflow-source API | Set `NATIVE_PACKAGE_JOBS_ENABLED=true`; other environment fields and code unchanged |
-| Native package worker | Set the same import flag; recompute packaging metadata; preserve role, network, runtime and resource allocations |
-| Existing SQS consumer | Enable it; other settings unchanged |
-| Package-job Pipe | Create and start the reviewed queued-state filter and pointer transform |
-| Temporary storage-probe Lambda and its log group | Remove them; all 12 log events and structured results are retained locally |
+| Resource                                         | Change                                                                                                           |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| Workflow-source API                              | Set `NATIVE_PACKAGE_JOBS_ENABLED=true`; other environment fields and code unchanged                              |
+| Native package worker                            | Set the same import flag; recompute packaging metadata; preserve role, network, runtime and resource allocations |
+| Existing SQS consumer                            | Enable it; other settings unchanged                                                                              |
+| Package-job Pipe                                 | Create and start the reviewed queued-state filter and pointer transform                                          |
+| Temporary storage-probe Lambda and its log group | Remove them; all 12 log events and structured results are retained locally                                       |
 
 No tables, queues, buckets, IAM grants, gateway routes or AgentCore resources
 changed in that activation. The full refresh observed the already-applied storage
@@ -428,7 +428,7 @@ This checkpoint does not constitute the all-four harness initialization gate.
   No source fixes, manifest changes, or lockfile changes were needed. The prior
   missing-dependency restriction no longer blocks local UI validation. Browser
   interaction and deployed integration were not covered by those local checks;
-   the subsequent authenticated UI and normal/diagnostic import results are recorded above.
+  the subsequent authenticated UI and normal/diagnostic import results are recorded above.
 - The latest storage-wiring slice passed 99 policy/renderer/static-wiring tests,
   including detection of 29 harmful in-memory mutations.
   Root lint passed with the same 16 existing warnings. No production bucket

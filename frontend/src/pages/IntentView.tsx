@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { NativeWorkspaceView } from './NativeIntentPage';
 import { Navigate, useNavigate, useParams } from 'react-router';
 import {
@@ -15,11 +15,14 @@ import { DiscussButton } from '@/components/discussion/DiscussButton';
 import { humanizeStageId } from '@/components/intent/documentHelpers';
 import { deriveLaneWaits } from '@/lib/intentRecovery';
 import { executionCapabilityReason } from '@/lib/executionCapabilities';
+import { ApiError } from '@/services/api';
 import { PendingQuestionsTabs } from '@/components/intent/PendingQuestionsTabs';
 import { IntentPhaseBreadcrumb } from '@/components/layout/IntentPipelineBar';
 import { QuorumEditPanel } from '@/components/intent/QuorumEditPanel';
 import { UnitLaneBoard, isFanoutActive } from '@/components/intent/UnitLaneBoard';
 import { AgentProgressCard } from '@/components/intent/AgentProgressCard';
+import { MethodologyReleaseBadge } from '@/components/intent/MethodologyReleaseBadge';
+import { aidlcReleasesService } from '@/services/aidlcReleases';
 import { GateCard } from '@/components/intent/GateCard';
 import { StageReviewPanel } from '@/components/intent/StageReviewPanel';
 import { WorkProductsSection } from '@/components/intent/WorkProductsSection';
@@ -53,6 +56,7 @@ import {
   GitBranch,
   KeyRound,
   Loader2,
+  Milestone,
   MoreHorizontal,
   Play,
   RotateCcw,
@@ -95,8 +99,11 @@ const errorMessage = (value: string) => {
 
 export default function IntentView() {
   const context = useIntent();
-  return context.executionBackend === 'native' && context.nativeWorkspace
-    ? <NativeWorkspaceView adapter={context.nativeWorkspace} /> : <PlatformIntentView />;
+  return context.executionBackend === 'native' && context.nativeWorkspace ? (
+    <NativeWorkspaceView adapter={context.nativeWorkspace} />
+  ) : (
+    <PlatformIntentView />
+  );
 }
 function PlatformIntentView() {
   const {
@@ -112,6 +119,7 @@ function PlatformIntentView() {
     cancelIntent,
     deleteIntent,
     rewindIntent,
+    resumeIntent,
     focusOutput,
     stageRows,
     stageNameOf,
@@ -139,6 +147,11 @@ function PlatformIntentView() {
   const [deleting, setDeleting] = useState(false);
   const [confirmRepair, setConfirmRepair] = useState(false);
   const [repairing, setRepairing] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const [resumeNotice, setResumeNotice] = useState<{
+    kind: 'expired' | 'retryable';
+    message: string;
+  } | null>(null);
   const [configurationOpen, setConfigurationOpen] = useState(false);
   const [reshapeOpen, setReshapeOpen] = useState(false);
   const [confirmExport, setConfirmExport] = useState(false);
@@ -152,6 +165,22 @@ function PlatformIntentView() {
   const [constructionExport, setConstructionExport] = useState<NativeWorkflowExport | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [dismissedError, setDismissedError] = useState<string | null>(null);
+  const [pinningEnabled, setPinningEnabled] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    aidlcReleasesService
+      .sharedChannels()
+      .then((channels) => {
+        if (!cancelled) setPinningEnabled(channels.pinningEnabled === true);
+      })
+      .catch(() => {
+        if (!cancelled) setPinningEnabled(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // A stage failure retries from the earliest failed stage, preserving all
   // completed upstream work. Failures before any stage row exists (init-ws,
@@ -182,6 +211,45 @@ function PlatformIntentView() {
   // Cancel (steering): retire a parked (WAITING), stranded (CREATED) or FAILED
   // run — supersedes pending gates and flips the run to CANCELLED. RUNNING
   // cannot be cancelled mid-turn (the API 409s); the button hides for it.
+  // The resume endpoint has three outcomes, and collapsing them into one error
+  // toast offered the human a button that could never work. 409
+  // `durable_execution_expired` is TERMINAL: the durable execution is gone, the
+  // API already failed the run and cleared the marker, so the affordance must
+  // disappear and the human be told to rewind. 503 is retryable and the button
+  // must stay. Anything else is an ordinary error.
+  const handleResume = async () => {
+    setResuming(true);
+    setActionError(null);
+    setResumeNotice(null);
+    try {
+      await resumeIntent();
+    } catch (err) {
+      setDismissedError(null);
+      if (err instanceof ApiError && err.status === 409) {
+        setResumeNotice({
+          kind: 'expired',
+          message:
+            'The durable execution expired before your answer could resume the run. The run is now failed — rewind to the stage you want to re-run; your answer is still on the record.',
+        });
+        // Re-read the intent: the API already wrote FAILED and cleared
+        // `resumeRequired`, which is what drops the resume affordance.
+        await reload();
+        return;
+      }
+      if (err instanceof ApiError && err.status === 503) {
+        setResumeNotice({
+          kind: 'retryable',
+          message:
+            'The durable callback could not be reached just now. Nothing was lost — try Resume again in a moment.',
+        });
+        return;
+      }
+      setActionError(err instanceof Error ? err.message : 'Failed to resume intent');
+    } finally {
+      setResuming(false);
+    }
+  };
+
   const handleCancel = async () => {
     if (!window.confirm('Cancel this run? Pending questions are retired and the run stops.')) {
       return;
@@ -304,6 +372,11 @@ function PlatformIntentView() {
   }
   const isActive = intent.status === 'RUNNING' || intent.status === 'WAITING';
   const isFailed = intent.status === 'FAILED';
+  // The server decides whether a recorded answer still needs its callback
+  // re-sent (`resumeAvailable`): the run is live and still parked on that gate,
+  // through META for an engine gate or through the asking stage for a question,
+  // which covers a unit lane while the intent keeps running.
+  const resumeRequired = gates.some((gate) => gate.resumeAvailable === true);
   const canReshape =
     (intent.status === 'WAITING' || isFailed) && intent.constructionAutonomyMode !== 'autonomous';
   // Cancellable (steering): parked, stranded, or failed — never mid-RUNNING.
@@ -363,6 +436,7 @@ function PlatformIntentView() {
               {intent.status}
             </Badge>
           )}
+          <MethodologyReleaseBadge release={intent.methodologyRelease ?? null} />
           {isActive && (
             <span
               className="h-1.5 w-1.5 rounded-full bg-agent-running animate-pulse shrink-0"
@@ -465,6 +539,21 @@ function PlatformIntentView() {
                   Reshape remaining stages
                 </DropdownMenuItem>
               )}
+              {/* Opt-in migration (issue #482): never migrates this intent —
+                  it opens the create page prefilled from it, and the new
+                  intent recomputes its plan on the version chosen there. */}
+              {pinningEnabled && (
+                <DropdownMenuItem
+                  onSelect={() =>
+                    navigate(
+                      `/space/${projectId}/intent/new?fromIntent=${encodeURIComponent(intentId)}`,
+                    )
+                  }
+                >
+                  <Milestone className="mr-2 h-4 w-4" />
+                  Start a new intent on another AI-DLC version
+                </DropdownMenuItem>
+              )}
               {(isCancellable || isDeletable) && <DropdownMenuSeparator />}
               {isCancellable && (
                 <DropdownMenuItem disabled={cancelling} onClick={handleCancel}>
@@ -542,6 +631,75 @@ function PlatformIntentView() {
                 Repair execution
               </Button>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* The answer is already recorded; only its durable callback failed, so one
+          click re-sends it. Shown until the resume succeeds or the callback
+          expires (which fails the run, recoverable by rewind). */}
+      {resumeRequired && (
+        <div className="rounded border border-agent-waiting/40 bg-agent-waiting/10 px-3 py-3 text-sm">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 font-medium">
+                <TriangleAlert className="h-4 w-4 text-agent-waiting" />
+                Your answer was saved but the run did not continue
+              </div>
+              <p className="mt-1 text-[12px] text-muted-foreground">
+                Resume re-sends the recorded answer. No decision is asked again.
+              </p>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="shrink-0 gap-1.5"
+              disabled={resuming}
+              onClick={handleResume}
+            >
+              {resuming ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Play className="h-3.5 w-3.5" />
+              )}
+              {resuming ? 'Resuming…' : 'Resume run'}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {resumeNotice && (
+        <div
+          className={
+            resumeNotice.kind === 'expired'
+              ? 'rounded border border-agent-error/30 bg-agent-error/10 px-3 py-3 text-sm'
+              : 'rounded border border-agent-waiting/40 bg-agent-waiting/10 px-3 py-3 text-sm'
+          }
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 font-medium">
+                {resumeNotice.kind === 'expired' ? (
+                  <XCircle className="h-4 w-4 text-agent-error" />
+                ) : (
+                  <TriangleAlert className="h-4 w-4 text-agent-waiting" />
+                )}
+                {resumeNotice.kind === 'expired'
+                  ? 'This run can no longer be resumed'
+                  : 'Resume did not go through'}
+              </div>
+              <p className="mt-1 text-[12px] text-muted-foreground">{resumeNotice.message}</p>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="shrink-0"
+              onClick={() => setResumeNotice(null)}
+            >
+              Dismiss
+            </Button>
           </div>
         </div>
       )}

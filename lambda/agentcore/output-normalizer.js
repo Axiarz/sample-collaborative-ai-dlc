@@ -702,7 +702,10 @@ export const createCliOutputSink = ({
         for (const part of parts) {
           if (part?.type !== 'tool_use' || !part.id) continue;
           if (!pendingTools.has(part.id) && pendingTools.size >= maxPendingTools) {
-            emitEvent(emit, 'Pending tool metadata capacity reached', { type: 'raw', level: 'info' });
+            emitEvent(emit, 'Pending tool metadata capacity reached', {
+              type: 'raw',
+              level: 'info',
+            });
             continue;
           }
           pendingTools.set(part.id, {

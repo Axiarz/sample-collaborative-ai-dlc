@@ -8,7 +8,10 @@ import {
 
 const ACCOUNT = '123456789012';
 const REPO = `${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com/aidlc-agentcore-dev`;
-const image = (hex) => ({ uri: `${REPO}@sha256:${hex.repeat(64)}`, digest: `sha256:${hex.repeat(64)}` });
+const image = (hex) => ({
+  uri: `${REPO}@sha256:${hex.repeat(64)}`,
+  digest: `sha256:${hex.repeat(64)}`,
+});
 const CURRENT = image('b');
 const OLD = image('a');
 const env = { NATIVE_RUNTIME_ACCOUNT_ID: ACCOUNT, AWS_REGION: 'us-east-1' };
@@ -25,13 +28,19 @@ const policy = (revocations = {}, send) => {
       send ??
         (async (command) => {
           expect(command).toBeInstanceOf(GetCommand);
-          expect(command.input).toMatchObject({ TableName: 'native-bindings', ConsistentRead: true });
+          expect(command.input).toMatchObject({
+            TableName: 'native-bindings',
+            ConsistentRead: true,
+          });
           const item = revocations[command.input.Key.pk];
           return item ? { Item: item } : {};
         }),
     ),
   };
-  return { ddb, images: createNativeRuntimeImagePolicy({ ddb, tableName: 'native-bindings', env }) };
+  return {
+    ddb,
+    images: createNativeRuntimeImagePolicy({ ddb, tableName: 'native-bindings', env }),
+  };
 };
 const revocation = (digest, extra = {}) => ({
   ...nativeRuntimeImageKey(digest),
@@ -48,7 +57,11 @@ describe('native runtime image policy', () => {
     const { images } = policy();
     for (const status of ['REQUESTED', 'FAILED', 'STOPPED']) {
       await expect(
-        images.decide({ image: CURRENT, row: { status, configuration: { image: CURRENT } }, deployment }),
+        images.decide({
+          image: CURRENT,
+          row: { status, configuration: { image: CURRENT } },
+          deployment,
+        }),
       ).resolves.toEqual({ status: 'current' });
     }
   });
@@ -114,9 +127,24 @@ describe('native runtime image policy', () => {
   });
 
   it.each([
-    ['another repository', { uri: `${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com/other@${OLD.digest}`, digest: OLD.digest }],
-    ['another account', { uri: `210987654321.dkr.ecr.us-east-1.amazonaws.com/aidlc-agentcore-dev@${OLD.digest}`, digest: OLD.digest }],
-    ['another region', { uri: `${ACCOUNT}.dkr.ecr.us-west-2.amazonaws.com/aidlc-agentcore-dev@${OLD.digest}`, digest: OLD.digest }],
+    [
+      'another repository',
+      { uri: `${ACCOUNT}.dkr.ecr.us-east-1.amazonaws.com/other@${OLD.digest}`, digest: OLD.digest },
+    ],
+    [
+      'another account',
+      {
+        uri: `210987654321.dkr.ecr.us-east-1.amazonaws.com/aidlc-agentcore-dev@${OLD.digest}`,
+        digest: OLD.digest,
+      },
+    ],
+    [
+      'another region',
+      {
+        uri: `${ACCOUNT}.dkr.ecr.us-west-2.amazonaws.com/aidlc-agentcore-dev@${OLD.digest}`,
+        digest: OLD.digest,
+      },
+    ],
     ['a mutable tag', { uri: `${REPO}:latest`, digest: OLD.digest }],
     ['a digest mismatch', { uri: `${REPO}@sha256:${'c'.repeat(64)}`, digest: OLD.digest }],
   ])('rejects %s even for a resumable run', async (_name, pinned) => {
@@ -133,10 +161,18 @@ describe('native runtime image policy', () => {
   it('rejects an image that is not the run protected pin or its upgraded target', async () => {
     const { images } = policy();
     await expect(
-      images.decide({ image: OLD, row: { status: 'AWAITING_USER', configuration: { image: image('c') } }, deployment }),
+      images.decide({
+        image: OLD,
+        row: { status: 'AWAITING_USER', configuration: { image: image('c') } },
+        deployment,
+      }),
     ).resolves.toEqual({ status: 'unapproved' });
     await expect(
-      images.decide({ image: OLD, row: row('AWAITING_USER', { target: { imageDigest: CURRENT.digest } }), deployment }),
+      images.decide({
+        image: OLD,
+        row: row('AWAITING_USER', { target: { imageDigest: CURRENT.digest } }),
+        deployment,
+      }),
     ).resolves.toEqual({ status: 'unapproved' });
   });
 
@@ -146,12 +182,18 @@ describe('native runtime image policy', () => {
       [nativeRuntimeImageKey(OLD.digest).pk]: revocation(OLD.digest),
     });
     await expect(
-      images.decide({ image: CURRENT, row: { status: 'REQUESTED', configuration: { image: CURRENT } }, deployment }),
+      images.decide({
+        image: CURRENT,
+        row: { status: 'REQUESTED', configuration: { image: CURRENT } },
+        deployment,
+      }),
     ).resolves.toMatchObject({ status: 'revoked', revocation: { reasonCode: 'vulnerable_image' } });
-    await expect(images.decide({ image: OLD, row: row('AWAITING_USER'), deployment })).resolves.toMatchObject(
-      { status: 'revoked' },
-    );
-    await expect(images.authorize({ image: OLD, row: row('RUNNING'), deployment })).rejects.toMatchObject({
+    await expect(
+      images.decide({ image: OLD, row: row('AWAITING_USER'), deployment }),
+    ).resolves.toMatchObject({ status: 'revoked' });
+    await expect(
+      images.authorize({ image: OLD, row: row('RUNNING'), deployment }),
+    ).rejects.toMatchObject({
       code: 'NATIVE_EXECUTION_IMAGE_REVOKED',
     });
   });
@@ -160,7 +202,9 @@ describe('native runtime image policy', () => {
     const { images } = policy({
       [nativeRuntimeImageKey(OLD.digest).pk]: { ...nativeRuntimeImageKey(OLD.digest), junk: true },
     });
-    await expect(images.decide({ image: OLD, row: row('RUNNING'), deployment })).resolves.toMatchObject({
+    await expect(
+      images.decide({ image: OLD, row: row('RUNNING'), deployment }),
+    ).resolves.toMatchObject({
       status: 'revoked',
       revocation: { reasonCode: 'revoked' },
     });
@@ -173,7 +217,9 @@ describe('native runtime image policy', () => {
       status: 'retained',
     });
     revocations[nativeRuntimeImageKey(OLD.digest).pk] = revocation(OLD.digest);
-    await expect(images.decide({ image: OLD, row: row('RUNNING'), deployment })).resolves.toMatchObject({
+    await expect(
+      images.decide({ image: OLD, row: row('RUNNING'), deployment }),
+    ).resolves.toMatchObject({
       status: 'revoked',
     });
     await images.decide({ image: OLD, row: row('RUNNING'), deployment });
@@ -184,13 +230,17 @@ describe('native runtime image policy', () => {
     const { images } = policy({}, async () => {
       throw new Error('unavailable');
     });
-    await expect(images.decide({ image: OLD, row: row('RUNNING'), deployment })).rejects.toMatchObject({
+    await expect(
+      images.decide({ image: OLD, row: row('RUNNING'), deployment }),
+    ).rejects.toMatchObject({
       code: 'NATIVE_RUNTIME_IMAGE_UNAVAILABLE',
     });
   });
 
   it('refuses malformed configuration instead of authorizing anything', () => {
-    expect(() => createNativeRuntimeImagePolicy({ ddb: {}, tableName: 'native-bindings', env })).toThrow();
+    expect(() =>
+      createNativeRuntimeImagePolicy({ ddb: {}, tableName: 'native-bindings', env }),
+    ).toThrow();
     expect(() => nativeRuntimeImageKey('latest')).toThrow();
     expect(nativeImageRenewalEligible(null)).toBe(false);
   });

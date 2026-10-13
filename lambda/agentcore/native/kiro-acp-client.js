@@ -209,7 +209,10 @@ export function createKiroAcpClient({
     });
     const job = {
       done,
-      timer: sequence === null ? setTimeout(() => stop(new KiroAcpError('TIMEOUT')), limits.defaultTimeoutMs) : null,
+      timer:
+        sequence === null
+          ? setTimeout(() => stop(new KiroAcpError('TIMEOUT')), limits.defaultTimeoutMs)
+          : null,
     };
     callbacks.add(job);
     if (sequence !== null) updates.set(sequence, completion);
@@ -250,7 +253,8 @@ export function createKiroAcpClient({
         throw new KiroAcpError('INVALID_MESSAGE');
       const params = value.params ?? {};
       if (!own(value, 'id')) {
-        if (value.method === 'session/update') return call(onUpdate, params, () => {}, ++updateSequence);
+        if (value.method === 'session/update')
+          return call(onUpdate, params, () => {}, ++updateSequence);
         return;
       }
       if (!validId(value.id) || serverRequests.has(value.id))

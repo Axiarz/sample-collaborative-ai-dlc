@@ -179,7 +179,10 @@ export const createNativeExecutionApi = ({
             fail('NATIVE_EXECUTION_UNAVAILABLE', 'Native runtime image policy is unavailable');
           }
           if (revoked)
-            fail('NATIVE_EXECUTION_IMAGE_REVOKED', 'The runtime image for this execution was revoked');
+            fail(
+              'NATIVE_EXECUTION_IMAGE_REVOKED',
+              'The runtime image for this execution was revoked',
+            );
         }
         await recheck(draft);
         await authorizeSource(draft, actorId);
@@ -250,7 +253,9 @@ export const createNativeExecutionApi = ({
           let rendered;
           try {
             rendered =
-              body.schemaVersion === 2 ? nativeAnswerText(body.pendingInput, request.selection) : null;
+              body.schemaVersion === 2
+                ? nativeAnswerText(body.pendingInput, request.selection)
+                : null;
           } catch {
             rendered = null;
           }

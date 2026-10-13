@@ -128,13 +128,20 @@ describe.skipIf(process.platform === 'win32')('bounded native command runner', (
   it('pauses stdout until observer pressure resolves and cancels while paused', async () => {
     const controller = new AbortController();
     let release;
-    const pressure = new Promise((resolve) => { release = resolve; });
+    const pressure = new Promise((resolve) => {
+      release = resolve;
+    });
     let observed;
-    const received = new Promise((resolve) => { observed = resolve; });
+    const received = new Promise((resolve) => {
+      observed = resolve;
+    });
     const pending = run('wait', [], {
       timeoutMs: null,
       signal: controller.signal,
-      onStdoutChunk: () => { observed(); return pressure; },
+      onStdoutChunk: () => {
+        observed();
+        return pressure;
+      },
     });
     await received;
     const child = spawn.mock.results[0].value;
@@ -144,20 +151,33 @@ describe.skipIf(process.platform === 'win32')('bounded native command runner', (
     await Promise.resolve();
     expect(child.stdout.isPaused()).toBe(false);
     controller.abort();
-    expect(await pending).toMatchObject({ signal: 'SIGKILL', cleanupComplete: true, timedOut: false });
+    expect(await pending).toMatchObject({
+      signal: 'SIGKILL',
+      cleanupComplete: true,
+      timedOut: false,
+    });
 
     const nextController = new AbortController();
     let ready;
-    const nextReceived = new Promise((resolve) => { ready = resolve; });
+    const nextReceived = new Promise((resolve) => {
+      ready = resolve;
+    });
     const blocked = run('wait', [], {
       timeoutMs: null,
       signal: nextController.signal,
-      onStdoutChunk: () => { ready(); return new Promise(() => {}); },
+      onStdoutChunk: () => {
+        ready();
+        return new Promise(() => {});
+      },
     });
     await nextReceived;
     expect(spawn.mock.results[1].value.stdout.isPaused()).toBe(true);
     nextController.abort();
-    expect(await blocked).toMatchObject({ signal: 'SIGKILL', cleanupComplete: true, timedOut: false });
+    expect(await blocked).toMatchObject({
+      signal: 'SIGKILL',
+      cleanupComplete: true,
+      timedOut: false,
+    });
   });
 
   it('passes literal argv, an explicit environment and cwd, and ignores stdin', async () => {

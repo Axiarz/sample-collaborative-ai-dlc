@@ -47,29 +47,70 @@ describe('flight samples', () => {
     expect(await flightProcessBreakdown({ readdir, read })).toEqual({
       procs: 8,
       scanned: 8,
-      kinds: { codex: [1, 120], aidlc: [2, 340], node: [1, 180], shell: [1, 4], git: [1, 10], other: [2, 3] },
+      kinds: {
+        codex: [1, 120],
+        aidlc: [2, 340],
+        node: [1, 180],
+        shell: [1, 4],
+        git: [1, 10],
+        other: [2, 3],
+      },
     });
   });
 
   it('never has more than two /proc reads in flight', async () => {
-    let active = 0, maxActive = 0;
-    const slowRead = vi.fn(async (path) => { active++; maxActive = Math.max(maxActive, active); await new Promise((r) => setTimeout(r, 2)); active--; return read(path); });
-    expect(await flightProcessBreakdown({ readdir, read: slowRead })).toMatchObject({ procs: 8, scanned: 8 });
+    let active = 0,
+      maxActive = 0;
+    const slowRead = vi.fn(async (path) => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 2));
+      active--;
+      return read(path);
+    });
+    expect(await flightProcessBreakdown({ readdir, read: slowRead })).toMatchObject({
+      procs: 8,
+      scanned: 8,
+    });
     expect(maxActive).toBe(2);
   });
 
   it('stops reading at its time budget but still counts every process', async () => {
     let clock = 0;
-    const slowRead = vi.fn(async (path) => { clock += 300; return read(path); });
-    const result = await flightProcessBreakdown({ readdir, read: slowRead, budgetMs: 700, now: () => clock });
+    const slowRead = vi.fn(async (path) => {
+      clock += 300;
+      return read(path);
+    });
+    const result = await flightProcessBreakdown({
+      readdir,
+      read: slowRead,
+      budgetMs: 700,
+      now: () => clock,
+    });
     expect(result.procs).toBe(8);
     expect(result.scanned).toBeLessThan(8);
     expect(slowRead.mock.calls.length).toBeLessThan(8);
   });
 
   it('records numbers only, with lag, memory, OOM count and processes', async () => {
-    const sample = await sampleNativeFlight({ lagMs: 37.4, read, readdir, system, proc, now: () => 9 });
-    expect(sample).toMatchObject({ t: 9, lag: 37, used: 3072, free: 5120, rss: 180, load: 2.35, oom: 2, procs: 8 });
+    const sample = await sampleNativeFlight({
+      lagMs: 37.4,
+      read,
+      readdir,
+      system,
+      proc,
+      now: () => 9,
+    });
+    expect(sample).toMatchObject({
+      t: 9,
+      lag: 37,
+      used: 3072,
+      free: 5120,
+      rss: 180,
+      load: 2.35,
+      oom: 2,
+      procs: 8,
+    });
     expect(JSON.stringify(sample)).not.toMatch(/tini|secret|bash|git-remote/);
   });
 
@@ -91,11 +132,27 @@ describe('flight recorder', () => {
   // Under fake timers a real file write never settles; keep the real directory
   // checks at boot and make the per-tick writes instant.
   const instant = { ...fs, writeFile: async () => {}, rename: async () => {} };
-  const fake = (t) => ({ t, lag: 0, used: 100 + t, free: 1, rss: 1, load: 0, oom: 0, procs: t, k: null });
+  const fake = (t) => ({
+    t,
+    lag: 0,
+    used: 100 + t,
+    free: 1,
+    rss: 1,
+    load: 0,
+    oom: 0,
+    procs: t,
+    k: null,
+  });
 
   it('writes a bounded ring to the mount every tick while busy and reports window maxima', async () => {
     let t = 0;
-    const recorder = startNativeFlightRecorder({ isBusy: () => true, dir, tickMs: 10, sample: async () => fake(++t), log: vi.fn() });
+    const recorder = startNativeFlightRecorder({
+      isBusy: () => true,
+      dir,
+      tickMs: 10,
+      sample: async () => fake(++t),
+      log: vi.fn(),
+    });
     await recorder.booted;
     await wait(120);
     recorder.stop();
@@ -114,33 +171,82 @@ describe('flight recorder', () => {
   it("logs the previous boot's last samples at boot", async () => {
     await fs.mkdir(dir, { mode: 0o700 });
     const samples = Array.from({ length: 90 }, (_, i) => fake(1000 + i));
-    await fs.writeFile(join(dir, 'recorder.json'), JSON.stringify({ schemaVersion: 1, bootId: 'old', startedAt: 500, samples }));
+    await fs.writeFile(
+      join(dir, 'recorder.json'),
+      JSON.stringify({ schemaVersion: 1, bootId: 'old', startedAt: 500, samples }),
+    );
     const log = vi.fn();
-    const recorder = startNativeFlightRecorder({ isBusy: () => false, dir, tickMs: 10_000, sample: async () => fake(1), log, now: () => 5000 });
+    const recorder = startNativeFlightRecorder({
+      isBusy: () => false,
+      dir,
+      tickMs: 10_000,
+      sample: async () => fake(1),
+      log,
+      now: () => 5000,
+    });
     await recorder.booted;
     recorder.stop();
     expect(log).toHaveBeenCalledTimes(1);
     const [event] = log.mock.calls[0];
-    expect(event).toMatchObject({ type: 'native.flight.previous', previousStartedAt: 500, previousLastAt: 1089, gapToBootMs: 5000 - 1089 });
+    expect(event).toMatchObject({
+      type: 'native.flight.previous',
+      previousStartedAt: 500,
+      previousLastAt: 1089,
+      gapToBootMs: 5000 - 1089,
+    });
     expect(event.samples).toHaveLength(60);
     expect(event.samples[0].t).toBe(1030);
   });
 
   it('replays only numeric fields and fixed categories from a tampered ring, and removes stale temp files', async () => {
     await fs.mkdir(dir, { mode: 0o700 });
-    const tampered = { t: 5, lag: 'x'.repeat(5000), used: 7, procs: 3, note: 'agent text', k: { codex: [1, 2], evil: [9, 9], aidlc: ['a', 3] } };
-    await fs.writeFile(join(dir, 'recorder.json'), JSON.stringify({ bootId: 'old', startedAt: 'nope', samples: [tampered, 'str', null, [1]] }));
+    const tampered = {
+      t: 5,
+      lag: 'x'.repeat(5000),
+      used: 7,
+      procs: 3,
+      note: 'agent text',
+      k: { codex: [1, 2], evil: [9, 9], aidlc: ['a', 3] },
+    };
+    await fs.writeFile(
+      join(dir, 'recorder.json'),
+      JSON.stringify({ bootId: 'old', startedAt: 'nope', samples: [tampered, 'str', null, [1]] }),
+    );
     const stale = join(dir, 'recorder.json.0f8fad5b-d9cb-469f-a165-70867728950e.tmp');
     await fs.writeFile(stale, '{}');
     const log = vi.fn();
-    const recorder = startNativeFlightRecorder({ isBusy: () => false, dir, tickMs: 10_000, sample: async () => fake(1), log, now: () => 50 });
+    const recorder = startNativeFlightRecorder({
+      isBusy: () => false,
+      dir,
+      tickMs: 10_000,
+      sample: async () => fake(1),
+      log,
+      now: () => 50,
+    });
     await recorder.booted;
     recorder.stop();
     const [event] = log.mock.calls[0];
     expect(event.previousStartedAt).toBeNull();
     expect(event.samples).toEqual([
-      { t: 5, lag: null, used: 7, free: null, rss: null, load: null, oom: null, procs: 3, scanned: null,
-        k: { codex: [1, 2], aidlc: [null, 3], node: [null, null], shell: [null, null], git: [null, null], other: [null, null] } },
+      {
+        t: 5,
+        lag: null,
+        used: 7,
+        free: null,
+        rss: null,
+        load: null,
+        oom: null,
+        procs: 3,
+        scanned: null,
+        k: {
+          codex: [1, 2],
+          aidlc: [null, 3],
+          node: [null, null],
+          shell: [null, null],
+          git: [null, null],
+          other: [null, null],
+        },
+      },
     ]);
     expect(JSON.stringify(event)).not.toMatch(/agent text|evil|xxxx/);
     await expect(fs.stat(stale)).rejects.toThrow();
@@ -148,9 +254,22 @@ describe('flight recorder', () => {
   });
 
   it('never stacks samples when one scan outlasts a tick', async () => {
-    let active = 0, maxActive = 0;
-    const sample = async () => { active++; maxActive = Math.max(maxActive, active); await wait(40); active--; return fake(1); };
-    const recorder = startNativeFlightRecorder({ isBusy: () => true, dir, tickMs: 5, sample, log: vi.fn() });
+    let active = 0,
+      maxActive = 0;
+    const sample = async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await wait(40);
+      active--;
+      return fake(1);
+    };
+    const recorder = startNativeFlightRecorder({
+      isBusy: () => true,
+      dir,
+      tickMs: 5,
+      sample,
+      log: vi.fn(),
+    });
     await recorder.booted;
     await wait(150);
     recorder.stop();
@@ -164,17 +283,35 @@ describe('flight recorder', () => {
     let release;
     const sample = vi.fn(async ({ lagMs }) => {
       lags.push(lagMs);
-      if (lags.length === 1) await new Promise((resolve) => { release = resolve; });
+      if (lags.length === 1)
+        await new Promise((resolve) => {
+          release = resolve;
+        });
       return fake(1);
     });
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
-    const recorder = startNativeFlightRecorder({ isBusy: () => true, dir, tickMs: 1000, sample, log: vi.fn(), fsp: instant, now: () => now });
+    const recorder = startNativeFlightRecorder({
+      isBusy: () => true,
+      dir,
+      tickMs: 1000,
+      sample,
+      log: vi.fn(),
+      fsp: instant,
+      now: () => now,
+    });
     await recorder.booted;
-    now = 1000; vi.advanceTimersByTime(1000); await Promise.resolve();
+    now = 1000;
+    vi.advanceTimersByTime(1000);
+    await Promise.resolve();
     // A 4 s stall ends while the first scan is still running: that tick is skipped.
-    now = 6000; vi.advanceTimersByTime(1000); await Promise.resolve();
-    release(); await wait(5);
-    now = 7000; vi.advanceTimersByTime(1000); await wait(5);
+    now = 6000;
+    vi.advanceTimersByTime(1000);
+    await Promise.resolve();
+    release();
+    await wait(5);
+    now = 7000;
+    vi.advanceTimersByTime(1000);
+    await wait(5);
     recorder.stop();
     expect(lags[0]).toBe(0);
     expect(lags[1]).toBeGreaterThanOrEqual(4000);
@@ -185,10 +322,21 @@ describe('flight recorder', () => {
     let t = 0;
     let release;
     const sample = vi.fn(async ({ lagMs }) => {
-      if (sample.mock.calls.length === 1) return new Promise((resolve) => { release = () => resolve(fake(1)); });
+      if (sample.mock.calls.length === 1)
+        return new Promise((resolve) => {
+          release = () => resolve(fake(1));
+        });
       return { ...fake(2), lag: lagMs };
     });
-    const recorder = startNativeFlightRecorder({ isBusy: () => true, dir, tickMs: 1000, sample, log: vi.fn(), fsp: instant, now: () => (t += 1000) });
+    const recorder = startNativeFlightRecorder({
+      isBusy: () => true,
+      dir,
+      tickMs: 1000,
+      sample,
+      log: vi.fn(),
+      fsp: instant,
+      now: () => (t += 1000),
+    });
     await recorder.booted;
     // The first scan hangs past the 10 s timeout; later ticks record lag-only samples.
     await vi.advanceTimersByTimeAsync(9_000);
@@ -214,33 +362,64 @@ describe('flight recorder', () => {
       if (lags.length === 1) throw new Error('scan failed');
       return fake(1);
     });
-    const recorder = startNativeFlightRecorder({ isBusy: () => true, dir, tickMs: 1000, sample, log: vi.fn(), fsp: instant, now: () => now });
+    const recorder = startNativeFlightRecorder({
+      isBusy: () => true,
+      dir,
+      tickMs: 1000,
+      sample,
+      log: vi.fn(),
+      fsp: instant,
+      now: () => now,
+    });
     await recorder.booted;
-    now = 5000; await vi.advanceTimersByTimeAsync(1000);
-    now = 6000; await vi.advanceTimersByTimeAsync(1000);
+    now = 5000;
+    await vi.advanceTimersByTimeAsync(1000);
+    now = 6000;
+    await vi.advanceTimersByTimeAsync(1000);
     recorder.stop();
     expect(lags[0]).toBeGreaterThanOrEqual(4000);
     expect(lags[1]).toBeGreaterThanOrEqual(4000);
   });
 
   it.each([
-    ['a symlinked ring', async () => {
-      await fs.mkdir(dir, { mode: 0o700 });
-      await fs.writeFile(join(dir, '..', 'elsewhere.json'), JSON.stringify({ bootId: 'old', samples: [] }));
-      await fs.symlink(join(dir, '..', 'elsewhere.json'), join(dir, 'recorder.json'));
-    }],
-    ['an oversized ring', async () => {
-      await fs.mkdir(dir, { mode: 0o700 });
-      await fs.writeFile(join(dir, 'recorder.json'), JSON.stringify({ bootId: 'old', samples: ['x'.repeat(300 * 1024)] }));
-    }],
-    ['a malformed ring', async () => {
-      await fs.mkdir(dir, { mode: 0o700 });
-      await fs.writeFile(join(dir, 'recorder.json'), '{"bootId":');
-    }],
+    [
+      'a symlinked ring',
+      async () => {
+        await fs.mkdir(dir, { mode: 0o700 });
+        await fs.writeFile(
+          join(dir, '..', 'elsewhere.json'),
+          JSON.stringify({ bootId: 'old', samples: [] }),
+        );
+        await fs.symlink(join(dir, '..', 'elsewhere.json'), join(dir, 'recorder.json'));
+      },
+    ],
+    [
+      'an oversized ring',
+      async () => {
+        await fs.mkdir(dir, { mode: 0o700 });
+        await fs.writeFile(
+          join(dir, 'recorder.json'),
+          JSON.stringify({ bootId: 'old', samples: ['x'.repeat(300 * 1024)] }),
+        );
+      },
+    ],
+    [
+      'a malformed ring',
+      async () => {
+        await fs.mkdir(dir, { mode: 0o700 });
+        await fs.writeFile(join(dir, 'recorder.json'), '{"bootId":');
+      },
+    ],
   ])('ignores %s', async (_name, setup) => {
     await setup();
     const log = vi.fn();
-    const recorder = startNativeFlightRecorder({ isBusy: () => false, dir, tickMs: 10_000, sample: async () => fake(1), log });
+    const recorder = startNativeFlightRecorder({
+      isBusy: () => false,
+      dir,
+      tickMs: 10_000,
+      sample: async () => fake(1),
+      log,
+    });
     await recorder.booted;
     recorder.stop();
     expect(log).not.toHaveBeenCalled();
@@ -248,7 +427,13 @@ describe('flight recorder', () => {
 
   it('samples only every 15th tick while idle', async () => {
     const sample = vi.fn(async () => fake(1));
-    const recorder = startNativeFlightRecorder({ isBusy: () => false, dir, tickMs: 5, sample, log: vi.fn() });
+    const recorder = startNativeFlightRecorder({
+      isBusy: () => false,
+      dir,
+      tickMs: 5,
+      sample,
+      log: vi.fn(),
+    });
     await recorder.booted;
     await wait(140);
     recorder.stop();

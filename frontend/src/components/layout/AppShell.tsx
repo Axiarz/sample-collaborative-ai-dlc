@@ -1,3 +1,4 @@
+import { isNativeIntentRoute } from '@/lib/intentDiscovery';
 import { Outlet, useParams, useLocation } from 'react-router';
 import { cn } from '@/lib/utils';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -25,8 +26,6 @@ import { useState, useCallback, useMemo, useEffect, useRef, lazy, Suspense } fro
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { useResizablePanel } from '@/hooks/useResizablePanel';
 import { setLastIntentSection } from '@/lib/intentSectionPreference';
-import { isNativeIntentRoute } from '@/lib/intentDiscovery';
-import type { ReactNode } from 'react';
 
 // ---------------------------------------------------------------------------
 // Route classification: determines whether the activity panel should default
@@ -89,8 +88,8 @@ export function AppShell() {
   const onGraphPage = !inNative && location.pathname.endsWith('/graph');
 
   useEffect(() => {
-    if (inIntent && !inNative && intentId) setLastIntentSection(intentId, detectSection(location.pathname));
-  }, [inIntent, inNative, intentId, location.pathname]);
+    if (!inNative && intentId) setLastIntentSection(intentId, detectSection(location.pathname));
+  }, [inNative, intentId, location.pathname]);
 
   // Breakpoint (Tailwind lg): below it BOTH side panels render as NON-modal
   // overlays above the content instead of grid columns, so they stay usable
@@ -119,6 +118,9 @@ export function AppShell() {
   const [commandOpen, setCommandOpen] = useState(false);
   const activityPanel = useResizablePanel(ACTIVITY_PANEL_SIZING);
   const sidebarPanel = useResizablePanel(SIDEBAR_SIZING);
+  const activityOverlayRef = useRef<HTMLElement | null>(null);
+  const activityReturnFocusRef = useRef<HTMLElement | null>(null);
+  const shouldFocusActivityOverlayRef = useRef(false);
 
   // Track the route category so the panel default reapplies on section
   // navigation but not on every render — preserves manual toggle.
@@ -135,13 +137,44 @@ export function AppShell() {
   const showActivity = (inSprint || inIntent || onProjectPage) && activityPanelOpen;
 
   const toggleSidebar = useCallback(() => setSidebarCollapsed((prev) => !prev), []);
-  const toggleActivity = useCallback(() => {
-    setActivityPanelOpen((prev) => !prev);
-  }, [inNative]);
+  const closeActivityPanel = useCallback(() => {
+    setActivityPanelOpen(false);
+    shouldFocusActivityOverlayRef.current = false;
+    const returnFocus = activityReturnFocusRef.current;
+    activityReturnFocusRef.current = null;
+    if (!returnFocus) return;
+    window.requestAnimationFrame(() => {
+      if (returnFocus.isConnected) returnFocus.focus();
+    });
+  }, []);
   // Opening a discussion pops the activity panel (the thread renders there).
   const showActivityPanel = useCallback(() => {
+    if (!activityPanelOpen && !panelsInline) {
+      const activeElement = document.activeElement;
+      activityReturnFocusRef.current =
+        activeElement instanceof HTMLElement && activeElement !== document.body
+          ? activeElement
+          : null;
+      shouldFocusActivityOverlayRef.current = true;
+    }
     setActivityPanelOpen(true);
-  }, [inNative]);
+  }, [activityPanelOpen, panelsInline]);
+  const toggleActivity = useCallback(() => {
+    if (activityPanelOpen) closeActivityPanel();
+    else showActivityPanel();
+  }, [activityPanelOpen, closeActivityPanel, showActivityPanel]);
+
+  useEffect(() => {
+    if (!showActivity || panelsInline || !shouldFocusActivityOverlayRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      const overlay = activityOverlayRef.current;
+      if (!overlay) return;
+      const closeButton = overlay.querySelector<HTMLElement>('[aria-label="Close activity panel"]');
+      (closeButton ?? overlay).focus();
+      shouldFocusActivityOverlayRef.current = false;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [panelsInline, showActivity]);
 
   // Grid columns only contain panels that render INLINE at the current
   // breakpoint — overlay panels must not reserve track space.
@@ -155,141 +188,129 @@ export function AppShell() {
 
   return (
     <TooltipProvider delayDuration={200}>
-      {/* Native IDs must never reach the platform intent/discussion providers;
-          native routes mount their own native-scoped providers. */}
-      <PlatformProviders native={inNative} onOpenActivity={showActivityPanel}>
-        <div className="flex h-screen flex-col bg-background">
-          {/* Header */}
-          <AppHeader
-            onToggleSidebar={toggleSidebar}
-            onToggleActivity={toggleActivity}
-            onOpenCommand={() => setCommandOpen(true)}
-            sidebarCollapsed={sidebarCollapsed}
-            activityPanelOpen={activityPanelOpen}
-          />
+      {/* DiscussionProvider sits above BOTH the routed pages and the
+          ActivityPanel so the Discussions tab, the entry-point buttons, the
+          panel-hosted thread and the mention toasts share one state.
+          IntentProvider is likewise always mounted (inert off intent routes)
+          so the routed IntentView and the AppShell-hosted IntentActivityPanel
+          share one fetch/realtime/output-buffer state. */}
+      <DiscussionProvider
+        backend={inNative ? 'native' : 'platform'}
+        onDiscussionOpen={showActivityPanel}
+      >
+        <IntentProvider backend={inNative ? 'native' : 'platform'} onAgentFocus={showActivityPanel}>
+          <div className="flex h-screen flex-col bg-background">
+            {/* Header */}
+            <AppHeader
+              onToggleSidebar={toggleSidebar}
+              onToggleActivity={toggleActivity}
+              onOpenCommand={() => setCommandOpen(true)}
+              sidebarCollapsed={sidebarCollapsed}
+              activityPanelOpen={activityPanelOpen}
+            />
 
-          {/* Main content area (relative: hosts the small-screen overlays,
+            {/* Main content area (relative: hosts the small-screen overlays,
               clipped between header and status bar) */}
-          <div
-            className="relative flex-1 overflow-hidden grid"
-            style={{ gridTemplateColumns: gridColumns }}
-          >
-            {/* Sidebar - inline column on lg+, with a resize handle */}
-            {showSidebar && panelsInline && (
-              <aside className="relative flex border-r overflow-hidden">
-                <AppSidebar />
+            <div
+              className="relative flex-1 overflow-hidden grid"
+              style={{ gridTemplateColumns: gridColumns }}
+            >
+              {/* Sidebar - inline column on lg+, with a resize handle */}
+              {showSidebar && panelsInline && (
+                <aside className="relative flex border-r overflow-hidden">
+                  <AppSidebar />
+                  <div
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label="Resize sidebar"
+                    tabIndex={0}
+                    onPointerDown={sidebarPanel.handleResizeStart}
+                    onKeyDown={sidebarPanel.handleResizeKey}
+                    onDoubleClick={sidebarPanel.resetWidth}
+                    className="absolute inset-y-0 right-0 z-10 w-1.5 cursor-col-resize touch-none hover:bg-primary/30 active:bg-primary/40 focus-visible:bg-primary/40 focus-visible:outline-none"
+                  />
+                </aside>
+              )}
+
+              {/* Main content */}
+              <main className="h-full overflow-hidden min-w-0 flex flex-col">
+                {inSprint && <SprintPipelineBar />}
                 <div
-                  role="separator"
-                  aria-orientation="vertical"
-                  aria-label="Resize sidebar"
-                  tabIndex={0}
-                  onPointerDown={sidebarPanel.handleResizeStart}
-                  onKeyDown={sidebarPanel.handleResizeKey}
-                  onDoubleClick={sidebarPanel.resetWidth}
-                  className="absolute inset-y-0 right-0 z-10 w-1.5 cursor-col-resize touch-none hover:bg-primary/30 active:bg-primary/40 focus-visible:bg-primary/40 focus-visible:outline-none"
-                />
-              </aside>
-            )}
+                  className={cn(
+                    'flex-1 overflow-y-auto min-w-0',
+                    onGraphPage ? 'overflow-hidden' : 'px-6 py-6',
+                  )}
+                >
+                  <Outlet />
+                </div>
+              </main>
 
-            {/* Main content */}
-            <main className="h-full overflow-hidden min-w-0 flex flex-col">
-              {inSprint && <SprintPipelineBar />}
-              <div
-                className={cn(
-                  'flex-1 overflow-y-auto min-w-0',
-                  onGraphPage ? 'overflow-hidden' : 'px-6 py-6',
-                )}
-              >
-                <Outlet />
-              </div>
-            </main>
+              {/* Activity panel - inline column on lg+, with a resize handle */}
+              {showActivity && panelsInline && (
+                <aside className="relative flex min-w-0 overflow-hidden border-l border-border shadow-[-4px_0_12px_-4px_rgba(0,0,0,0.08)] dark:shadow-[-4px_0_12px_-4px_rgba(0,0,0,0.4)]">
+                  <div
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label="Resize activity panel"
+                    tabIndex={0}
+                    onPointerDown={activityPanel.handleResizeStart}
+                    onKeyDown={activityPanel.handleResizeKey}
+                    onDoubleClick={activityPanel.resetWidth}
+                    className="absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize touch-none hover:bg-primary/30 active:bg-primary/40 focus-visible:bg-primary/40 focus-visible:outline-none"
+                  />
+                  {inIntent ? (
+                    <Suspense fallback={null}>
+                      <IntentActivityPanel onClose={closeActivityPanel} />
+                    </Suspense>
+                  ) : (
+                    <Suspense fallback={null}>
+                      <ActivityPanel
+                        sprintId={inSprint ? sprintId : (latestActiveSprintId ?? undefined)}
+                        onClose={closeActivityPanel}
+                      />
+                    </Suspense>
+                  )}
+                </aside>
+              )}
 
-            {/* Activity panel - inline column on lg+, with a resize handle */}
-            {showActivity && panelsInline && (
-              <aside className="relative flex min-w-0 overflow-hidden border-l border-border shadow-[-4px_0_12px_-4px_rgba(0,0,0,0.08)] dark:shadow-[-4px_0_12px_-4px_rgba(0,0,0,0.4)]">
-                <div
-                  role="separator"
-                  aria-orientation="vertical"
-                  aria-label="Resize activity panel"
-                  tabIndex={0}
-                  onPointerDown={activityPanel.handleResizeStart}
-                  onKeyDown={activityPanel.handleResizeKey}
-                  onDoubleClick={activityPanel.resetWidth}
-                  className="absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize touch-none hover:bg-primary/30 active:bg-primary/40 focus-visible:bg-primary/40 focus-visible:outline-none"
-                />
-                {inIntent ? (
-                  <Suspense fallback={null}>
-                    <IntentActivityPanel onClose={() => setActivityPanelOpen(false)} />
-                  </Suspense>
-                ) : (
-                  <Suspense fallback={null}>
-                    <ActivityPanel
-                      sprintId={inSprint ? sprintId : (latestActiveSprintId ?? undefined)}
-                      onClose={() => setActivityPanelOpen(false)}
-                    />
-                  </Suspense>
-                )}
-              </aside>
-            )}
-
-            {/* Small-screen overlays — NON-modal: no backdrop, the content
+              {/* Small-screen overlays — NON-modal: no backdrop, the content
                 behind stays visible and interactive. */}
-            {showSidebar && !panelsInline && (
-              <aside className="absolute inset-y-0 left-0 z-40 flex w-72 max-w-[85vw] overflow-hidden border-r bg-background shadow-2xl">
-                <AppSidebar />
-              </aside>
-            )}
-            {showActivity && !panelsInline && (
-              <aside className="absolute inset-y-0 right-0 z-40 flex w-full max-w-md overflow-hidden bg-background shadow-2xl">
-                {inIntent ? (
-                  <Suspense fallback={null}>
-                    <IntentActivityPanel onClose={() => setActivityPanelOpen(false)} />
-                  </Suspense>
-                ) : (
-                  <Suspense fallback={null}>
-                    <ActivityPanel
-                      sprintId={inSprint ? sprintId : (latestActiveSprintId ?? undefined)}
-                      onClose={() => setActivityPanelOpen(false)}
-                    />
-                  </Suspense>
-                )}
-              </aside>
-            )}
+              {showSidebar && !panelsInline && (
+                <aside className="absolute inset-y-0 left-0 z-40 flex w-72 max-w-[85vw] overflow-hidden border-r bg-background shadow-2xl">
+                  <AppSidebar />
+                </aside>
+              )}
+              {showActivity && !panelsInline && (
+                <aside
+                  ref={activityOverlayRef}
+                  aria-label="Activity panel"
+                  tabIndex={-1}
+                  className="absolute inset-y-0 right-0 z-40 flex w-full max-w-md overflow-hidden bg-background shadow-2xl"
+                >
+                  {inIntent ? (
+                    <Suspense fallback={null}>
+                      <IntentActivityPanel onClose={closeActivityPanel} />
+                    </Suspense>
+                  ) : (
+                    <Suspense fallback={null}>
+                      <ActivityPanel
+                        sprintId={inSprint ? sprintId : (latestActiveSprintId ?? undefined)}
+                        onClose={closeActivityPanel}
+                      />
+                    </Suspense>
+                  )}
+                </aside>
+              )}
+            </div>
+
+            {/* Status bar */}
+            <StatusBar />
+
+            {/* Command palette */}
+            <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} />
           </div>
-
-          {/* Status bar */}
-          <StatusBar />
-
-          {/* Command palette */}
-          <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} />
-        </div>
-      </PlatformProviders>
-    </TooltipProvider>
-  );
-}
-
-function PlatformProviders({
-  native,
-  children,
-  onOpenActivity,
-}: {
-  native: boolean;
-  children: ReactNode;
-  onOpenActivity: () => void;
-}) {
-  // Native routes get the native discussion scope (protected native ownership,
-  // native API paths and channel); never the platform intent scope.
-  if (native)
-    return (
-      <DiscussionProvider backend="native" onDiscussionOpen={onOpenActivity}>
-        <IntentProvider backend="native" onAgentFocus={onOpenActivity}>
-          {children}
         </IntentProvider>
       </DiscussionProvider>
-    );
-  return (
-    <DiscussionProvider onDiscussionOpen={onOpenActivity}>
-      <IntentProvider onAgentFocus={onOpenActivity}>{children}</IntentProvider>
-    </DiscussionProvider>
+    </TooltipProvider>
   );
 }

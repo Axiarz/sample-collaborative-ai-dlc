@@ -81,18 +81,18 @@ Collected on 21 September 2026, with the infrastructure snapshot completed at
 `746558295630` with its `ReadOnly` role. The similarly named `aidlc` profile
 resolved to a different account and was not used for resource inspection.
 
-| Area | Observed result |
-| --- | --- |
-| Source API and package worker | Both Lambda functions are `Active`, with successful updates. Source administration and import environment flags are `"false"`. Worker architecture is ARM64. |
-| Dispatch | SQS consumer is `Disabled`; no matching EventBridge Pipe exists. Main queue and both dead-letter queues report zero visible/in-flight messages and managed encryption. |
-| Protected tables | Job and source-binding tables are `ACTIVE`, encrypted, on demand, with PITR enabled and TTL disabled. Job stream is enabled with `NEW_IMAGE`. |
-| Package bucket | Versioning enabled, AES256 default encryption, all four public-access blocks enabled, `BucketOwnerEnforced`, and no lifecycle configuration. |
-| Package policies | Retrieved bucket policy and worker publisher policy exactly match the rendered repository templates, ignoring JSON member/array ordering. AWS has accepted and stored these policies; request enforcement has not been exercised. |
-| API configuration | All five source/package methods use `COGNITO_USER_POOLS` and proxy to the dedicated workflow-source Lambda. The `dev` stage has a deployment updated after the infrastructure apply. These are configuration checks, not authenticated route execution. |
-| Yjs runtime | Task definition revision 28, one desired/running task, zero pending, rollout `COMPLETED`, ALB target `healthy`. Cluster-related environment variables are absent. |
-| Approved retirement | Worker-members table returns `ResourceNotFoundException`; old scaling target and four alarms are absent; cluster ownership policy is absent from the Yjs task role. |
-| Existing storage | Original Yjs document table remains active with its pre-deployment creation date. Artifacts and code-snapshots buckets remain present/versioned; lifecycle rules match the reviewed plan. No document or object contents were read. |
-| Frontend | Public homepage and the user's local Vite frontend return HTTP 200. Local `.env` points to the reviewed `dev` API and both WebSocket endpoints. The user is deliberately running the frontend locally; frontend publication is not required for this checkpoint. |
+| Area                          | Observed result                                                                                                                                                                                                                                                  |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source API and package worker | Both Lambda functions are `Active`, with successful updates. Source administration and import environment flags are `"false"`. Worker architecture is ARM64.                                                                                                     |
+| Dispatch                      | SQS consumer is `Disabled`; no matching EventBridge Pipe exists. Main queue and both dead-letter queues report zero visible/in-flight messages and managed encryption.                                                                                           |
+| Protected tables              | Job and source-binding tables are `ACTIVE`, encrypted, on demand, with PITR enabled and TTL disabled. Job stream is enabled with `NEW_IMAGE`.                                                                                                                    |
+| Package bucket                | Versioning enabled, AES256 default encryption, all four public-access blocks enabled, `BucketOwnerEnforced`, and no lifecycle configuration.                                                                                                                     |
+| Package policies              | Retrieved bucket policy and worker publisher policy exactly match the rendered repository templates, ignoring JSON member/array ordering. AWS has accepted and stored these policies; request enforcement has not been exercised.                                |
+| API configuration             | All five source/package methods use `COGNITO_USER_POOLS` and proxy to the dedicated workflow-source Lambda. The `dev` stage has a deployment updated after the infrastructure apply. These are configuration checks, not authenticated route execution.          |
+| Yjs runtime                   | Task definition revision 28, one desired/running task, zero pending, rollout `COMPLETED`, ALB target `healthy`. Cluster-related environment variables are absent.                                                                                                |
+| Approved retirement           | Worker-members table returns `ResourceNotFoundException`; old scaling target and four alarms are absent; cluster ownership policy is absent from the Yjs task role.                                                                                              |
+| Existing storage              | Original Yjs document table remains active with its pre-deployment creation date. Artifacts and code-snapshots buckets remain present/versioned; lifecycle rules match the reviewed plan. No document or object contents were read.                              |
+| Frontend                      | Public homepage and the user's local Vite frontend return HTTP 200. Local `.env` points to the reviewed `dev` API and both WebSocket endpoints. The user is deliberately running the frontend locally; frontend publication is not required for this checkpoint. |
 
 An initial API resource-list request was throttled; a single larger-page retry
 and subsequent method reads succeeded. Initial automatic-approval failures

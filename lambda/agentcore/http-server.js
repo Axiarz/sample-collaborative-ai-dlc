@@ -44,6 +44,10 @@
 //       verifies + concludes, the agent only edits the conflicted files).
 //   { "command": "record-unit-pr", unitPrs:[...] } → best-effort Neptune
 //       projection for unit review PRs; DDB remains scheduling truth.
+//   { "command": "record-learning", projectId, intentId, executionId,
+//     stageInstanceId?, stageId?, learnings, recordedBy?, recordedByName? }
+//     → the learnings ritual: write a human-authored learning offered at an
+//       approval gate into the project rule stack. Never fails the run.
 //   { "command": "discussion-assist-start", ...discussion args }
 //     → accepts in ms, runs Quorum's one-shot discussion answer in a background
 //       job, then updates the pending DiscussionMessage and broadcasts it.
@@ -71,6 +75,14 @@ if (process.env.NATIVE_RUNTIME_MODE && process.env.NATIVE_RUNTIME_MODE !== 'isol
 const isolatedRuntime = process.env.NATIVE_RUNTIME_MODE === 'isolated';
 const { Logger } = isolatedRuntime ? {} : await import('@aws-lambda-powertools/logger');
 const { commandDefinition } = isolatedRuntime ? {} : await import('./command-registry.js');
+const { authenticationCommandFailure, authenticationCommandHandlers } = isolatedRuntime
+  ? {}
+  : await import('./authentication-command-registry.js');
+const { installProcessGroupShutdown } = isolatedRuntime ? {} : await import('./cli/spawn.js');
+const { createCredentialSession } = isolatedRuntime ? {} : await import('./credential-session.js');
+const { accountCredentialInvocation } = isolatedRuntime
+  ? {}
+  : await import('./invocation-accounting.js');
 
 const logger = isolatedRuntime ? null : new Logger({ persistentKeys: { component: 'agentcore' } });
 
@@ -89,6 +101,11 @@ export const createBusyTracker = () => {
     },
   };
 };
+
+export const createRecordLearningHandler =
+  ({ recordLearning, store, openGraph, broadcast }) =>
+  (payload) =>
+    recordLearning(payload, { store, openGraph, broadcast });
 
 // Dispatch one parsed invocation to the right command handler. PURE of HTTP —
 // returns { statusCode, body }. `handlers` = { initWs, runStage }; `busy` is the
@@ -113,6 +130,7 @@ export const dispatchInvocation = async ({
   }
 
   busy?.enter();
+  let credentialSession = null;
   try {
     const context =
       prepareInvocation && definition.agentAuth
@@ -120,7 +138,10 @@ export const dispatchInvocation = async ({
         : {};
     const handlerPayload = { ...payload };
     delete handlerPayload.agentCredentialGrant;
-    const result = await handler(handlerPayload, context);
+    credentialSession = context.credentialSession ?? null;
+    const result = credentialSession
+      ? await credentialSession.run(() => handler(handlerPayload, context))
+      : await handler(handlerPayload, context);
     // Command-level failures are part of the application protocol. Keep them on
     // HTTP 200 so Bedrock AgentCore returns the JSON body to the orchestrator
     // instead of turning the response into an SDK transport exception. Log them
@@ -136,9 +157,15 @@ export const dispatchInvocation = async ({
     }
     return { statusCode: 200, body: { ...result, command, at: now() } };
   } catch (e) {
+    const failure = authenticationCommandFailure(command, e);
+    if (failure) {
+      logger.warn('Authentication command failed', { command, code: failure.code });
+      return { statusCode: 200, body: { ...failure, command, at: now() } };
+    }
     logger.error('command threw', e, { command });
     return { statusCode: 500, body: { error: e.message, command } };
   } finally {
+    await credentialSession?.release();
     busy?.leave();
   }
 };
@@ -225,6 +252,7 @@ const main = async () => {
   const { deriveArtifacts } = await import('./commands/derive-artifacts.js');
   const { createWorkflowCheckpoint } = await import('./commands/create-workflow-checkpoint.js');
   const { recordPr } = await import('./commands/record-pr.js');
+  const { recordLearning } = await import('./commands/record-learning.js');
   const { recordUnitPr } = await import('./commands/record-unit-pr.js');
   const { initLane, mergeLane, reconcileLane, refreshIntentWorkspace } =
     await import('./commands/lane.js');
@@ -239,8 +267,7 @@ const main = async () => {
   const { materializeStage, renderRulesDoc } = await import('./stage-materializer.js');
   const { checkoutRepos } = await import('./workspace.js');
   const { discoverInstalledClis } = await import('./cli/discover.js');
-  const { authenticatedClisForEnv, resolveInvocationAgentAuth } =
-    await import('./auth-resolver.js');
+  const { authenticatedClis, resolveInvocationAgentAuth } = await import('./auth-resolver.js');
 
   const workspaceDir = process.env.V2_WORKSPACE_DIR || '/mnt/workspace';
   const mcpEntry = process.env.V2_MCP_ENTRY || new URL('./mcp/index.js', import.meta.url).pathname;
@@ -253,9 +280,34 @@ const main = async () => {
       store,
       env: process.env,
     });
+    const credentialSession =
+      auth.credentialSession ??
+      createCredentialSession({
+        env: auth.env,
+        credentialEnvironment: auth.credentialEnvironment,
+        expiresAt: auth.expiresAt,
+        authorizationExpiresAt: auth.authorizationExpiresAt,
+        refresh: auth.refresh,
+      });
+    try {
+      await accountCredentialInvocation({
+        ddb,
+        tableName: process.env.V2_PROCESS_TABLE,
+        session: credentialSession,
+        payload: { ...payload, projectId: auth.projectId },
+        bindings: auth.bindings,
+      });
+    } catch (error) {
+      await credentialSession.release();
+      throw error;
+    }
     return {
       ...auth,
-      availableClis: authenticatedClisForEnv({ installed: installedClis, env: auth.env }),
+      credentialSession,
+      availableClis: authenticatedClis({
+        installed: installedClis,
+        providers: auth.resolvedProviders,
+      }),
     };
   };
 
@@ -291,9 +343,12 @@ const main = async () => {
       capabilities(p, {
         env: context.env,
         discoverInstalledClis: async () => installedClis,
+        authenticatedProviders: context.resolvedProviders,
+        materialTypes: context.materialTypes ?? [],
       }),
     managedRuntimeCheck: (p) => managedRuntimeCheck(p, { workspaceDir }),
     verifyMcp: (p) => verifyMcp(p),
+    ...authenticationCommandHandlers(),
     // WP3: freeze the approved unit DAG into UNITPLAN/UNIT rows + the graph
     // mirror. Dispatched by the orchestrator after the producing stage
     // succeeds (docs/v2-parallel.md).
@@ -316,6 +371,9 @@ const main = async () => {
     // Fan-in PR record: write the opened PR(s) into the graph (the orchestrator
     // has no Neptune access, so it forwards the structured PR data here).
     recordPr: (p) => recordPr(p, { store, openGraph, broadcast }),
+    // Learnings ritual: the human's gate answer becomes a durable
+    // project learning here, because the orchestrator has no Neptune access.
+    recordLearning: createRecordLearningHandler({ recordLearning, store, openGraph, broadcast }),
     recordUnitPr: (p) => recordUnitPr(p, { store, openGraph, broadcast }),
     // WP5 unit lanes: engine-owned lane git (docs/v2-parallel.md A3). init-lane
     // runs in the lane's own session; merge-lane in the intent session.
@@ -427,6 +485,14 @@ const main = async () => {
       deriveArtifacts: (q) => handlers.deriveArtifacts(q, context),
       env: context.env,
     });
+
+  // Shutdown policy, installed once for the whole container rather than lazily by
+  // the first persona session: a stop reaps the persona-session process groups
+  // (their children are not group leaders and would otherwise be orphaned) and
+  // then lets the signal take its default course. A container that never runs a
+  // persona stage therefore keeps exactly the disposition it had before persona
+  // sessions existed.
+  if (!isolatedRuntime) installProcessGroupShutdown();
 
   const server = createServer({
     handlers,

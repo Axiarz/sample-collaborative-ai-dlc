@@ -19,6 +19,7 @@
 
 import { createHash } from 'node:crypto';
 import gremlin from 'gremlin';
+import { randomUUID } from 'node:crypto';
 import {
   DERIVED_ITEM_LABELS,
   flattenVertexMap,
@@ -36,6 +37,7 @@ import {
   VERSIONED_RELATIONSHIP_EDGES,
 } from '../../shared/artifact-versioning.js';
 import { validateStructuredBlock } from '../../shared/artifact-extractors.js';
+import { contributionArtifactId } from '../../shared/ensemble-contribution.js';
 
 const __ = gremlin.process.statics;
 const { cardinality } = gremlin.process;
@@ -184,6 +186,8 @@ const RESERVED_PROPS = new Set([
   'artifact_logical_key',
   'artifact_aliases',
   'generation',
+  'collaboration_epoch',
+  'edit_revision',
   'version_count',
   'created_at',
   'updated_at',
@@ -209,6 +213,10 @@ const RESERVED_PROPS = new Set([
   'verified_at',
   'verify_note',
 ]);
+
+// The server-owned `status` of a contribution a persona wrote itself (a gap stub
+// the platform wrote carries `gap`).
+const CONTRIBUTION_RECORDED_STATUS = 'recorded';
 
 const GENERATION_METADATA_PROPS = [
   'restart_reason',
@@ -328,40 +336,33 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
     created_at: now(),
   });
 
-  // Upsert a vertex by (label,id): create it only if absent, then return the
-  // traversal positioned on it for property writes.
-  //
-  // Labels whose `id` prop is only unique WITHIN an intent — agents choose
-  // Artifact ids freely and Section ids embed the artifact id (`section:<id>:
-  // <slug>`), so two intents can pick the SAME id and, without scoping, share
-  // (and overwrite/delete) one vertex — the field incident that lost a run's
-  // items. Every lookup/edge/upsert of these MUST additionally match the
-  // trusted `intent_id` prop (from stamp()). Project-scoped labels
-  // (TeamKnowledge/LearningRule), the Intent anchor, and UUID/deterministic-id
-  // labels (Question/Steering/UnitOfWork/typed items — ids are globally unique
-  // or embed the intentId) are safe without it.
+  // Agent-selected IDs are local to their owning intent or project. Apply the
+  // same ownership key to lookup, creation, property updates, and edge endpoints.
   const INTENT_SCOPED_LABELS = new Set([ARTIFACT_LABEL, SECTION_LABEL]);
-
-  // Append the intent_id match iff the label's id space is intent-local. Works
-  // on any traversal (`g.V()...`, `__.V()...`, `__.inV()...`).
-  const scopeByIntent = (traversal, label) =>
-    INTENT_SCOPED_LABELS.has(label) ? traversal.has('intent_id', scope.intentId) : traversal;
-
-  // Position a fresh traversal on the (label,id) vertex, intent-scoped when the
-  // label needs it. The one lookup helper the write/read sites share.
-  const vAt = (label, id) => scopeByIntent(g.V().has(label, 'id', id), label);
+  const PROJECT_SCOPED_LABELS = new Set([TEAM_KNOWLEDGE_LABEL, LEARNING_RULE_LABEL]);
+  const ownership = (label) => {
+    if (INTENT_SCOPED_LABELS.has(label)) return ['intent_id', scope.intentId];
+    if (PROJECT_SCOPED_LABELS.has(label)) return ['project_id', scope.projectId];
+    return null;
+  };
+  const scopeVertex = (traversal, label) => {
+    const key = ownership(label);
+    return key ? traversal.has(...key) : traversal;
+  };
+  const vAt = (label, id) => scopeVertex(g.V().has(label, 'id', id), label);
 
   // Derived-row lookup by id alone (Section/item ids gathered from a scoped
   // artifact's edges). These rows always carry intent_id, so scope defensively
   // — an id collision across intents must never let a write cross over.
   const vDerivedById = (id) => g.V().has('id', id).has('intent_id', scope.intentId);
 
-  const logicalIdentity = (artifactType) => ({
+  const logicalIdentity = (artifactType, persona = scope.agentRef) => ({
     intentId: scope.intentId,
     sectionIndex: scope.sectionIndex,
     unitSlug: scope.unitSlug,
     stageInstanceId: scope.stageInstanceId,
     artifactType,
+    ...(artifactType === 'contribution' && persona ? { persona: String(persona) } : {}),
   });
 
   const resolveArtifactEntry = async (id, { preferCurrentScope = true } = {}) => {
@@ -372,7 +373,12 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
     if (preferCurrentScope) {
       const scopedKeys = new Set(
         matching
-          .filter((row) => sameLogicalArtifact(row, logicalIdentity(row.artifact_type)))
+          .filter((row) =>
+            sameLogicalArtifact(
+              row,
+              logicalIdentity(row.artifact_type, row.collaborator ?? scope.agentRef),
+            ),
+          )
           .map((row) => artifactLogicalKeyFromRow(row, scope.intentId)),
       );
       const currentScoped = selectCanonicalArtifact(
@@ -392,27 +398,23 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
   };
 
   const upsertVertex = async (label, id) => {
-    const scoped = INTENT_SCOPED_LABELS.has(label);
-    // The coalesce key must include intent_id for scoped labels so a second
-    // intent reusing an id creates a NEW vertex instead of adopting the
-    // existing one. The new vertex carries intent_id immediately (the full
-    // stamp is written by the caller right after).
+    const key = ownership(label);
     let create = __.addV(label).property(cardinality.single, 'id', id);
-    if (scoped) create = create.property(cardinality.single, 'intent_id', scope.intentId);
+    if (key) create = create.property(cardinality.single, ...key);
     await vAt(label, id).fold().coalesce(__.unfold(), create).next();
   };
 
   // Idempotent edge create between two existing vertices, each end matched with
-  // intent scoping appropriate to its label.
+  // ownership scoping appropriate to its label.
   const ensureEdge = async ({ fromLabel, fromId, toLabel, toId, edge }) => {
-    const exists = await scopeByIntent(g.V().has(fromLabel, 'id', fromId), fromLabel)
+    const exists = await scopeVertex(g.V().has(fromLabel, 'id', fromId), fromLabel)
       .outE(edge)
-      .where(scopeByIntent(__.inV().has(toLabel, 'id', toId), toLabel))
+      .where(scopeVertex(__.inV().has(toLabel, 'id', toId), toLabel))
       .hasNext();
     if (!exists) {
-      await scopeByIntent(g.V().has(fromLabel, 'id', fromId), fromLabel)
+      await scopeVertex(g.V().has(fromLabel, 'id', fromId), fromLabel)
         .addE(edge)
-        .to(scopeByIntent(__.V().has(toLabel, 'id', toId), toLabel))
+        .to(scopeVertex(__.V().has(toLabel, 'id', toId), toLabel))
         .next();
     }
     return !exists;
@@ -514,6 +516,50 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
     return { linked };
   };
 
+  // Who may write a `contribution` head, and with which props. The evidence a
+  // mob or subagent stage is judged on is one contribution per support, so one
+  // session must never be able to write — or flip — another persona's:
+  //   - the platform's own writer (`systemWriter: true`, the gap stub) may write
+  //     any persona's head, `status` and `collaborator` included;
+  //   - a session with a trusted identity (`agentRef`: a dispatched persona, and
+  //     the lead under a resolved policy) may write only its deterministic stage
+  //     contribution id; `collaborator` is forced to that ref and `status` is
+  //     server-owned, so an agent cannot turn a gap stub into evidence or mark its
+  //     own work as one;
+  //   - a release-mode session with NO identity is refused outright;
+  //   - an unpinned/2.3.3 session (no policy, no identity) keeps today's
+  //     behaviour: those runs never judge contribution evidence.
+  const contributionPropsFor = ({ id, props = {}, head = null, isCreate = false }) => {
+    if (scope.systemWriter === true) return props;
+    if (!scope.agentRef) {
+      if (!scope.policy) return props;
+      throw new GraphWriteError(
+        `contribution "${id}" cannot be written by a session with no collaborator identity`,
+      );
+    }
+    const ownId = (value) =>
+      String(value ?? '') ===
+      contributionArtifactId({ stageId: scope.stageId, agentRef: scope.agentRef });
+    const foreignHead =
+      head &&
+      (!ownId(head.id) ||
+        (head.collaborator !== undefined &&
+          head.collaborator !== null &&
+          String(head.collaborator) !== scope.agentRef));
+    if (!ownId(id) || foreignHead) {
+      throw new GraphWriteError(
+        `contribution id "${id}" does not belong to ${scope.agentRef} — use the id your brief gave you`,
+      );
+    }
+    const { collaborator: _collaborator, status: _status, ...rest } = props;
+    // A persona's own create is evidence, so it also clears a gap stub the
+    // platform left on the same head in an earlier round or attempt; an update
+    // never changes `status` at all.
+    return isCreate
+      ? { ...rest, collaborator: scope.agentRef, status: CONTRIBUTION_RECORDED_STATUS }
+      : rest;
+  };
+
   // Create (or upsert) a business Artifact vertex and anchor it to the Intent.
   // `links` optionally wires it to existing artifacts in the same call.
   const createArtifact = async ({
@@ -543,7 +589,11 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
     if (!intentExists)
       throw new GraphWriteError(`Intent "${scope.intentId}" not found — run init-ws first`);
 
-    const identity = logicalIdentity(artifactType);
+    const contributionPersona =
+      artifactType === 'contribution'
+        ? (scope.agentRef ?? (scope.systemWriter === true ? props.collaborator : null))
+        : null;
+    const identity = logicalIdentity(artifactType, contributionPersona);
     const baseLogicalKey = artifactLogicalKey(identity);
     let logicalKey = baseLogicalKey;
     const rows = await readIntentArtifactEntries(g, scope.intentId);
@@ -585,6 +635,10 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
         head = selectCanonicalArtifact(logicalRows);
       }
     }
+    const contributionProps =
+      artifactType === 'contribution'
+        ? contributionPropsFor({ id, props, head, isCreate: true })
+        : props;
     if (!head) {
       await g
         .addV(ARTIFACT_LABEL)
@@ -626,7 +680,7 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
     const rehabilitating = Boolean(head.superseded_at);
     const generation = Math.max(1, Number(head.generation) || 1) + (rehabilitating ? 1 : 0);
     const stamped = {
-      ...sanitizeProps(props),
+      ...sanitizeProps(contributionProps),
       title: String(title ?? ''),
       content: String(content ?? ''),
       ...stamp(),
@@ -635,6 +689,7 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
       artifact_logical_key: logicalKey,
       artifact_aliases: JSON.stringify([...aliases]),
       generation,
+      collaboration_epoch: randomUUID(),
       version_count: Number(head.version_count) || 0,
     };
 
@@ -803,7 +858,9 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
     assertId(id);
     const head = await resolveArtifactEntry(id);
     if (!head) throw new GraphWriteError(`Artifact "${id}" not found`);
-    const clean = sanitizeProps(props);
+    const clean = sanitizeProps(
+      head.artifact_type === 'contribution' ? contributionPropsFor({ id, props, head }) : props,
+    );
     const rehabilitating = Boolean(head.superseded_at);
     const generation = Math.max(1, Number(head.generation) || 1) + (rehabilitating ? 1 : 0);
     if (rehabilitating) {
@@ -820,13 +877,16 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
       .property(cardinality.single, 'stage_attempt', Number(scope.stageAttempt) || 0)
       .property(cardinality.single, 'generation', generation);
     for (const [k, v] of Object.entries(clean)) q = q.property(cardinality.single, k, v);
+    if (Object.hasOwn(clean, 'content') || rehabilitating) {
+      q = q.property(cardinality.single, 'collaboration_epoch', randomUUID());
+    }
     await q.next();
     // An updated artifact is current again (rewind rehabilitation) and no
     // longer stale (drift rehabilitation).
     await clearSuperseded(head.id, head.vertexId);
     await clearStale(head.id, head.vertexId);
     await linkAnsweredQuestionsToArtifact(head.vertexId);
-    return { id: head.id, updated: Object.keys(clean) };
+    return { id: head.id, artifactType: head.artifact_type ?? null, updated: Object.keys(clean) };
   };
 
   const linkArtifacts = async ({ fromId, toId, edge }) => {
@@ -967,7 +1027,7 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
       ...knowledgeStamp(),
       id,
     };
-    let q = g.V().has(TEAM_KNOWLEDGE_LABEL, 'id', id);
+    let q = vAt(TEAM_KNOWLEDGE_LABEL, id);
     for (const [k, v] of Object.entries(stamped)) q = q.property(cardinality.single, k, v);
     await q.next();
 
@@ -994,6 +1054,7 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
       .has(PROJECT_LABEL, 'id', scope.projectId)
       .out(KNOWLEDGE_EDGE)
       .hasLabel(TEAM_KNOWLEDGE_LABEL)
+      .has('project_id', scope.projectId)
       .valueMap(true)
       .toList();
     const rows = list.map(flattenValueMap);
@@ -1037,7 +1098,7 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
       ...knowledgeStamp(),
       id,
     };
-    let q = g.V().has(LEARNING_RULE_LABEL, 'id', id);
+    let q = vAt(LEARNING_RULE_LABEL, id);
     for (const [k, v] of Object.entries(stamped)) q = q.property(cardinality.single, k, v);
     await q.next();
 
@@ -1064,6 +1125,7 @@ export const createGraphWriter = ({ g, scope = {}, clock } = {}) => {
       .has(PROJECT_LABEL, 'id', scope.projectId)
       .out(LEARNING_EDGE)
       .hasLabel(LEARNING_RULE_LABEL)
+      .has('project_id', scope.projectId)
       .valueMap(true)
       .toList();
     return list

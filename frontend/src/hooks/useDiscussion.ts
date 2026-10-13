@@ -71,7 +71,11 @@ export function useDiscussion({
     : scope.kind === 'intent'
       ? { intentId: scope.intentId, projectId: scope.projectId }
       : scope.kind === 'native'
-        ? { intentId: scope.intentId, projectId: scope.projectId, executionBackend: 'native' as const }
+        ? {
+            intentId: scope.intentId,
+            projectId: scope.projectId,
+            executionBackend: 'native' as const,
+          }
         : { sprintId: scope.sprintId };
   const { doc, synced, awareness, remoteUsers } = useYjsDocument(
     docId,

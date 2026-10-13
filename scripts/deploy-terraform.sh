@@ -163,7 +163,7 @@ print_deployment_summary() {
     [[ -n "$oidc_callback" ]] && printf '  OIDC callback:   %s\n' "$oidc_callback"
     [[ -n "$saml_acs" ]] && printf '  SAML ACS:        %s\n' "$saml_acs"
     [[ -n "$saml_entity_id" ]] && printf '  SAML entity ID:  %s\n' "$saml_entity_id"
-    if [[ "$lambda_vpc_scope" == "public-egress" ]]; then
+    if [[ "$lambda_vpc_scope" == "public-egress" || "$lambda_vpc_scope" == "all" ]]; then
         nat_ips="$(terraform -chdir="$TF_DIR" output -json nat_egress_public_ips 2>/dev/null || true)"
         [[ -n "$nat_ips" ]] && printf '  NAT egress IPs:  %s\n' "$nat_ips"
     fi
@@ -331,6 +331,16 @@ stop_retired_agent_tasks "$TFVARS_FILE"
 
 echo "Applying changes..."
 terraform apply "$PLAN_FILE"
+
+# All selection, execution and invocation writers are deployed before this
+# additive backfill. It also writes the readiness marker on fresh installations.
+# Initialization is idempotent and independent of the optional baseline reseed.
+echo "Initializing scoped agent authentication inventory..."
+INVENTORY_REGION="$(terraform output -raw aws_region)"
+INVENTORY_TABLE="$(terraform output -raw v2_executions_table_name)"
+AWS_REGION="$INVENTORY_REGION" V2_PROCESS_TABLE="$INVENTORY_TABLE" \
+    node "$SCRIPT_DIR/initialize-agent-auth-inventory.mjs"
+
 if [[ "${AIDLC_KEEP_PLAN:-0}" != "1" ]]; then
     rm -f "$PLAN_FILE"
 fi

@@ -80,7 +80,8 @@ export function useYjsDocument(
   }, [documentId, doc, userName, userColor]);
   const remoteUsers = new Map<number, { name: string; color: string }>();
   for (const peer of (documentId && servers.get(documentId)) || []) {
-    if (peer.doc !== doc) remoteUsers.set(peer.doc.clientID, { name: peer.name, color: peer.color });
+    if (peer.doc !== doc)
+      remoteUsers.set(peer.doc.clientID, { name: peer.name, color: peer.color });
   }
   return { doc, synced: Boolean(documentId), awareness, remoteUsers, setCursor: () => {} };
 }

@@ -955,10 +955,10 @@ was needed to reach **READY**, version **12**, fence **5**, at
 After READY, the retained forms submitted the exact original Create payload
 and another Prepare:
 
-| Action | API result | Request ID | Protected record |
-| --- | --- | --- | --- |
-| Duplicate Create, 12:55:09Z | 200 READY | `f2e47aaf-5a15-49cd-ae61-880b6f75418f` | Entire row unchanged |
-| Repeat Prepare, 12:55:22Z | 200 READY | `f0a33798-6402-4c8b-9289-79f39286bbca` | Entire row unchanged |
+| Action                      | API result | Request ID                             | Protected record     |
+| --------------------------- | ---------- | -------------------------------------- | -------------------- |
+| Duplicate Create, 12:55:09Z | 200 READY  | `f2e47aaf-5a15-49cd-ae61-880b6f75418f` | Entire row unchanged |
+| Repeat Prepare, 12:55:22Z   | 200 READY  | `f0a33798-6402-4c8b-9289-79f39286bbca` | Entire row unchanged |
 
 The before/after rows are deeply equal, including all resource identifiers,
 package/image pins, version/fence and timestamps. Their canonical JSON SHA-256
@@ -988,10 +988,10 @@ On 28 September the user signed in with a separate account that is not a
 flappy-bird member. The visible account differed from the earlier member.
 The following real authenticated reads were denied:
 
-| UI action | API route | Result |
-| --- | --- | --- |
-| Open run C, 13:35:13Z | GET native intent item | 403, 77-byte error response |
-| Open original run A, 13:38:30Z | GET native intent item | 403, 77-byte error response |
+| UI action                          | API route                               | Result                      |
+| ---------------------------------- | --------------------------------------- | --------------------------- |
+| Open run C, 13:35:13Z              | GET native intent item                  | 403, 77-byte error response |
+| Open original run A, 13:38:30Z     | GET native intent item                  | 403, 77-byte error response |
 | Open native draft entry, 13:38:30Z | GET native intent collection/capability | 403, 77-byte error response |
 
 The existing-run pages show **Native intent access denied**, with no private
@@ -1041,19 +1041,19 @@ use the original A page.
    1141 and verified on E/F: **4:22 and 4:16**, approximately 64% faster than
    the earlier 12-minute runs. Both hit a ten-second first-invocation deadline,
    then recovered automatically; fresh-session filesystem checks also passed.
-    The worker-only diagnostic-budget follow-up is deployed at **1142** with
-    matching bytes and 16 deployment checks. G/H take **4:18 and 4:14**, but
-    both first invocations still exceed 20 seconds and recover automatically.
-    Fresh-session filesystem proofs pass and stop with HTTP 200. The
-    time-correlated AWS latency samples are **51.833 and 50.470 seconds**,
-    beyond the 30-second worker window. On 29 September the user selected only
-    the timeout repair and deferred pre-provisioning. The reviewed 90-second
-    worker / 80-second diagnostic / 540-second queue plan passes 294 tests and
-    both 21-check reviews. It is applied at **1143**: 15 parent and 18 independent
-    deployment checks pass. Fresh I/J reach READY in **98.968/101.093 seconds**
-    with no first-invocation abort or long recovery wait. Independent filesystem
-    sessions pass and stop with HTTP 200; the 40-check measurement review passes.
-    This loop is complete. Continue the existing UI/graph slice.
+   The worker-only diagnostic-budget follow-up is deployed at **1142** with
+   matching bytes and 16 deployment checks. G/H take **4:18 and 4:14**, but
+   both first invocations still exceed 20 seconds and recover automatically.
+   Fresh-session filesystem proofs pass and stop with HTTP 200. The
+   time-correlated AWS latency samples are **51.833 and 50.470 seconds**,
+   beyond the 30-second worker window. On 29 September the user selected only
+   the timeout repair and deferred pre-provisioning. The reviewed 90-second
+   worker / 80-second diagnostic / 540-second queue plan passes 294 tests and
+   both 21-check reviews. It is applied at **1143**: 15 parent and 18 independent
+   deployment checks pass. Fresh I/J reach READY in **98.968/101.093 seconds**
+   with no first-invocation abort or long recovery wait. Independent filesystem
+   sessions pass and stop with HTTP 200; the 40-check measurement review passes.
+   This loop is complete. Continue the existing UI/graph slice.
 2. Complete direct unauthorized POST and other-enabled-project API checks,
    live membership-revocation behavior and physical filesystem isolation.
 3. Continue to one model turn, durable first-question/file publication and

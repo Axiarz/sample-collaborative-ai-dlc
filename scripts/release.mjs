@@ -39,7 +39,16 @@ const writeJson = (path, value) => writeFileSync(path, `${JSON.stringify(value, 
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const componentManifests = (dir = root) => {
-  const ignored = new Set(['.git', '.terraform', 'builds', 'dist', 'node_modules', 'site']);
+  const ignored = new Set([
+    '.git',
+    '.native-evidence',
+    '.native-tmp',
+    '.terraform',
+    'builds',
+    'dist',
+    'node_modules',
+    'site',
+  ]);
   const manifests = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (ignored.has(entry.name)) continue;

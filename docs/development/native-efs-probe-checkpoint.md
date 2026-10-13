@@ -247,14 +247,14 @@ At **08:10:02Z**, a credential-free bootstrap created a disposable runtime 103
 session and a fixed read-only diagnostic issued real EFS requests using the
 runtime role. Model credentials remained in AWS and no model ran.
 
-| Actual request | Result |
-| --- | --- |
+| Actual request                                           | Result                                   |
+| -------------------------------------------------------- | ---------------------------------------- |
 | `DescribeAccessPoints` by the configured access-point ID | HTTP 200; expected access point returned |
-| `DescribeAccessPoints` by the configured filesystem ID | HTTP 200; expected access point returned |
-| `DescribeMountTargets` by the configured filesystem ID | HTTP 200; both mount targets returned |
-| `DescribeMountTargets` by the configured access-point ID | HTTP 200; both mount targets returned |
-| Unfiltered access-point listing | HTTP 403 |
-| Mount-target lookup without a resource ID | HTTP 400; invalid request |
+| `DescribeAccessPoints` by the configured filesystem ID   | HTTP 200; expected access point returned |
+| `DescribeMountTargets` by the configured filesystem ID   | HTTP 200; both mount targets returned    |
+| `DescribeMountTargets` by the configured access-point ID | HTTP 200; both mount targets returned    |
+| Unfiltered access-point listing                          | HTTP 403                                 |
+| Mount-target lookup without a resource ID                | HTTP 400; invalid request                |
 
 CloudTrail independently confirms that the successful access-point lookups
 used `assumed-role/collaborative-ai-dlc-agentcore-dev/BedrockAgentCore-...`,
@@ -321,15 +321,15 @@ The final standard operator invocation used session
 `aidlc-native-efs-probe-581b58af-e006-46e8-b1ed-b1cac19fc4fc`.
 Its filesystem work finished in **7,775 ms**:
 
-| Check | Live result |
-| --- | --- |
-| Hard link | Same inode/device; link count 2 |
-| Symlink | Target and content match |
-| Rename | Replacement observed intact; directory synced |
-| Executable | Mode 0700; execution succeeds |
-| Capacity | 1,082,130,432 bytes written, synced, allocated and read back |
-| SHA-256 | `c3f1468726d71bb72a75c45990310c8b25774aa593627dbe79bd160e7f3704ba` on write and read |
-| Cleanup | Synthetic directory and bulk file removed |
+| Check      | Live result                                                                          |
+| ---------- | ------------------------------------------------------------------------------------ |
+| Hard link  | Same inode/device; link count 2                                                      |
+| Symlink    | Target and content match                                                             |
+| Rename     | Replacement observed intact; directory synced                                        |
+| Executable | Mode 0700; execution succeeds                                                        |
+| Capacity   | 1,082,130,432 bytes written, synced, allocated and read back                         |
+| SHA-256    | `c3f1468726d71bb72a75c45990310c8b25774aa593627dbe79bd160e7f3704ba` on write and read |
+| Cleanup    | Synthetic directory and bulk file removed                                            |
 
 Evidence is under `/tmp/aidlc-plan-tools/native-efs-verify-20260924/`:
 `deployment-review.json`, `mount-inspection.json`, `filesystem-result.json`,
@@ -344,12 +344,12 @@ four harnesses: **13 setup commands and 67 filesystem checks**, with all five
 package hashes and explicit GitHub attestation verification passing.
 Installation and projects were on EFS; active homes were on local disk.
 
-| Harness | Filesystem checks | Project pin | Harness configuration |
-| --- | --- | --- | --- |
-| Codex | 18 passed | 15.864 s | 26.029 s |
-| Claude | 16 passed | 19.705 s | 20.522 s |
-| Kiro | 17 passed | 15.227 s | 21.340 s |
-| OpenCode | 16 passed | 13.952 s | 21.079 s |
+| Harness  | Filesystem checks | Project pin | Harness configuration |
+| -------- | ----------------- | ----------- | --------------------- |
+| Codex    | 18 passed         | 15.864 s    | 26.029 s              |
+| Claude   | 16 passed         | 19.705 s    | 20.522 s              |
+| Kiro     | 17 passed         | 15.227 s    | 21.340 s              |
+| OpenCode | 16 passed         | 13.952 s    | 21.079 s              |
 
 The first attempt exceeded the diagnostic's 120-second installation timeout.
 A controlled retry succeeded: the shared installation took **137.343 seconds**

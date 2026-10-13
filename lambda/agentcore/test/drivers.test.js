@@ -100,6 +100,13 @@ describe('claude driver', () => {
     });
   });
 
+  it('sends inference to BEDROCK_REGION instead of the deployment region', () => {
+    expect(
+      claudeDriver.envForAuth({ AWS_REGION: 'eu-central-1', BEDROCK_REGION: 'us-east-1' })
+        .AWS_REGION,
+    ).toBe('us-east-1');
+  });
+
   it('omits the bearer token when not configured', () => {
     expect(
       claudeDriver.envForAuth({ AWS_REGION: 'us-east-1' }).AWS_BEARER_TOKEN_BEDROCK,
@@ -480,5 +487,25 @@ describe('runChild — exit contract', () => {
     child.emit('close', 0);
     await p;
     expect(piped).toBe('hello');
+  });
+});
+
+describe('claudeDriver — turn cap', () => {
+  it('passes a positive integer cap as --max-turns', () => {
+    const inv = claudeDriver.buildInvocation({
+      prompt: 'p',
+      mcpConfigPath: '/m.json',
+      maxTurns: 60,
+    });
+    const at = inv.args.indexOf('--max-turns');
+    expect(at).toBeGreaterThan(-1);
+    expect(inv.args[at + 1]).toBe('60');
+  });
+
+  it('adds no flag without a cap or for a value that is not a positive integer', () => {
+    for (const maxTurns of [undefined, null, 0, -1, 2.5, '60']) {
+      const inv = claudeDriver.buildInvocation({ prompt: 'p', mcpConfigPath: '/m.json', maxTurns });
+      expect(inv.args).not.toContain('--max-turns');
+    }
   });
 });

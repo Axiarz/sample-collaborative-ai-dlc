@@ -278,7 +278,8 @@ export const createNativeTurnOutput = ({
   const parser = createProjectionParser((event) => {
     if (!event || typeof event !== 'object' || Array.isArray(event)) invalid();
     // Incremental ACP presentation is independent of the final interaction record.
-    if (harness === 'kiro' && event.transport === 'kiro-acp-activity' && event.schemaVersion === 1) return;
+    if (harness === 'kiro' && event.transport === 'kiro-acp-activity' && event.schemaVersion === 1)
+      return;
     for (const value of [
       event.thread_id,
       event.session_id,

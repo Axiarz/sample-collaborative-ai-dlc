@@ -24,12 +24,12 @@ git --version    # Expected output: 2.x
 
 To deploy AIDLC Collaborative to AWS, install the following additional tools. For detailed deployment instructions, see [Setup](setup.md).
 
-| Tool                                                                                                                  | Version        | Purpose                                                                               |
-| --------------------------------------------------------------------------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------- |
-| [Terraform](https://developer.hashicorp.com/terraform/install)                                                        | 1.7 or later   | Infrastructure provisioning                                                           |
-| [AWS Command Line Interface (AWS CLI)](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | v2             | AWS resource management and credential handling                                       |
-| [Docker](https://docs.docker.com/get-docker/) (default)                                                               | 20.10 or later | Lambda packaging and container builds; alternatives use the override documented below |
-| [Amazon ECR credential helper](https://github.com/awslabs/amazon-ecr-credential-helper) | Available on `PATH` | Resolve registry credentials when Terraform plans and applies |
+| Tool                                                                                                                  | Version             | Purpose                                                                               |
+| --------------------------------------------------------------------------------------------------------------------- | ------------------- | ------------------------------------------------------------------------------------- |
+| [Terraform](https://developer.hashicorp.com/terraform/install)                                                        | 1.7 or later        | Infrastructure provisioning                                                           |
+| [AWS Command Line Interface (AWS CLI)](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | v2                  | AWS resource management and credential handling                                       |
+| [Docker](https://docs.docker.com/get-docker/) (default)                                                               | 20.10 or later      | Lambda packaging and container builds; alternatives use the override documented below |
+| [Amazon ECR credential helper](https://github.com/awslabs/amazon-ecr-credential-helper)                               | Available on `PATH` | Resolve registry credentials when Terraform plans and applies                         |
 
 Run the following commands to confirm the default Docker-based deployment tools are installed. If you use an alternative container runtime, follow the section below instead of the Docker verification command.
 
@@ -91,14 +91,14 @@ export DOCKER_HOST="unix://$HOME/.rd/docker.sock"
 
 You must also have an AWS account with permissions to manage the following services.
 
-| Category      | Services                                                                                                           |
-| ------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Compute       | AWS Lambda, Amazon ECS with Fargate (Yjs collaboration server), Amazon Bedrock AgentCore (agent runtime)           |
-| Networking    | Amazon VPC, Amazon API Gateway (REST and WebSocket), Amazon CloudFront, Elastic Load Balancing                     |
-| Storage       | Amazon S3, Amazon DynamoDB, Amazon Neptune                                                                         |
-| Security      | Amazon Cognito, AWS Identity and Access Management (IAM), AWS Secrets Manager, AWS Systems Manager Parameter Store |
-| Integration   | Amazon Elastic Container Registry (Amazon ECR)                                                                     |
-| Observability | Amazon CloudWatch Logs                                                                                             |
+| Category      | Services                                                                                                                    |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Compute       | AWS Lambda, Amazon ECS with Fargate (Yjs collaboration server), Amazon Bedrock AgentCore (agent runtime)                    |
+| Networking    | Amazon VPC, Amazon API Gateway (REST and WebSocket), Amazon CloudFront, Elastic Load Balancing                              |
+| Storage       | Amazon S3, Amazon DynamoDB, Amazon Neptune                                                                                  |
+| Security      | Amazon Cognito, AWS Identity and Access Management (IAM), AWS KMS, AWS Secrets Manager, AWS Systems Manager Parameter Store |
+| Integration   | Amazon Elastic Container Registry (Amazon ECR)                                                                              |
+| Observability | Amazon CloudWatch Logs                                                                                                      |
 
 ## Optional tools
 
@@ -146,3 +146,11 @@ The credential name is `bedrock-bearer-token` or `kiro-api-key`. An unset platfo
 AIDLC Collaborative infrastructure still requires valid AWS credentials for deployment and AWS resource management. Agent CLI model calls do not use ambient AWS credentials; they use the effective Kiro or Bedrock key selected through the hierarchy above.
 
 Without an effective agent credential, users can still browse the application and edit draft intents, but credential-backed AI composition, Quorum assists, and intent start are unavailable.
+
+### KMS permissions for infrastructure encryption
+
+The example tfvars leaves `kms_key_arn` empty. DynamoDB remains encrypted at rest with the AWS-owned key, and the deployment principal does not need KMS administration permissions.
+
+To use a customer-managed key for DynamoDB, supply its full key ARN in `kms_key_arn`. The key must be managed outside this Terraform stack. Its key policy must enable IAM authorization for the deployment account (or directly authorize the principals below); an explicit service-principal grant to DynamoDB alone is not sufficient.
+
+The deployment principal needs `kms:DescribeKey`, `kms:Encrypt`, `kms:Decrypt`, `kms:ReEncrypt*`, `kms:GenerateDataKey*`, and `kms:CreateGrant` on the key so Terraform can enable encryption and DynamoDB can establish its resource grants. Application roles receive the same key-scoped permissions from this stack only through DynamoDB (`kms:ViaService`), with `kms:CreateGrant` additionally restricted by `kms:GrantIsForAWSResource`. For a cross-account key policy that does not delegate to account IAM, directly authorize both the deployment principal and the generated application role ARNs.

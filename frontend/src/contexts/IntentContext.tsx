@@ -174,6 +174,9 @@ export interface IntentContextValue {
   /** Steering: restart the run from an earlier stage. Guidance optional — with
    *  it a corrective rewind, without it a plain retry of the stage + rest. */
   rewindIntent: (fromStageId: string, guidance?: string) => Promise<void>;
+  /** Recovery: re-attempt the durable callback for an already-recorded gate
+   *  answer (`intent.resumeRequired`). Idempotent. */
+  resumeIntent: () => Promise<void>;
 }
 
 // ── Module-level stale-while-revalidate cache ───────────────────────────────
@@ -185,10 +188,17 @@ const INTENT_CACHE_MAX = 20;
 interface IntentCacheEntry {
   detail: IntentDetail;
   compiled: CompiledWorkflow | null;
+  compiledKey: string | null;
   workflowPhases: PhaseNode[] | null;
 }
 
+interface CompiledCacheEntry {
+  intentKey: string;
+  request: Promise<CompiledWorkflow>;
+}
+
 const intentCache = new Map<string, IntentCacheEntry>();
+const compiledCache = new Map<string, CompiledCacheEntry>();
 
 function intentCacheKey(projectId: string, intentId: string): string {
   return `${projectId}#${intentId}`;
@@ -208,45 +218,166 @@ function trimIntentCache() {
   while (intentCache.size > INTENT_CACHE_MAX) {
     const oldest = intentCache.keys().next().value!;
     intentCache.delete(oldest);
+    deleteCompiledForIntent(oldest);
   }
+}
+
+function compiledCacheKey(
+  projectId: string,
+  intentId: string,
+  workflowId: string,
+  workflowVersion: number | undefined,
+  releaseId: string | undefined,
+  importerRevision: number | undefined,
+): string {
+  return [
+    projectId,
+    intentId,
+    workflowId,
+    workflowVersion ?? '',
+    releaseId ?? '',
+    importerRevision ?? '',
+  ].join('#');
+}
+
+function deleteCompiledForIntent(intentKey: string, exceptKey?: string) {
+  for (const [key, entry] of compiledCache) {
+    if (entry.intentKey === intentKey && key !== exceptKey) compiledCache.delete(key);
+  }
+}
+
+function trimCompiledCache() {
+  while (compiledCache.size > INTENT_CACHE_MAX) {
+    const oldest = compiledCache.keys().next().value!;
+    compiledCache.delete(oldest);
+  }
+}
+
+function getPinnedCompiled(
+  key: string,
+  intentKey: string,
+  workflowId: string,
+  workflowVersion: number | undefined,
+  releaseId: string | undefined,
+  importerRevision: number | undefined,
+  existingIntent?: { projectId: string; intentId: string },
+): Promise<CompiledWorkflow> {
+  const cached = compiledCache.get(key);
+  if (cached) {
+    compiledCache.delete(key);
+    compiledCache.set(key, cached);
+    return cached.request;
+  }
+
+  let entry: CompiledCacheEntry;
+  const request = workflowsService
+    .compiled(workflowId, workflowVersion, releaseId, importerRevision, existingIntent)
+    .catch((error) => {
+      if (compiledCache.get(key) === entry) compiledCache.delete(key);
+      throw error;
+    });
+  entry = { intentKey, request };
+  compiledCache.set(key, entry);
+  trimCompiledCache();
+  return request;
 }
 
 /** Clear the module-level intent cache (for test isolation). */
 export function clearIntentCache() {
   intentCache.clear();
+  compiledCache.clear();
 }
 
 const IntentContext = createContext<IntentContextValue | undefined>(undefined);
 
-export function IntentProvider({ children, onAgentFocus, backend = 'platform' }: {
-  children: ReactNode; onAgentFocus?: () => void; backend?: 'platform' | 'native';
+export function IntentProvider({
+  children,
+  onAgentFocus,
+  backend = 'platform',
+}: {
+  children: ReactNode;
+  onAgentFocus?: () => void;
+  backend?: 'platform' | 'native';
 }) {
   const { projectId = '', intentId = '' } = useParams();
   if (backend === 'native' && (!projectId || !intentId)) return <>{children}</>;
-  return backend === 'native' ? <NativeIntentAdapterProvider key={JSON.stringify([projectId,intentId,currentSessionEpoch()])} onAgentFocus={onAgentFocus}>{children}</NativeIntentAdapterProvider>
-    : <PlatformIntentAdapterProvider onAgentFocus={onAgentFocus}>{children}</PlatformIntentAdapterProvider>;
+  return backend === 'native' ? (
+    <NativeIntentAdapterProvider
+      key={JSON.stringify([projectId, intentId, currentSessionEpoch()])}
+      onAgentFocus={onAgentFocus}
+    >
+      {children}
+    </NativeIntentAdapterProvider>
+  ) : (
+    <PlatformIntentAdapterProvider onAgentFocus={onAgentFocus}>
+      {children}
+    </PlatformIntentAdapterProvider>
+  );
 }
 
-function NativeIntentAdapterProvider({children,onAgentFocus}: {children: ReactNode; onAgentFocus?: () => void}) {
-  const {projectId = '',intentId = ''} = useParams();
-  const nativeWorkspace = useNativeIntentAdapter(projectId,intentId);
+function NativeIntentAdapterProvider({
+  children,
+  onAgentFocus,
+}: {
+  children: ReactNode;
+  onAgentFocus?: () => void;
+}) {
+  const { projectId = '', intentId = '' } = useParams();
+  const nativeWorkspace = useNativeIntentAdapter(projectId, intentId);
   const activity = useNativeActivity(nativeWorkspace);
-  const ensureOutputs = useCallback(() => { void activity.replay(); }, [activity.replay]);
-  const [agentFocus,setAgentFocus] = useState<AgentFocusRequest | null>(null);
-  const [selectedStageId,setSelectedStageId] = useState<string | null>(null);
-  const unsupported = async (): Promise<never> => { throw new Error('This action is not supported by native execution'); };
+  const ensureOutputs = useCallback(() => {
+    void activity.replay();
+  }, [activity.replay]);
+  const [agentFocus, setAgentFocus] = useState<AgentFocusRequest | null>(null);
+  const [selectedStageId, setSelectedStageId] = useState<string | null>(null);
+  const unsupported = async (): Promise<never> => {
+    throw new Error('This action is not supported by native execution');
+  };
   const value: IntentContextValue = {
-    executionBackend:'native', nativeWorkspace, projectId,intentId, detail:null,compiled:null,
-    loading:!nativeWorkspace.intent && !nativeWorkspace.error,error:nativeWorkspace.error,
-    workflowPhases:null,phaseNameOf:value=>value,initializationPhasePaths:new Set(),currentPhasePath:null,
-    stageRows:[],stageEdges:[],gates:[],pendingGates:[],steering:[],sensorsByStage:new Map(),artifactsByStage:new Map(),
-    outputRows:new Map([[INTENT_OUTPUT_KEY,activity.rows]]),
-    outputBuffers:new Map([[INTENT_OUTPUT_KEY,activity.rows.map(row=>row.content).join('')]]),
-    outputVersion:activity.rows.length,stageNameOf:()=> 'Agent activity',
-    ensureOutputs,outputPaneStatus:()=>activity.loading?'loading':'seeded',
-    selectedStageId,setSelectedStageId,agentFocus,focusOutput:()=> {setAgentFocus(previous=>({key:INTENT_OUTPUT_KEY,seq:(previous?.seq??0)+1}));onAgentFocus?.();},
-    previewArtifactId:null,previewItemId:null,previewSeq:0,openArtifactPreview:()=>{},openItemPreview:()=>{},
-    reload:nativeWorkspace.refresh,answerGate:unsupported,reviseGate:unsupported,cancelIntent:unsupported,deleteIntent:unsupported,rewindIntent:unsupported,
+    executionBackend: 'native',
+    nativeWorkspace,
+    projectId,
+    intentId,
+    detail: null,
+    compiled: null,
+    loading: !nativeWorkspace.intent && !nativeWorkspace.error,
+    error: nativeWorkspace.error,
+    workflowPhases: null,
+    phaseNameOf: (value) => value,
+    initializationPhasePaths: new Set(),
+    currentPhasePath: null,
+    stageRows: [],
+    stageEdges: [],
+    gates: [],
+    pendingGates: [],
+    steering: [],
+    sensorsByStage: new Map(),
+    artifactsByStage: new Map(),
+    outputRows: new Map([[INTENT_OUTPUT_KEY, activity.rows]]),
+    outputBuffers: new Map([[INTENT_OUTPUT_KEY, activity.rows.map((row) => row.content).join('')]]),
+    outputVersion: activity.rows.length,
+    stageNameOf: () => 'Agent activity',
+    ensureOutputs,
+    outputPaneStatus: () => (activity.loading ? 'loading' : 'seeded'),
+    selectedStageId,
+    setSelectedStageId,
+    agentFocus,
+    focusOutput: () => {
+      setAgentFocus((previous) => ({ key: INTENT_OUTPUT_KEY, seq: (previous?.seq ?? 0) + 1 }));
+      onAgentFocus?.();
+    },
+    previewArtifactId: null,
+    previewItemId: null,
+    previewSeq: 0,
+    openArtifactPreview: () => {},
+    openItemPreview: () => {},
+    reload: nativeWorkspace.refresh,
+    answerGate: unsupported,
+    reviseGate: unsupported,
+    cancelIntent: unsupported,
+    resumeIntent: unsupported,
+    deleteIntent: unsupported,
+    rewindIntent: unsupported,
   };
   return <IntentContext.Provider value={value}>{children}</IntentContext.Provider>;
 }
@@ -307,21 +438,86 @@ function PlatformIntentAdapterProvider({
       setLiveGates(new Map(dto.gates.map((g) => [g.humanTaskId, g])));
 
       const cacheKey = intentCacheKey(projectId, intentId);
-      const prevEntry = intentCache.get(cacheKey);
+      const prevEntry = intentCacheGet(cacheKey);
+      const workflowId = dto.intent.workflowId;
+      const releasePin = dto.intent.methodologyRelease;
+      const releasePinned = Boolean(releasePin);
+      const releaseId = releasePin?.releaseId;
+      const importerRevision = releasePin?.importerRevision;
+      const compiledKey = workflowId
+        ? compiledCacheKey(
+            projectId,
+            intentId,
+            workflowId,
+            dto.intent.workflowVersion ?? undefined,
+            releaseId,
+            importerRevision,
+          )
+        : null;
+      // Only pinned intents carry a compile identity. Unpinned entries keep a
+      // null key so their reloads behave as before: the previous compiled
+      // workflow stays visible until the refetch replaces it.
+      const pinnedCompiledKey = releasePinned ? compiledKey : null;
+      deleteCompiledForIntent(cacheKey, pinnedCompiledKey ?? undefined);
 
-      if (dto.intent.workflowId) {
-        workflowsService
-          .compiled(dto.intent.workflowId, dto.intent.workflowVersion ?? undefined)
+      if (releasePinned) {
+        const sameCompileIdentity = Boolean(
+          pinnedCompiledKey && prevEntry?.compiledKey === pinnedCompiledKey,
+        );
+        const cachedCompiled = sameCompileIdentity ? (prevEntry?.compiled ?? null) : null;
+        intentCache.set(cacheKey, {
+          detail: dto,
+          compiled: cachedCompiled,
+          compiledKey: pinnedCompiledKey,
+          workflowPhases: sameCompileIdentity ? (prevEntry?.workflowPhases ?? null) : null,
+        });
+        setCompiled(cachedCompiled);
+        if (!sameCompileIdentity) setWorkflowPhases(null);
+        else if (cachedCompiled) setWorkflowPhases(cachedCompiled.phases ?? []);
+      } else {
+        intentCache.set(cacheKey, {
+          detail: dto,
+          compiled: prevEntry?.compiled ?? null,
+          compiledKey: null,
+          workflowPhases: prevEntry?.workflowPhases ?? null,
+        });
+      }
+      trimIntentCache();
+
+      if (workflowId) {
+        const compileRequest =
+          releasePinned && compiledKey
+            ? getPinnedCompiled(
+                compiledKey,
+                cacheKey,
+                workflowId,
+                dto.intent.workflowVersion ?? undefined,
+                releaseId,
+                importerRevision,
+                { projectId, intentId },
+              )
+            : workflowsService.compiled(
+                workflowId,
+                dto.intent.workflowVersion ?? undefined,
+                releaseId,
+                importerRevision,
+              );
+        compileRequest
           .then((c) => {
             if (activeIntentRef.current !== intentId) return;
-            setCompiled(c);
             const entry = intentCache.get(cacheKey);
-            if (entry) entry.compiled = c;
+            if (!entry || entry.compiledKey !== pinnedCompiledKey) return;
+            setCompiled(c);
+            entry.compiled = c;
+            if (releasePinned) {
+              entry.workflowPhases = c.phases ?? [];
+              setWorkflowPhases(c.phases ?? []);
+            }
           })
           .catch(() => {});
 
         const workflowKey = `${dto.intent.workflowId}@${dto.intent.workflowVersion ?? ''}`;
-        if (fetchedWorkflowKeyRef.current !== workflowKey) {
+        if (!releasePinned && fetchedWorkflowKeyRef.current !== workflowKey) {
           fetchedWorkflowKeyRef.current = workflowKey;
           workflowsService
             .get(dto.intent.workflowId, dto.intent.workflowVersion ?? undefined)
@@ -336,13 +532,6 @@ function PlatformIntentAdapterProvider({
             });
         }
       }
-
-      intentCache.set(cacheKey, {
-        detail: dto,
-        compiled: prevEntry?.compiled ?? null,
-        workflowPhases: prevEntry?.workflowPhases ?? null,
-      });
-      trimIntentCache();
     } catch (err) {
       if (activeIntentRef.current !== intentId) return;
       setError(err instanceof Error ? err.message : 'Failed to load intent');
@@ -545,6 +734,19 @@ function PlatformIntentAdapterProvider({
             status: 'pending',
             prompt: evt.prompt ?? null,
             options: evt.options ?? null,
+            findings: evt.findings ?? null,
+            // The validation gate asks the learnings question only when the
+            // engine says so; keep the flag the API copy may already carry.
+            learningsRitual: evt.learningsRitual ?? existing?.learningsRitual ?? null,
+            // The loop-back target rides only the live event and the API copy;
+            // without it the review panel cannot show the loop-back button.
+            loopBackTarget: evt.loopBackTarget ?? existing?.loopBackTarget ?? null,
+            // The reason and the engine's verdict ride the same event. Without them
+            // a reviewer already on the page sees the generic sentence when the
+            // option is offered, and nothing at all when it is withheld.
+            loopBackReason: evt.loopBackReason ?? existing?.loopBackReason ?? null,
+            loopBackStatus: evt.loopBackStatus ?? existing?.loopBackStatus ?? null,
+            loopBackNote: evt.loopBackNote ?? existing?.loopBackNote ?? null,
             questions:
               typeof evt.questions === 'string'
                 ? evt.questions
@@ -661,7 +863,9 @@ function PlatformIntentAdapterProvider({
   // caller navigates back to the project page.
   const deleteIntent = useCallback(async () => {
     await intentsService.delete(projectId, intentId);
-    intentCache.delete(intentCacheKey(projectId, intentId));
+    const cacheKey = intentCacheKey(projectId, intentId);
+    intentCache.delete(cacheKey);
+    deleteCompiledForIntent(cacheKey);
   }, [projectId, intentId]);
 
   const rewindIntent = useCallback(
@@ -677,6 +881,12 @@ function PlatformIntentAdapterProvider({
     },
     [projectId, intentId, load, detail?.intent],
   );
+
+  const resumeIntent = useCallback(async () => {
+    if (!projectId || !intentId) return;
+    await intentsService.resume(projectId, intentId);
+    await load();
+  }, [projectId, intentId, load]);
 
   const focusOutput = useCallback(
     (stageInstanceId: string | null) => {
@@ -939,6 +1149,7 @@ function PlatformIntentAdapterProvider({
         cancelIntent,
         deleteIntent,
         rewindIntent,
+        resumeIntent,
       }}
     >
       {children}

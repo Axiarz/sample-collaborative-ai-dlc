@@ -73,6 +73,7 @@ describe('git connection identity', () => {
     { userId: 'u1\nsecret' },
     { userId: 'a'.repeat(257) },
     { parameterName: '' },
+    // secretlint-disable-next-line @secretlint/secretlint-rule-basicauth -- synthetic rejection fixture
     { parameterName: 'https://user:secret@example.com/token' },
     { parameterName: '/private/token?secret' },
     { parameterName: '/private/token\n' },

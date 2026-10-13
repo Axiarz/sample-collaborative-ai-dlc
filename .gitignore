@@ -77,3 +77,9 @@ lambda/agentcore/test/a7-mcp-config.json
 
 # Checkout-local short paths for Terraform Unix sockets
 .native-tmp/
+
+# dependency-cruiser generated reports
+reports/dependency/
+
+# Local Python test bytecode
+__pycache__/

@@ -179,10 +179,14 @@ export const startNativeFlightRecorder = ({
     writing = true;
     const temp = `${file}.${bootId}.tmp`;
     try {
-      await fsp.writeFile(temp, JSON.stringify({ schemaVersion: 1, bootId, startedAt, samples: ring }), {
-        mode: 0o600,
-        flag: 'w',
-      });
+      await fsp.writeFile(
+        temp,
+        JSON.stringify({ schemaVersion: 1, bootId, startedAt, samples: ring }),
+        {
+          mode: 0o600,
+          flag: 'w',
+        },
+      );
       await fsp.rename(temp, file);
     } catch {
       // Recording must never affect execution.
@@ -199,7 +203,10 @@ export const startNativeFlightRecorder = ({
       if (!stat.isDirectory() || stat.isSymbolicLink()) return;
       const previous = await readPrevious({ fsp, file });
       if (previous && previous.bootId !== bootId) {
-        const samples = previous.samples.slice(-REPORTED).map(flightSampleFromRecord).filter(Boolean);
+        const samples = previous.samples
+          .slice(-REPORTED)
+          .map(flightSampleFromRecord)
+          .filter(Boolean);
         const lastAt = samples.at(-1)?.t ?? null;
         log({
           type: 'native.flight.previous',
@@ -212,7 +219,8 @@ export const startNativeFlightRecorder = ({
       }
       // A boot killed mid-write leaves its temporary file behind.
       for (const name of await fsp.readdir(dir).catch(() => []))
-        if (/^recorder\.json\.[0-9a-f-]{36}\.tmp$/.test(name)) await fsp.rm(join(dir, name), { force: true }).catch(() => {});
+        if (/^recorder\.json\.[0-9a-f-]{36}\.tmp$/.test(name))
+          await fsp.rm(join(dir, name), { force: true }).catch(() => {});
       ready = true;
     } catch {
       ready = false;
@@ -233,7 +241,18 @@ export const startNativeFlightRecorder = ({
       let next;
       if (abandoned) {
         // Lag-only sample: no /proc or cgroup reads while one is still stuck.
-        next = { t: now(), lag: Math.round(tickLag), used: null, free: null, rss: null, load: null, oom: null, procs: null, scanned: null, k: null };
+        next = {
+          t: now(),
+          lag: Math.round(tickLag),
+          used: null,
+          free: null,
+          rss: null,
+          load: null,
+          oom: null,
+          procs: null,
+          scanned: null,
+          k: null,
+        };
       } else {
         // A scan that never returns must not silence the recorder.
         const scan = sample({ lagMs: tickLag });
@@ -274,7 +293,12 @@ export const startNativeFlightRecorder = ({
     booted: boot,
     stop: () => clearInterval(timer),
     window: () => {
-      const result = { maxLagMs: win.lag, maxUsedMB: win.used, maxProcs: win.procs, samples: win.samples };
+      const result = {
+        maxLagMs: win.lag,
+        maxUsedMB: win.used,
+        maxProcs: win.procs,
+        samples: win.samples,
+      };
       win = { lag: 0, used: 0, procs: 0, samples: 0 };
       return result;
     },

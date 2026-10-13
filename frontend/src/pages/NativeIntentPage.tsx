@@ -4,7 +4,17 @@ import { Badge } from '@/components/ui/badge';
 import { NativeIntentContent } from '@/components/intent/NativeIntentContent';
 import { currentSessionEpoch } from '@/services/sessionExpiry';
 import { useNativeListingVersion } from '@/hooks/useNativeIntents';
-import { useNativeIntentAdapter, type NativeIntentAdapter, labels, harnesses, executionLabels, activeExecution, recoveryMessages, canRecover, imageBlocked } from '@/contexts/adapters/nativeIntent';
+import {
+  useNativeIntentAdapter,
+  type NativeIntentAdapter,
+  labels,
+  harnesses,
+  executionLabels,
+  activeExecution,
+  recoveryMessages,
+  canRecover,
+  imageBlocked,
+} from '@/contexts/adapters/nativeIntent';
 
 export default function NativeIntentPage() {
   const { projectId = '', intentId = '' } = useParams();
@@ -23,7 +33,17 @@ function NativeWorkspace({ projectId, intentId }: { projectId: string; intentId:
 }
 
 export function NativeWorkspaceView({ adapter }: { adapter: NativeIntentAdapter }) {
-  const { projectId, intent, error, preparing, acting, prepare, execute, refresh, publicationFailure } = adapter;
+  const {
+    projectId,
+    intent,
+    error,
+    preparing,
+    acting,
+    prepare,
+    execute,
+    refresh,
+    publicationFailure,
+  } = adapter;
   return (
     <div className="h-full overflow-y-auto p-4">
       <div className="mx-auto max-w-6xl space-y-5">
@@ -102,7 +122,11 @@ export function NativeWorkspaceView({ adapter }: { adapter: NativeIntentAdapter 
                       ? 'Preparation stopped with an error. The run identity and any created resources are retained for diagnosis and retry.'
                       : 'Prepare a separate workspace for this native intent before agent execution is enabled.'}
             </p>
-            {imageBlocked(intent) && <p role="status" className="text-sm text-muted-foreground">Execution is unavailable for this runtime image. Committed results remain readable.</p>}
+            {imageBlocked(intent) && (
+              <p role="status" className="text-sm text-muted-foreground">
+                Execution is unavailable for this runtime image. Committed results remain readable.
+              </p>
+            )}
             <div className="flex flex-wrap gap-2">
               {intent.status !== 'READY' && (
                 <Button onClick={() => void prepare()} disabled={preparing}>
@@ -154,11 +178,7 @@ export function NativeWorkspaceView({ adapter }: { adapter: NativeIntentAdapter 
                   ' Agent execution is not enabled for this draft.'}
               </p>
               <div className="flex flex-wrap gap-2">
-                {[
-                  'Edit artifacts',
-                  'Create unit PR',
-                  'Delete intent',
-                ].map((action) => (
+                {['Edit artifacts', 'Create unit PR', 'Delete intent'].map((action) => (
                   <Button key={action} variant="outline" disabled>
                     {action}
                   </Button>

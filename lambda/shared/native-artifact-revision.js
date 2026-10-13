@@ -135,7 +135,12 @@ export const createNativeArtifactRevisions = ({ ddb, nativeTable, publications }
       return {
         ...describe(located),
         encoding: text === null ? 'binary' : 'utf8',
-        content: text === null ? null : truncated ? Buffer.from(text).subarray(0, maxBytes).toString('utf8') : text,
+        content:
+          text === null
+            ? null
+            : truncated
+              ? Buffer.from(text).subarray(0, maxBytes).toString('utf8')
+              : text,
         truncated,
       };
     },

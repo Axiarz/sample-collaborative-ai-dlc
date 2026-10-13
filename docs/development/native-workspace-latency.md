@@ -23,13 +23,13 @@ code or run a model.
 
 ## Measured sequence
 
-| Attempt | Run C, UTC | Run D, UTC | Result |
-| --- | --- | --- | --- |
-| 1 | 12:36:08 | 12:42:32 | EFS access point created; immediate read is not yet available |
-| 2 | 12:39:08 | 12:45:32 | Access point verified; role created; AgentCore has not yet accepted the new role |
-| 3 | 12:42:08 | 12:48:32 | Same role accepted; runtime created; immediate read is not yet READY |
-| 4 | 12:45:08 | 12:51:32 | Runtime verified; pinned endpoint created; immediate read is not yet READY |
-| 5 | 12:48:08 | 12:54:32 | Endpoint verified; filesystem diagnostic and final authority checks pass |
+| Attempt | Run C, UTC | Run D, UTC | Result                                                                           |
+| ------- | ---------- | ---------- | -------------------------------------------------------------------------------- |
+| 1       | 12:36:08   | 12:42:32   | EFS access point created; immediate read is not yet available                    |
+| 2       | 12:39:08   | 12:45:32   | Access point verified; role created; AgentCore has not yet accepted the new role |
+| 3       | 12:42:08   | 12:48:32   | Same role accepted; runtime created; immediate read is not yet READY             |
+| 4       | 12:45:08   | 12:51:32   | Runtime verified; pinned endpoint created; immediate read is not yet READY       |
+| 5       | 12:48:08   | 12:54:32   | Endpoint verified; filesystem diagnostic and final authority checks pass         |
 
 Run C took **724.269 seconds** from Prepare to the protected READY write.
 Its five Lambda invocations totalled **9.53657 seconds**, plus 0.25812 seconds
@@ -158,10 +158,10 @@ The user restored the member session. Two fresh Codex drafts used the same
 verified v2.9.0 package as the baseline. Each received exactly one authenticated
 Prepare action; neither needed a manual retry.
 
-| Run | Prepare to protected READY | Short retry delays | First diagnostic attempt |
-| --- | --- | --- | --- |
-| E | 261.581 seconds | 6, 12, 22, 30 seconds | Aborted at the 10-second invocation deadline |
-| F | 255.552 seconds | 7, 10, 21, 30 seconds | Aborted at the 10-second invocation deadline |
+| Run | Prepare to protected READY | Short retry delays    | First diagnostic attempt                     |
+| --- | -------------------------- | --------------------- | -------------------------------------------- |
+| E   | 261.581 seconds            | 6, 12, 22, 30 seconds | Aborted at the 10-second invocation deadline |
+| F   | 255.552 seconds            | 7, 10, 21, 30 seconds | Aborted at the 10-second invocation deadline |
 
 All eight visibility changes were confirmed with HTTP 200 and followed by
 short redeliveries. Each aborted diagnostic retained its lease and used the
@@ -216,10 +216,10 @@ Deployed bundle SHA-256:
 Two new member-created Codex drafts used the same verified v2.9.0 package.
 Each received exactly one authenticated Prepare action and no manual retry.
 
-| Run | Prepare to protected READY | Short retry delays | First diagnostic attempt |
-| --- | --- | --- | --- |
-| G | 258.125 seconds | 6, 11, 21, 30 seconds | Aborted at the 20-second invocation deadline |
-| H | 254.400 seconds | 7, 10, 20, 30 seconds | Aborted at the 20-second invocation deadline |
+| Run | Prepare to protected READY | Short retry delays    | First diagnostic attempt                     |
+| --- | -------------------------- | --------------------- | -------------------------------------------- |
+| G   | 258.125 seconds            | 6, 11, 21, 30 seconds | Aborted at the 20-second invocation deadline |
+| H   | 254.400 seconds            | 7, 10, 20, 30 seconds | Aborted at the 20-second invocation deadline |
 
 All eight visibility changes returned HTTP 200. Both runs retained their
 lease after the diagnostic abort, recovered on the conservative 180-second
@@ -305,10 +305,10 @@ ZIP/bundle, 90-second worker, unchanged role/environment, Text logging with
 seven-day retention, 540-second queue and the existing partial-failure mapping.
 The worker was last modified at **07:39:25Z on 29 September**.
 
-| Run | Prepare to protected READY | Short retry delays | Final verification attempt |
-| --- | --- | --- | --- |
-| I | 98.968 seconds | 6, 12, 20, 30 seconds | 23.021 seconds; first diagnostic succeeds |
-| J | 101.093 seconds | 7, 12, 21, 30 seconds | 25.833 seconds; first diagnostic succeeds |
+| Run | Prepare to protected READY | Short retry delays    | Final verification attempt                |
+| --- | -------------------------- | --------------------- | ----------------------------------------- |
+| I   | 98.968 seconds             | 6, 12, 20, 30 seconds | 23.021 seconds; first diagnostic succeeds |
+| J   | 101.093 seconds            | 7, 12, 21, 30 seconds | 25.833 seconds; first diagnostic succeeds |
 
 Both were fresh member-created drafts with one Prepare action each, tested
 sequentially. All eight short visibility changes returned HTTP 200; both reached

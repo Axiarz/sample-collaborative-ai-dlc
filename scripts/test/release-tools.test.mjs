@@ -128,6 +128,12 @@ test('release and main deployments use isolated protected environments and GitHu
   assert.match(deployment, /docker\/setup-qemu-action@[0-9a-f]{40}/);
   assert.match(deployment, /platforms: arm64/);
   assert.match(deployment, /python3 "\$package_script" build --timestamp 0/);
+  assert.match(deployment, /AUTH_DOMAIN: \$\{\{ secrets\.AUTH_DOMAIN \}\}/);
+  assert.match(deployment, /AUTH_MODE: \$\{\{ vars\.AUTH_MODE \}\}/);
+  assert.match(deployment, /SSO_CONFIG: \$\{\{ secrets\.SSO_CONFIG \}\}/);
+  assert.match(deployment, /printf 'auth_domain {10}= %s\\n'/);
+  assert.match(deployment, /node scripts\/sso-config\.mjs "\$sso_input" "\$AUTH_MODE"/);
+  assert.match(deployment, /\$TF_ENVIRONMENT\.sso\.tfvars\.json/);
   assert.match(deployment, /AIDLC_SKIP_NPM_CI: '1'/);
   assert.match(deployment, /deploy-terraform\.sh "\$TF_ENVIRONMENT"/);
   assert.match(deployment, /deploy-frontend\.sh "\$TF_ENVIRONMENT"/);
@@ -260,10 +266,17 @@ test('Yjs image pins readable ownership and modes for non-root runtime files', (
     dockerfile,
     /COPY --chown=node:node --chmod=0644 package\.json package-lock\.json \.\//,
   );
-  assert.match(
-    dockerfile,
-    /COPY --chown=node:node --chmod=0644 server\.js realtime-token\.js doc-name\.js \.\//,
+  const runtimeCopy = dockerfile.match(
+    /^COPY --chown=node:node --chmod=0644 (server\.js .+) \.\/$/m,
   );
+  assert.ok(runtimeCopy, 'runtime sources must be readable by the non-root user');
+  const runtimeFiles = new Set(runtimeCopy[1].split(/\s+/));
+  for (const file of runtimeFiles) {
+    const source = readFileSync(join(dirname(yjsDockerfile), file), 'utf8');
+    for (const [, dependency] of source.matchAll(/['"]\.\/([^'"]+\.js)['"]/g)) {
+      assert.ok(runtimeFiles.has(dependency), `${file} imports unpackaged ${dependency}`);
+    }
+  }
   assert.ok(
     dockerfile.indexOf('--chmod=0644 server.js') < dockerfile.indexOf('USER node'),
     'runtime source permissions must be fixed before dropping privileges',
@@ -415,6 +428,75 @@ test('Terraform plan inspection rejects protected deletion and allows the retire
   assert.match(accepted.stdout, /Allowed retired v1 resource removal/);
 });
 
+test('Terraform teardown preparation only permits existing-resource protection updates', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aidlc-teardown-plan-'));
+  const address = 'module.dynamodb.aws_dynamodb_table.sessions';
+  const allowedPlan = join(dir, 'allowed.json');
+  const createPlan = join(dir, 'create.json');
+  const unrelatedUpdatePlan = join(dir, 'unrelated-update.json');
+  writeJson(allowedPlan, {
+    resource_changes: [
+      {
+        address,
+        type: 'aws_dynamodb_table',
+        change: {
+          actions: ['update'],
+          before: {
+            deletion_protection_enabled: true,
+            name: 'sessions',
+            billing_mode: 'PAY_PER_REQUEST',
+          },
+          after: {
+            deletion_protection_enabled: false,
+            name: 'sessions',
+            billing_mode: 'PAY_PER_REQUEST',
+          },
+        },
+      },
+    ],
+  });
+  writeJson(createPlan, {
+    resource_changes: [
+      {
+        address,
+        type: 'aws_dynamodb_table',
+        change: { actions: ['create'], before: null, after: { name: 'sessions' } },
+      },
+    ],
+  });
+  writeJson(unrelatedUpdatePlan, {
+    resource_changes: [
+      {
+        address,
+        type: 'aws_dynamodb_table',
+        change: {
+          actions: ['update'],
+          before: {
+            deletion_protection_enabled: true,
+            name: 'sessions',
+            billing_mode: 'PROVISIONED',
+          },
+          after: {
+            deletion_protection_enabled: false,
+            name: 'sessions',
+            billing_mode: 'PAY_PER_REQUEST',
+          },
+        },
+      },
+    ],
+  });
+
+  const accepted = run('node', [inspector, allowedPlan, '--deletion-protection-only']);
+  assert.equal(accepted.status, 0, accepted.stderr);
+  assert.match(accepted.stdout, /deletion-protection-only check passed/);
+
+  for (const plan of [createPlan, unrelatedUpdatePlan]) {
+    const rejected = run('node', [inspector, plan, '--deletion-protection-only']);
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /changes other than disabling deletion protection/);
+  }
+});
+
 test('standalone Terraform deployment ends with the application URL', () => {
   const dir = mkdtempSync(join(tmpdir(), 'aidlc-deploy-summary-'));
   const bin = join(dir, 'bin');
@@ -437,7 +519,8 @@ case "$*" in
     ;;
   *"show -json "*) printf '{"resource_changes":[]}\\n' ;;
   *" output -raw application_url"*) printf 'https://app.example.invalid\\n' ;;
-  *" output -raw aws_region"*) printf 'eu-west-1\\n' ;;
+  *"output -raw aws_region"*) printf 'eu-west-1\\n' ;;
+  *"output -raw v2_executions_table_name"*) printf 'auth-summary\\n' ;;
   *" output -raw environment"*) printf 'summary\\n' ;;
   *" output -raw seed_blocks_lambda_name"*) printf 'seed-summary\\n' ;;
 esac
@@ -464,6 +547,17 @@ fi
   writeFileSync(join(bin, 'docker-credential-ecr-login'), '#!/usr/bin/env bash\nexit 0\n', {
     mode: 0o755,
   });
+  writeFileSync(
+    join(bin, 'node'),
+    `#!/usr/bin/env bash
+if [[ "$1" == */initialize-agent-auth-inventory.mjs ]]; then
+  exit 0
+fi
+exec '${process.execPath}' "$@"
+`,
+    { mode: 0o755 },
+  );
+
   const deployed = run(
     'bash',
     [deployTerraform, 'summary', '--plan-file', join(dir, 'summary.tfplan')],
@@ -529,7 +623,8 @@ case "$*" in
   *" output -raw oidc_idp_callback_url"*) printf 'https://broker.example.invalid/oauth2/idpresponse\\n' ;;
   *" output -raw saml_acs_url"*) printf 'https://broker.example.invalid/saml2/idpresponse\\n' ;;
   *" output -raw saml_entity_id"*) printf 'urn:amazon:cognito:sp:eu-west-1_pool\\n' ;;
-  *" output -raw aws_region"*) printf 'eu-west-1\\n' ;;
+  *"output -raw aws_region"*) printf 'eu-west-1\\n' ;;
+  *"output -raw v2_executions_table_name"*) printf 'auth-summary\\n' ;;
   *" output -raw environment"*) printf 'summary\\n' ;;
   *" output -raw seed_blocks_lambda_name"*) printf 'seed-summary\\n' ;;
 esac
@@ -557,6 +652,18 @@ fi
   writeFileSync(join(bin, 'docker-credential-ecr-login'), '#!/usr/bin/env bash\nexit 0\n', {
     mode: 0o755,
   });
+  writeFileSync(
+    join(bin, 'node'),
+    `#!/usr/bin/env bash
+if [[ "$1" == */initialize-agent-auth-inventory.mjs ]]; then
+  printf 'initialize-inventory %s %s\\n' "$AWS_REGION" "$V2_PROCESS_TABLE" >> "$AIDLC_TERRAFORM_LOG"
+  exit "\${AIDLC_FAKE_INVENTORY_EXIT:-0}"
+fi
+exec '${process.execPath}' "$@"
+`,
+    { mode: 0o755 },
+  );
+
   return {
     env: {
       PATH: `${bin}:${process.env.PATH}`,
@@ -635,6 +742,39 @@ test('standalone deployment can skip the post-apply baseline seed', () => {
 
   assert.equal(deployed.status, 0, deployed.stderr);
   assert.match(deployed.stdout, /Skipping AI-DLC default workflow/);
+  assert.doesNotMatch(readFileSync(awsLog, 'utf8'), /lambda invoke/);
+});
+
+test('deployment initializes inventory after apply even when baseline seeding is skipped', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aidlc-deploy-inventory-'));
+  const { env, terraformLog, planFile } = standaloneDeployEnv(dir);
+  const planned = run(
+    'bash',
+    [deployTerraform, 'summary', '--phase', 'plan', '--plan-file', planFile],
+    { env },
+  );
+  assert.equal(planned.status, 0, planned.stderr);
+  assert.doesNotMatch(readFileSync(terraformLog, 'utf8'), /initialize-inventory/);
+  const applied = run(
+    'bash',
+    [deployTerraform, 'summary', '--phase', 'apply', '--plan-file', planFile, '--skip-seed'],
+    { env },
+  );
+  assert.equal(applied.status, 0, applied.stderr);
+  const log = readFileSync(terraformLog, 'utf8');
+  assert.match(log, /initialize-inventory eu-west-1 auth-summary/);
+  assert.ok(log.indexOf(`apply ${planFile}`) < log.indexOf('initialize-inventory'));
+});
+
+test('deployment fails and retains the plan when inventory initialization fails', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aidlc-deploy-inventory-failed-'));
+  const { env, awsLog, planFile } = standaloneDeployEnv(dir);
+  const result = run('bash', [deployTerraform, 'summary', '--plan-file', planFile], {
+    env: { ...env, AIDLC_FAKE_INVENTORY_EXIT: '1' },
+  });
+  assert.equal(result.status, 1);
+  assert.ok(existsSync(planFile));
+  assert.doesNotMatch(result.stdout, /Infrastructure deployment complete/);
   assert.doesNotMatch(readFileSync(awsLog, 'utf8'), /lambda invoke/);
 });
 
@@ -860,7 +1000,22 @@ test('standalone destroy supports custom local environments and backs up state',
     join(bin, 'terraform'),
     `#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$TERRAFORM_LOG"
-[[ "$*" == *" state pull"* ]] && printf '{"version":4}\\n'
+case "$*" in
+  *" console "*) printf 'false\\n' ;;
+  *" state pull"*) printf '{"version":4}\\n' ;;
+  *" state list"*)
+    printf '%s\\n' \\
+      module.neptune.aws_neptune_cluster.main \\
+      module.dynamodb.aws_dynamodb_table.yjs_documents \\
+      module.agentcore.aws_dynamodb_table.v2_executions
+    ;;
+  *" plan "*)
+    for arg in "$@"; do
+      [[ "$arg" == -out=* ]] && : > "\${arg#-out=}"
+    done
+    ;;
+  *" show -json "*) printf '{"resource_changes":[]}\\n' ;;
+esac
 exit 0
 `,
     { mode: 0o755 },
@@ -883,7 +1038,287 @@ exit 0
   const commands = readFileSync(terraformLog, 'utf8');
   assert.match(commands, /init -reconfigure/);
   assert.match(commands, /state pull/);
-  assert.match(commands, /destroy .*local-test\.tfvars -auto-approve/);
+  assert.match(
+    commands,
+    /plan .*local-test\.tfvars -var=deletion_protection=false .*module\.neptune\.aws_neptune_cluster\.main .*module\.dynamodb\.aws_dynamodb_table\.yjs_documents .*module\.agentcore\.aws_dynamodb_table\.v2_executions -out=.*teardown-preparation\.tfplan/,
+  );
+  assert.match(commands, /show -json .*teardown-preparation\.tfplan/);
+  assert.match(commands, /apply -auto-approve .*teardown-preparation\.tfplan/);
+  assert.match(
+    commands,
+    /destroy .*local-test\.tfvars -var=deletion_protection=false -auto-approve/,
+  );
+});
+
+test('standalone destroy refuses production even when confirmation is bypassed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aidlc-destroy-prod-'));
+  const bin = join(dir, 'bin');
+  const config = join(dir, 'config/environments');
+  const terraformLog = join(dir, 'terraform.log');
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(config, { recursive: true });
+  writeFileSync(join(config, 'prod.tfvars'), 'environment = "prod"\n');
+  writeFileSync(join(config, 'prod.s3.tfbackend'), 'bucket = "prod-state"\n');
+  writeFileSync(join(config, 'production-alias.tfvars'), 'environment = "prod"\n');
+  writeFileSync(
+    join(config, 'production-alias.s3.tfbackend'),
+    'bucket = "production-alias-state"\n',
+  );
+  writeFileSync(join(config, 'slash-comment.tfvars'), 'environment = "prod" // production\n');
+  writeFileSync(join(config, 'slash-comment.s3.tfbackend'), 'bucket = "slash-state"\n');
+  writeFileSync(
+    join(config, 'block-comment.tfvars'),
+    '/*\nenvironment = "dev"\n*/\nenvironment = "prod"\n',
+  );
+  writeFileSync(join(config, 'block-comment.s3.tfbackend'), 'bucket = "block-state"\n');
+  writeFileSync(
+    join(bin, 'terraform'),
+    `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$TERRAFORM_LOG"
+if [[ "$*" == *" console "* ]]; then
+  cat >/dev/null
+  printf 'true\\n'
+fi
+exit 0
+`,
+    { mode: 0o755 },
+  );
+
+  for (const environment of ['prod', 'production-alias', 'slash-comment', 'block-comment']) {
+    const destroyed = run('bash', [destroyTerraform, environment, '--yes'], {
+      env: {
+        PATH: `${bin}:${process.env.PATH}`,
+        AIDLC_CONFIG_DIR: join(dir, 'config'),
+        AIDLC_YES: '1',
+        TERRAFORM_LOG: terraformLog,
+      },
+    });
+    assert.equal(destroyed.status, 1);
+    assert.match(destroyed.stderr, /Refusing automated destruction of a production environment/);
+  }
+  const commands = readFileSync(terraformLog, 'utf8');
+  const commandLines = commands.trim().split('\n');
+  assert.equal(commandLines.length, 8);
+  for (let index = 0; index < commandLines.length; index += 2) {
+    assert.match(commandLines[index], / init -reconfigure /);
+    assert.match(commandLines[index + 1], / console /);
+  }
+  assert.doesNotMatch(commands, / plan | apply | destroy | state /);
+});
+
+test('standalone destroy initializes its backend before loading production from auto tfvars', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aidlc-destroy-auto-tfvars-'));
+  const scripts = join(dir, 'scripts');
+  const terraformDir = join(dir, 'terraform');
+  const environments = join(terraformDir, 'environments');
+  const fixtureDestroy = join(scripts, 'destroy.sh');
+  mkdirSync(scripts, { recursive: true });
+  mkdirSync(environments, { recursive: true });
+  cpSync(destroyTerraform, fixtureDestroy);
+  cpSync(join(root, 'terraform/variables.tf'), join(terraformDir, 'variables.tf'));
+  writeFileSync(join(terraformDir, 'backend.tf'), 'terraform {\n  backend "local" {}\n}\n');
+  writeFileSync(join(terraformDir, 'production.auto.tfvars'), 'environment = "prod"\n');
+  writeFileSync(join(environments, 'live.tfvars'), 'aws_region = "us-east-1"\n');
+  writeFileSync(
+    join(environments, 'live.s3.tfbackend'),
+    `path = ${JSON.stringify(join(dir, 'live.tfstate'))}\n`,
+  );
+
+  try {
+    const destroyed = run('bash', [fixtureDestroy, 'live', '--yes'], {
+      env: {
+        TF_CLI_ARGS: '',
+        TF_CLI_ARGS_console: '',
+        TF_CLI_ARGS_plan: '',
+        TF_CLI_ARGS_destroy: '',
+        TF_DATA_DIR: join(dir, '.terraform-data'),
+        TF_IN_AUTOMATION: '1',
+      },
+    });
+
+    assert.equal(destroyed.status, 1, destroyed.stderr);
+    assert.match(destroyed.stderr, /Refusing automated destruction of a production environment/);
+    assert.match(destroyed.stdout, /Initializing Terraform for environment: live/);
+    assert.doesNotMatch(destroyed.stderr, /Backend initialization required/);
+    assert.equal(existsSync(join(dir, '.terraform-data/terraform.tfstate')), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('standalone destroy normalizes command-specific Terraform variable inputs', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aidlc-destroy-command-vars-'));
+  const scripts = join(dir, 'scripts');
+  const terraformDir = join(dir, 'terraform');
+  const environments = join(terraformDir, 'environments');
+  const fixtureDestroy = join(scripts, 'destroy.sh');
+  const backendFile = join(environments, 'live.s3.tfbackend');
+  const autoTfvarsFile = join(terraformDir, 'production.auto.tfvars');
+  const terraformEnv = {
+    ...process.env,
+    TF_CLI_ARGS: '',
+    TF_CLI_ARGS_console: '',
+    TF_CLI_ARGS_plan: '',
+    TF_CLI_ARGS_destroy: '',
+    TF_DATA_DIR: join(dir, '.terraform-data'),
+    TF_IN_AUTOMATION: '1',
+    AIDLC_BACKUP_DIR: join(dir, 'backups'),
+  };
+  mkdirSync(scripts, { recursive: true });
+  mkdirSync(environments, { recursive: true });
+  cpSync(destroyTerraform, fixtureDestroy);
+  cpSync(inspector, join(scripts, 'inspect-terraform-plan.mjs'));
+  writeFileSync(
+    fixtureDestroy,
+    readFileSync(fixtureDestroy, 'utf8').replace(
+      '-target=module.neptune.aws_neptune_cluster.main',
+      '-target=terraform_data.marker',
+    ),
+  );
+  writeFileSync(
+    join(terraformDir, 'main.tf'),
+    [
+      'terraform {',
+      '  backend "local" {}',
+      '}',
+      'variable "environment" {',
+      '  type    = string',
+      '  default = "dev"',
+      '}',
+      'variable "deletion_protection" {',
+      '  type    = bool',
+      '  default = true',
+      '}',
+      'resource "terraform_data" "marker" {',
+      '  input = var.environment',
+      '  lifecycle {',
+      '    precondition {',
+      '      condition     = var.environment != "prod"',
+      '      error_message = "production input reached destructive command"',
+      '    }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'),
+  );
+  writeFileSync(join(environments, 'live.tfvars'), '# environment intentionally omitted\n');
+  writeFileSync(backendFile, `path = ${JSON.stringify(join(dir, 'live.tfstate'))}\n`);
+
+  try {
+    execFileSync(
+      'terraform',
+      [`-chdir=${terraformDir}`, 'init', '-reconfigure', `-backend-config=${backendFile}`],
+      { env: terraformEnv, stdio: 'pipe' },
+    );
+    execFileSync(
+      'terraform',
+      [`-chdir=${terraformDir}`, 'apply', '-auto-approve', '-var=environment=dev'],
+      { env: terraformEnv, stdio: 'pipe' },
+    );
+
+    writeFileSync(autoTfvarsFile, 'environment = "prod"\n');
+    const consoleOverride = run('bash', [fixtureDestroy, 'live', '--yes'], {
+      env: { ...terraformEnv, TF_CLI_ARGS_console: '-var=environment=dev' },
+    });
+    assert.equal(consoleOverride.status, 1, consoleOverride.stderr);
+    assert.match(
+      consoleOverride.stderr,
+      /Refusing automated destruction of a production environment/,
+    );
+    assert.doesNotMatch(consoleOverride.stderr, /production input reached destructive command/);
+    rmSync(autoTfvarsFile);
+
+    const quotedOverrides = run('bash', [fixtureDestroy, 'live', '--yes'], {
+      env: {
+        ...terraformEnv,
+        TF_CLI_ARGS_plan: '-v"ar"=environment=prod',
+        TF_CLI_ARGS_destroy: '-v"ar"=environment=prod',
+      },
+    });
+    assert.equal(quotedOverrides.status, 0, quotedOverrides.stderr);
+    assert.match(quotedOverrides.stdout, /Environment destruction complete/);
+    assert.doesNotMatch(quotedOverrides.stderr, /production input reached destructive command/);
+
+    const state = execFileSync('terraform', [`-chdir=${terraformDir}`, 'state', 'list'], {
+      encoding: 'utf8',
+      env: terraformEnv,
+    });
+    assert.equal(state, '');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('standalone destroy skips protection targets already removed from state', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aidlc-destroy-retry-'));
+  const bin = join(dir, 'bin');
+  const config = join(dir, 'config/environments');
+  const terraformLog = join(dir, 'terraform.log');
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(config, { recursive: true });
+  writeFileSync(join(config, 'retry.tfvars'), 'environment = "retry"\n');
+  writeFileSync(join(config, 'retry.s3.tfbackend'), 'bucket = "retry-state"\n');
+  writeFileSync(
+    join(bin, 'terraform'),
+    `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$TERRAFORM_LOG"
+case "$*" in
+  *" console "*) printf 'false\\n' ;;
+  *" state pull"*) printf '{"version":4}\\n' ;;
+  *" state list"*) printf 'module.dynamodb.aws_dynamodb_table.notifications\\n' ;;
+  *" plan "*)
+    for arg in "$@"; do
+      [[ "$arg" == -out=* ]] && : > "\${arg#-out=}"
+    done
+    ;;
+  *" show -json "*)
+    printf '{"resource_changes":[{"address":"module.dynamodb.aws_dynamodb_table.notifications","type":"aws_dynamodb_table","change":{"actions":["update"],"before":{"deletion_protection_enabled":true},"after":{"deletion_protection_enabled":false}}}]}\\n'
+    ;;
+esac
+exit 0
+`,
+    { mode: 0o755 },
+  );
+
+  const destroyed = run('bash', [destroyTerraform, 'retry', '--yes'], {
+    env: {
+      PATH: `${bin}:${process.env.PATH}`,
+      AIDLC_CONFIG_DIR: join(dir, 'config'),
+      AIDLC_BACKUP_DIR: join(dir, 'backups'),
+      TERRAFORM_LOG: terraformLog,
+    },
+  });
+
+  assert.equal(destroyed.status, 0, destroyed.stderr);
+  assert.match(destroyed.stdout, /Environment destruction complete/);
+  const commands = readFileSync(terraformLog, 'utf8');
+  assert.match(commands, / state list/);
+  assert.match(commands, /plan .*module\.dynamodb\.aws_dynamodb_table\.notifications/);
+  assert.doesNotMatch(commands, /plan .*module\.dynamodb\.aws_dynamodb_table\.sessions/);
+  assert.match(commands, / show -json /);
+  assert.match(commands, / apply /);
+  assert.match(commands, / destroy /);
+});
+
+test('managed destroy refuses production before command or AWS preflight', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aidlc-managed-destroy-prod-'));
+  const configRoot = join(dir, 'config/collaborative-ai-dlc');
+  mkdirSync(configRoot, { recursive: true });
+  writeFileSync(
+    join(configRoot, 'install.conf'),
+    'AIDLC_ENVIRONMENT=prod\nAIDLC_REGION=us-east-1\n',
+  );
+
+  const destroyed = run('bash', [installer, 'destroy', '--yes'], {
+    env: {
+      PATH: '/usr/bin:/bin',
+      XDG_CONFIG_HOME: join(dir, 'config'),
+      XDG_DATA_HOME: join(dir, 'data'),
+    },
+  });
+  assert.equal(destroyed.status, 1);
+  assert.match(destroyed.stderr, /Refusing automated destruction of a production environment/);
+  assert.doesNotMatch(destroyed.stderr, /Missing required command/);
 });
 
 test('installer lists prereleases by default in SemVer order', () => {

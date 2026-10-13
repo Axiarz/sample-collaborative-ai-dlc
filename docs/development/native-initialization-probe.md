@@ -23,12 +23,12 @@ experiment.
 The final run completed **18/18 commands in 34.1 seconds**, from
 11:16:47Z to 11:17:21Z:
 
-| Harness | Native configuration | Doctor failures | Doctor warnings | Filesystem checks |
-| --- | --- | --- | --- | --- |
-| Claude Code | Passed | 0 | 4 | 16 passed |
-| Codex | Passed | 0 | 4 | 18 passed |
-| Kiro CLI | Passed | 0 | 4 | 17 passed |
-| OpenCode | Passed | 0 | 4 | 16 passed |
+| Harness     | Native configuration | Doctor failures | Doctor warnings | Filesystem checks |
+| ----------- | -------------------- | --------------- | --------------- | ----------------- |
+| Claude Code | Passed               | 0               | 4               | 16 passed         |
+| Codex       | Passed               | 0               | 4               | 18 passed         |
+| Kiro CLI    | Passed               | 0               | 4               | 17 passed         |
+| OpenCode    | Passed               | 0               | 4               | 16 passed         |
 
 All doctor commands returned native code 0. The retained warnings concern the
 installed command's login-independent PATH, uncommitted workspace records,

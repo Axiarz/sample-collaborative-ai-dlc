@@ -7,21 +7,21 @@ data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 
 locals {
-  name        = "${var.project_name}-native-runs-${var.environment}"
-  account_id  = data.aws_caller_identity.current.account_id
-  region      = data.aws_region.current.region
-  partition   = data.aws_partition.current.partition
-  role_arn    = "arn:${local.partition}:iam::${local.account_id}:role/native-runs/native_*"
-  runtime_arn = "arn:${local.partition}:bedrock-agentcore:${local.region}:${local.account_id}:runtime/native_*"
-  ap_arn      = "arn:${local.partition}:elasticfilesystem:${local.region}:${local.account_id}:access-point/*"
-  logs_arn    = "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:/aws/bedrock-agentcore/runtimes/native_*"
-  source_path = abspath("${path.module}/../../../../lambda/native-runtime-control")
-  shared_path = abspath("${path.module}/../../../../lambda/shared")
+  name          = "${var.project_name}-native-runs-${var.environment}"
+  account_id    = data.aws_caller_identity.current.account_id
+  region        = data.aws_region.current.region
+  partition     = data.aws_partition.current.partition
+  role_arn      = "arn:${local.partition}:iam::${local.account_id}:role/native-runs/native_*"
+  runtime_arn   = "arn:${local.partition}:bedrock-agentcore:${local.region}:${local.account_id}:runtime/native_*"
+  ap_arn        = "arn:${local.partition}:elasticfilesystem:${local.region}:${local.account_id}:access-point/*"
+  logs_arn      = "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:/aws/bedrock-agentcore/runtimes/native_*"
+  source_path   = abspath("${path.module}/../../../../lambda/native-runtime-control")
+  shared_path   = abspath("${path.module}/../../../../lambda/shared")
   activity_path = abspath("${path.module}/../../../../lambda/agentcore")
   source_hash = sha256(join("", concat([
     for f in sort(fileset(local.shared_path, "**/*.{js,mjs,cjs,json}")) :
     filesha256("${local.shared_path}/${f}")
-  ], [
+    ], [
     # The trusted activity store shares the runtime's output privacy boundary,
     # which imports the existing CLI normalizers. Include transitive inputs.
     for f in concat(["native/activity.js", "output-normalizer.js"], sort(tolist(fileset(local.activity_path, "cli/*.js")))) :
@@ -481,18 +481,18 @@ module "api" {
 }
 
 module "worker" {
-  source        = "terraform-aws-modules/lambda/aws"
-  version       = "~> 8.0"
-  function_name = "${local.name}-provisioner"
-  handler       = "worker.handler"
-  runtime       = "nodejs24.x"
-  architectures = ["arm64"]
-  memory_size   = 512
-  timeout       = 90
-  create_role   = false
-  lambda_role   = aws_iam_role.worker.arn
-  create_package         = false
-  local_existing_package = module.packages["worker"].local_filename
+  source                            = "terraform-aws-modules/lambda/aws"
+  version                           = "~> 8.0"
+  function_name                     = "${local.name}-provisioner"
+  handler                           = "worker.handler"
+  runtime                           = "nodejs24.x"
+  architectures                     = ["arm64"]
+  memory_size                       = 512
+  timeout                           = 90
+  create_role                       = false
+  lambda_role                       = aws_iam_role.worker.arn
+  create_package                    = false
+  local_existing_package            = module.packages["worker"].local_filename
   environment_variables             = local.base_environment
   cloudwatch_logs_retention_in_days = 7
   depends_on = [

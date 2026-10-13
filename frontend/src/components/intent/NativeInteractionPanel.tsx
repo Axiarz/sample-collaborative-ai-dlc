@@ -46,7 +46,9 @@ function useSharedReplyDraft({
   userName: string;
 }) {
   const digest = useNativeCollaborationDigest(intent.projectId, intent.id);
-  const revision = interaction ? { interactionId: interaction.id, sequence: interaction.sequence } : null;
+  const revision = interaction
+    ? { interactionId: interaction.id, sequence: interaction.sequence }
+    : null;
   let docId: string | null = null;
   try {
     docId = open && digest && revision ? nativeReplyDocument(digest, revision) : null;
@@ -129,7 +131,7 @@ export function useNativeReply({
   const awaitingReply =
     intent.executionAvailable === true &&
     intent.execution?.status === 'AWAITING_USER' &&
-    !['revoked','unapproved','unavailable'].includes(intent.execution.imageStatus ?? '') &&
+    !['revoked', 'unapproved', 'unavailable'].includes(intent.execution.imageStatus ?? '') &&
     intent.execution.responsePending !== true &&
     interaction !== null &&
     interaction.id === intent.execution.interactionId &&
@@ -297,7 +299,9 @@ export function useNativeReply({
 
 function ReplyPresence({ users }: { users: Map<number, AwarenessUser> }) {
   if (users.size === 0) return null;
-  const names = Array.from(users.values()).map((user) => user.name).filter(Boolean);
+  const names = Array.from(users.values())
+    .map((user) => user.name)
+    .filter(Boolean);
   return (
     <div className="flex items-center gap-1" aria-label={`Also editing: ${names.join(', ')}`}>
       {Array.from(users.entries()).map(([id, user]) => (
@@ -364,8 +368,8 @@ export function NativeInteractionPanel({
             <p className="text-sm text-muted-foreground">Loading the shared answer…</p>
           )}
           <p className="text-xs text-muted-foreground">
-            Project members choose together; one member submits. The exact option is sent to
-            AI-DLC, which records it in the workflow.
+            Project members choose together; one member submits. The exact option is sent to AI-DLC,
+            which records it in the workflow.
           </p>
           {reply.error && (
             <p role="alert" className="text-sm text-destructive">
@@ -374,85 +378,87 @@ export function NativeInteractionPanel({
           )}
         </section>
       ) : (
-      <form
-        aria-label="Reply to AI-DLC"
-        className="space-y-2"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void reply.submit();
-        }}
-      >
-        <div className="flex items-center justify-between gap-2">
-          <Label htmlFor="native-reply">Reply to AI-DLC</Label>
-          <ReplyPresence users={reply.shared.remoteUsers} />
-        </div>
-        {reply.receipt && reply.text !== reply.receipt.text && (
-          <div className="space-y-2 rounded-md border p-3">
-            <p className="text-sm">A different reply was accepted. Your draft is retained below.</p>
-            <pre aria-label="Accepted reply" className="whitespace-pre-wrap break-words text-sm">
-              {reply.receipt.text}
-            </pre>
-          </div>
-        )}
-        {/* One field for every state: the shared draft while this turn is
-            editable, otherwise the frozen request or the accepted reply. */}
-        <CollaborativeTextarea
-          id="native-reply"
+        <form
           aria-label="Reply to AI-DLC"
-          {...(reply.editable && reply.shared.connected
-            ? { yText: reply.shared.yText, awareness: reply.shared.awareness }
-            : { value: reply.text })}
-          disabled={!reply.editable || !reply.shared.connected}
-          rows={4}
-        />
-        <p id="native-reply-help" className="text-xs text-muted-foreground">
-          Project members edit this draft together; one member sends it to continue this
-          session. {bytes.toLocaleString()} / {NATIVE_REPLY_MAX_BYTES.toLocaleString()} bytes.
-          Drafts are kept while someone has this turn open, not after everyone leaves.
-        </p>
-        {reply.shared.diverged && (
-          <p role="status" className="text-xs text-muted-foreground">
-            The shared draft changed after you sent. Retry sends the text shown here.
+          className="space-y-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void reply.submit();
+          }}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor="native-reply">Reply to AI-DLC</Label>
+            <ReplyPresence users={reply.shared.remoteUsers} />
+          </div>
+          {reply.receipt && reply.text !== reply.receipt.text && (
+            <div className="space-y-2 rounded-md border p-3">
+              <p className="text-sm">
+                A different reply was accepted. Your draft is retained below.
+              </p>
+              <pre aria-label="Accepted reply" className="whitespace-pre-wrap break-words text-sm">
+                {reply.receipt.text}
+              </pre>
+            </div>
+          )}
+          {/* One field for every state: the shared draft while this turn is
+            editable, otherwise the frozen request or the accepted reply. */}
+          <CollaborativeTextarea
+            id="native-reply"
+            aria-label="Reply to AI-DLC"
+            {...(reply.editable && reply.shared.connected
+              ? { yText: reply.shared.yText, awareness: reply.shared.awareness }
+              : { value: reply.text })}
+            disabled={!reply.editable || !reply.shared.connected}
+            rows={4}
+          />
+          <p id="native-reply-help" className="text-xs text-muted-foreground">
+            Project members edit this draft together; one member sends it to continue this session.{' '}
+            {bytes.toLocaleString()} / {NATIVE_REPLY_MAX_BYTES.toLocaleString()} bytes. Drafts are
+            kept while someone has this turn open, not after everyone leaves.
           </p>
-        )}
-        {bytes > NATIVE_REPLY_MAX_BYTES && (
-          <p role="alert" className="text-sm text-destructive">
-            Shorten your reply to 16 KiB or less.
-          </p>
-        )}
-        {reply.error && (
-          <p role="alert" className="text-sm text-destructive">
-            {reply.error}
-          </p>
-        )}
-        {reply.receipt && (
-          <p role="status" className="text-sm text-muted-foreground">
-            {recovery
-              ? 'Your reply is saved.'
-              : stopped
-                ? 'Reply accepted. Execution is no longer continuing.'
-                : executionStatus === 'CANCEL_REQUESTED'
-                  ? 'Reply accepted. Cancellation requested.'
-                  : reply.receipt.deliveryStatus === 'pending'
-                    ? 'Reply accepted. Delivery pending.'
-                    : 'Reply delivered. Waiting for the next AI-DLC response.'}
-          </p>
-        )}
-        {!reply.receipt && !reply.editable && reply.state === 'idle' && (
-          <p className="text-sm text-muted-foreground">
-            {recovery
-              ? 'Replying is paused while this session needs recovery.'
-              : 'Replying is unavailable for this turn. Refresh status to see the current execution.'}
-          </p>
-        )}
-        <Button type="submit" disabled={!reply.canSubmit}>
-          {reply.state === 'sending'
-            ? 'Sending reply…'
-            : reply.state === 'uncertain'
-              ? 'Retry same reply'
-              : 'Send reply'}
-        </Button>
-      </form>
+          {reply.shared.diverged && (
+            <p role="status" className="text-xs text-muted-foreground">
+              The shared draft changed after you sent. Retry sends the text shown here.
+            </p>
+          )}
+          {bytes > NATIVE_REPLY_MAX_BYTES && (
+            <p role="alert" className="text-sm text-destructive">
+              Shorten your reply to 16 KiB or less.
+            </p>
+          )}
+          {reply.error && (
+            <p role="alert" className="text-sm text-destructive">
+              {reply.error}
+            </p>
+          )}
+          {reply.receipt && (
+            <p role="status" className="text-sm text-muted-foreground">
+              {recovery
+                ? 'Your reply is saved.'
+                : stopped
+                  ? 'Reply accepted. Execution is no longer continuing.'
+                  : executionStatus === 'CANCEL_REQUESTED'
+                    ? 'Reply accepted. Cancellation requested.'
+                    : reply.receipt.deliveryStatus === 'pending'
+                      ? 'Reply accepted. Delivery pending.'
+                      : 'Reply delivered. Waiting for the next AI-DLC response.'}
+            </p>
+          )}
+          {!reply.receipt && !reply.editable && reply.state === 'idle' && (
+            <p className="text-sm text-muted-foreground">
+              {recovery
+                ? 'Replying is paused while this session needs recovery.'
+                : 'Replying is unavailable for this turn. Refresh status to see the current execution.'}
+            </p>
+          )}
+          <Button type="submit" disabled={!reply.canSubmit}>
+            {reply.state === 'sending'
+              ? 'Sending reply…'
+              : reply.state === 'uncertain'
+                ? 'Retry same reply'
+                : 'Send reply'}
+          </Button>
+        </form>
       )}
     </section>
   );

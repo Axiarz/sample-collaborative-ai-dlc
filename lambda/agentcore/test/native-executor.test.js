@@ -1112,7 +1112,9 @@ describe('native invocation and first-wait classification', () => {
       expect(args[at - 1]).toBe('-c');
     }
     for (const harness of ['claude', 'kiro', 'opencode'])
-      expect(nativeExecutionInvocation({ ...base, harness }).args.join(' ')).not.toContain('max_threads');
+      expect(nativeExecutionInvocation({ ...base, harness }).args.join(' ')).not.toContain(
+        'max_threads',
+      );
   });
 
   const asSnapshot = (files = nativeFiles) => ({
@@ -1231,7 +1233,17 @@ describe('native cold recovery', () => {
       [join(packages, 'aidlc'), ['use', '2.9.0', '--from', packages, '--offline', '--json']],
       [
         join(root, 'machine/bin/aidlc'),
-        ['config', '--pin', '2.9.0', '--project-dir', join(root, 'project'), '--from', packages, '--offline', '--json'],
+        [
+          'config',
+          '--pin',
+          '2.9.0',
+          '--project-dir',
+          join(root, 'project'),
+          '--from',
+          packages,
+          '--offline',
+          '--json',
+        ],
       ],
     ]);
     // Both run against the rebuilt machine data, offline, never with model credentials.
@@ -1259,4 +1271,3 @@ describe('native cold recovery', () => {
     });
   });
 });
-

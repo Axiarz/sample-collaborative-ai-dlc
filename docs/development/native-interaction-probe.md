@@ -17,8 +17,7 @@ Terraform state **1118**, image tag **`15c34685dcbc7627`** and digest
 are verified. **54 independent deployment checks passed**, including deployed
 Lambda ZIP/bundle hashes, actual runtime sources, CLI versions, Tini, UID 1000,
 launcher and EFS. Role, filesystem and network configuration are unchanged.
-Computed runtime-version metadata remains 109; control API/source bytes identify
-110. The separate source-check runtime was stopped with HTTP 200.
+Computed runtime-version metadata remains 109; control API/source bytes identify 110. The separate source-check runtime was stopped with HTTP 200.
 
 Probe **`996b26a8-a4ad-419e-850e-df936d2fa588`** passed four native setup commands
 and **17 filesystem checks**. The first turn returned three native questions and
@@ -327,10 +326,10 @@ the control API reported **107 READY** with the correct image digest.
 
 ### Claude/Codex verification — historical runtime-107 snapshot
 
-| Harness | Observation on runtime 107 | Qualification remaining |
-| --- | --- | --- |
-| Claude | Four setup commands/16 checks passed; title question, Blue Lake answer and follow-up choice returned in the same structured/native session. Both turns exit 0 with cleanup; Q2–Q4 blank | SessionEnd cancellation subsequently resolved on runtime 108; ignored permission entries and broader pilot qualification remain open |
-| Codex | Four setup commands/18 checks passed; title question, Blue Lake answer and follow-up choice returned in the same structured/native session. Both turns exit 0 with cleanup; Q2–Q5 blank; prior unsupported-tool error absent | Broader native integration, approval and recovery qualification |
+| Harness | Observation on runtime 107                                                                                                                                                                                                   | Qualification remaining                                                                                                              |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Claude  | Four setup commands/16 checks passed; title question, Blue Lake answer and follow-up choice returned in the same structured/native session. Both turns exit 0 with cleanup; Q2–Q4 blank                                      | SessionEnd cancellation subsequently resolved on runtime 108; ignored permission entries and broader pilot qualification remain open |
+| Codex   | Four setup commands/18 checks passed; title question, Blue Lake answer and follow-up choice returned in the same structured/native session. Both turns exit 0 with cleanup; Q2–Q5 blank; prior unsupported-tool error absent | Broader native integration, approval and recovery qualification                                                                      |
 
 Claude's first question returned at **11:35:34Z** with Q1–Q4 blank. Both turns'
 structured events and native session identify
@@ -451,12 +450,12 @@ All four runtime-106 probes passed initialization: **16 commands and 67
 filesystem checks** (Codex 18, Claude 16, Kiro 17, OpenCode 16). Each probe ran
 its own four setup commands; the earlier shared-install diagnostic used 13.
 
-| Harness | Live result | Qualification still open |
-| --- | --- | --- |
-| Codex | Title question returned; Blue Lake recorded in the same native session; both turns exit 0 with cleanup | Next-question delivery failed on runtime 106; runtime-107 overrides subsequently passed the scoped interaction experiment |
-| Claude | Four setup commands/16 checks passed; API 400 rejects CLI 2.1.246; exit 1 with cleanup, no model response | Runtime-107 upgrade/scoped interaction and runtime-108 SessionEnd completion subsequently passed; permission warnings and broader qualification remain |
-| Kiro | Title question, Blue Lake answer and next Q2/Q3 returned through the same native question file; both turns exit 0 with cleanup | Conversation-history resume and exact model fidelity |
-| OpenCode | Title question returned; Blue Lake recorded; follow-up question returned in the same native and structured-event session; both turns exit 0 with cleanup and empty diagnostics | Shared application integration, human approval and cold recovery |
+| Harness  | Live result                                                                                                                                                                    | Qualification still open                                                                                                                               |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Codex    | Title question returned; Blue Lake recorded in the same native session; both turns exit 0 with cleanup                                                                         | Next-question delivery failed on runtime 106; runtime-107 overrides subsequently passed the scoped interaction experiment                              |
+| Claude   | Four setup commands/16 checks passed; API 400 rejects CLI 2.1.246; exit 1 with cleanup, no model response                                                                      | Runtime-107 upgrade/scoped interaction and runtime-108 SessionEnd completion subsequently passed; permission warnings and broader qualification remain |
+| Kiro     | Title question, Blue Lake answer and next Q2/Q3 returned through the same native question file; both turns exit 0 with cleanup                                                 | Conversation-history resume and exact model fidelity                                                                                                   |
+| OpenCode | Title question returned; Blue Lake recorded; follow-up question returned in the same native and structured-event session; both turns exit 0 with cleanup and empty diagnostics | Shared application integration, human approval and cold recovery                                                                                       |
 
 Codex probe `ca7072b4-5d4a-4011-90a7-2e6123a984d1` returned the ordinary title
 question with a blank native Q1. The separately submitted answer resumed the
@@ -737,11 +736,11 @@ hard links. Synthetic filesystem-check files were removed after the check.
 The actual signed v2.9.0 package was then tested in two layouts, rechecking all
 five package assets against the pinned byte sizes and SHA-256 hashes:
 
-| Layout | Observed result |
-| --- | --- |
-| Installation and project on the persistent mount | Original operator probe fails in `aidlc use` |
-| Installation on local disk, project on the persistent mount | `aidlc use` succeeds; project `config --pin` fails on the same hard-link lock for all four harnesses |
-| Installation and projects on local disk | Shared installation plus all four harness initializations succeed: 13 commands and 67 filesystem checks |
+| Layout                                                      | Observed result                                                                                         |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Installation and project on the persistent mount            | Original operator probe fails in `aidlc use`                                                            |
+| Installation on local disk, project on the persistent mount | `aidlc use` succeeds; project `config --pin` fails on the same hard-link lock for all four harnesses    |
+| Installation and projects on local disk                     | Shared installation plus all four harness initializations succeed: 13 commands and 67 filesystem checks |
 
 The successful configuration counts are Codex **18**, Claude **16**, Kiro **17**
 and OpenCode **16** filesystem checks. These are actual AgentCore results, not

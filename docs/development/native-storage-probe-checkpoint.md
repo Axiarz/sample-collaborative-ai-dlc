@@ -55,16 +55,16 @@ temporary probe, and submit one real public import through the existing UI.
 
 At 12:03 UTC on 22 September, the corrected probe reached 13 of 20 cases:
 
-| Observed operation | Actual AWS result |
-| --- | --- |
-| Existing source creation attempt | HTTP 412; expected `INITIAL_CREATE_REUSED`, not a new-create success |
-| Current and pinned reads | HTTP 200; original version and bytes |
-| Identical/conflicting conditional overwrites | HTTP 412 |
-| Missing condition, replacement condition, unconditional overwrite | HTTP 403 |
-| Unsupported fixed condition value | HTTP 501; inconclusive, continued as intended |
-| Copies with/without the destination condition | HTTP 403 |
-| Ordinary multipart initiation | HTTP 403 |
-| Multipart initiation with a signed `If-None-Match: *` header | **HTTP 200; unexpected mutation, stopped immediately** |
+| Observed operation                                                | Actual AWS result                                                    |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Existing source creation attempt                                  | HTTP 412; expected `INITIAL_CREATE_REUSED`, not a new-create success |
+| Current and pinned reads                                          | HTTP 200; original version and bytes                                 |
+| Identical/conflicting conditional overwrites                      | HTTP 412                                                             |
+| Missing condition, replacement condition, unconditional overwrite | HTTP 403                                                             |
+| Unsupported fixed condition value                                 | HTTP 501; inconclusive, continued as intended                        |
+| Copies with/without the destination condition                     | HTTP 403                                                             |
+| Ordinary multipart initiation                                     | HTTP 403                                                             |
+| Multipart initiation with a signed `If-None-Match: *` header      | **HTTP 200; unexpected mutation, stopped immediately**               |
 
 The remaining seven cases were not executed. The failure shows that requiring
 the header does not itself prevent multipart initiation. Independent reads
@@ -132,13 +132,13 @@ The deployed probe ran on 22 September at 09:04 UTC using the verified
 for inspection but its invocation dry run was denied. No permission changes
 were made.
 
-| Observed operation | Actual AWS result |
-| --- | --- |
-| Conditional creation | HTTP 200; one 32-byte version created |
-| Current and exact-version reads | HTTP 200; expected bytes and encryption |
-| Identical and conflicting conditional overwrites | HTTP 412 `PreconditionFailed` |
-| Write without the creation condition | HTTP 403 `AccessDenied` |
-| Fixed unsupported condition value | HTTP 501 `NotImplemented`; inconclusive, probe stopped |
+| Observed operation                               | Actual AWS result                                      |
+| ------------------------------------------------ | ------------------------------------------------------ |
+| Conditional creation                             | HTTP 200; one 32-byte version created                  |
+| Current and exact-version reads                  | HTTP 200; expected bytes and encryption                |
+| Identical and conflicting conditional overwrites | HTTP 412 `PreconditionFailed`                          |
+| Write without the creation condition             | HTTP 403 `AccessDenied`                                |
+| Fixed unsupported condition value                | HTTP 501 `NotImplemented`; inconclusive, probe stopped |
 
 The first six cases passed; the seventh stopped the probe before its remaining
 13 cases. This is partial live evidence, not completed storage qualification.
@@ -332,11 +332,11 @@ SHA256:
 
 The reviewed cloud changes are exactly:
 
-| Resource | Change |
-| --- | --- |
-| Native package worker | Increase memory from 2,048 to 8,192 MiB and repackage the archive after the source-hash correction. Its compiled `index.mjs` bytes match the previous deployed archive. |
-| `collaborative-ai-dlc-native-storage-probe-dev` | Create the temporary ARM64 diagnostic using the worker's existing role and network configuration. |
-| Probe log group | Create with seven-day retention. Export needed evidence before teardown. |
+| Resource                                        | Change                                                                                                                                                                  |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Native package worker                           | Increase memory from 2,048 to 8,192 MiB and repackage the archive after the source-hash correction. Its compiled `index.mjs` bytes match the previous deployed archive. |
+| `collaborative-ai-dlc-native-storage-probe-dev` | Create the temporary ARM64 diagnostic using the worker's existing role and network configuration.                                                                       |
+| Probe log group                                 | Create with seven-day retention. Export needed evidence before teardown.                                                                                                |
 
 There are no cloud resource deletions/replacements, IAM changes, S3 changes,
 database changes, AgentCore changes or import activation. Terraform also

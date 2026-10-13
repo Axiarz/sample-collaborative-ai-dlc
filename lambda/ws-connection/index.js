@@ -59,7 +59,8 @@ export const handler = async (event, context) => {
     const access = verifyRealtimeAccess({
       token: docToken,
       secret: await getSecret(),
-      requiredScope: requiredNativeScopeForChannel(documentId) ?? requiredScopeForChannel(documentId),
+      requiredScope:
+        requiredNativeScopeForChannel(documentId) ?? requiredScopeForChannel(documentId),
       sub: event.requestContext.authorizer?.userId,
     });
     if (!access.ok) {

@@ -414,50 +414,78 @@ describe('native activity terminal drain', () => {
     const f = await make();
     await f.dispatch();
     const log = createNativeActivityLog({ writerGeneration: 1 });
-    const turn = log.turn({ sequence: 1, harness: 'codex', forbiddenBytes: ['abcdefghijklmnopqrstuvwxyz0123456789'] });
-    turn.write(Buffer.from(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'Final output pending'}})+'\n'));
+    const turn = log.turn({
+      sequence: 1,
+      harness: 'codex',
+      forbiddenBytes: ['abcdefghijklmnopqrstuvwxyz0123456789'],
+    });
+    turn.write(
+      Buffer.from(
+        JSON.stringify({
+          type: 'item.completed',
+          item: { type: 'agent_message', text: 'Final output pending' },
+        }) + '\n',
+      ),
+    );
     let durable = 0;
     const persisted = [];
     const activity = {
       cursor: vi.fn(async () => durable),
-      ingest: vi.fn(async (_row,batch) => {
+      ingest: vi.fn(async (_row, batch) => {
         persisted.push(...batch.events);
         durable = batch.events.at(-1)?.index ?? durable;
         return durable;
       }),
     };
     const invoke = f.ports.invoke.getMockImplementation();
-    f.ports.invoke.mockImplementation(async input => input.payload.command === 'native-activity'
-      ? {...executionIdentity(input.execution), ...log.pull(input.payload.after)}
-      : {...await invoke(input), capabilities:['activity-v1']});
-    const reconcile = createNativeExecutionSupervisor({...f.ports,activity});
+    f.ports.invoke.mockImplementation(async (input) =>
+      input.payload.command === 'native-activity'
+        ? { ...executionIdentity(input.execution), ...log.pull(input.payload.after) }
+        : { ...(await invoke(input)), capabilities: ['activity-v1'] },
+    );
+    const reconcile = createNativeExecutionSupervisor({ ...f.ports, activity });
     await reconcile(f.identity);
     expect(f.row().status).toBe('RUNNING');
     expect(f.ports.publications.read).not.toHaveBeenCalled();
     turn.close();
     await reconcile(f.identity);
-    expect(persisted.map(r=>r.index)).toEqual([1]);
+    expect(persisted.map((r) => r.index)).toEqual([1]);
     expect(durable).toBe(1);
     expect(log.pull(1).events).toEqual([]);
     expect(f.row().status).toBe('WAITING_FOR_INPUT');
-    expect(f.ports.invoke.mock.calls.filter(([input])=>input.payload.command === 'native-start')).toHaveLength(1);
+    expect(
+      f.ports.invoke.mock.calls.filter(([input]) => input.payload.command === 'native-start'),
+    ).toHaveLength(1);
   });
 
   it('retries activity transport without reissuing the model command', async () => {
-    const f = await make(); await f.dispatch();
+    const f = await make();
+    await f.dispatch();
     const invoke = f.ports.invoke.getMockImplementation();
     let failed = false;
-    f.ports.invoke.mockImplementation(async input => {
-      if (input.payload.command !== 'native-activity') return {...await invoke(input),capabilities:['activity-v1']};
-      if (!failed) { failed = true; throw Object.assign(new Error('transport'),{name:'TimeoutError'}); }
-      return {...executionIdentity(input.execution),writerGeneration:1,after:0,events:[],complete:true};
+    f.ports.invoke.mockImplementation(async (input) => {
+      if (input.payload.command !== 'native-activity')
+        return { ...(await invoke(input)), capabilities: ['activity-v1'] };
+      if (!failed) {
+        failed = true;
+        throw Object.assign(new Error('transport'), { name: 'TimeoutError' });
+      }
+      return {
+        ...executionIdentity(input.execution),
+        writerGeneration: 1,
+        after: 0,
+        events: [],
+        complete: true,
+      };
     });
-    const activity = { cursor: async()=>0, ingest: async()=>0 };
-    const reconcile = createNativeExecutionSupervisor({...f.ports,activity});
+    const activity = { cursor: async () => 0, ingest: async () => 0 };
+    const reconcile = createNativeExecutionSupervisor({ ...f.ports, activity });
     await reconcile(f.identity);
     expect(f.row().status).toBe('RUNNING');
     await reconcile(f.identity);
     expect(f.row().status).toBe('WAITING_FOR_INPUT');
-    expect(f.ports.invoke.mock.calls.filter(([input])=>input.payload.command === 'native-start')).toHaveLength(1);
+    expect(
+      f.ports.invoke.mock.calls.filter(([input]) => input.payload.command === 'native-start'),
+    ).toHaveLength(1);
   });
 });

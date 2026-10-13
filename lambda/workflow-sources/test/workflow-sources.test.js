@@ -352,6 +352,7 @@ describe('dedicated workflow-source HTTP boundary', () => {
     { ...requestBody(), expectedRevision: 'not-a-uuid' },
     { ...requestBody(), expectedRevision: 123 },
     { ...requestBody(), provider: 'other' },
+    // secretlint-disable-next-line @secretlint/secretlint-rule-basicauth -- synthetic rejection fixture
     { ...requestBody(), repository: 'https://user:secret@github.com/example/workflows' },
     { ...requestBody(), repository: '../workflows' },
     { ...requestBody(), authType: 'gitlab-oauth', confirmDelegation: true },

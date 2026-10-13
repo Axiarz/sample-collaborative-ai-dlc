@@ -241,25 +241,27 @@ export const createNativeRuntimeApi =
       return invalid();
     const { projectId, intentId } = params;
     const outputRead = event.resource === OUTPUTS;
-    const suffix = outputRead ? '/outputs' : preparation
-      ? '/prepare'
-      : start
-        ? '/start'
-        : cancel
-          ? '/cancel'
-          : recover
-            ? '/recover'
-            : userResponse
-              ? '/response'
-              : event.resource === INTERACTION
-                ? '/interaction'
-                : file
-                  ? `/files/${params.fileId}`
-                  : event.resource === PUBLICATION
-                    ? '/publication'
-                    : event.resource === GRAPH
-                      ? '/graph'
-                      : '';
+    const suffix = outputRead
+      ? '/outputs'
+      : preparation
+        ? '/prepare'
+        : start
+          ? '/start'
+          : cancel
+            ? '/cancel'
+            : recover
+              ? '/recover'
+              : userResponse
+                ? '/response'
+                : event.resource === INTERACTION
+                  ? '/interaction'
+                  : file
+                    ? `/files/${params.fileId}`
+                    : event.resource === PUBLICATION
+                      ? '/publication'
+                      : event.resource === GRAPH
+                        ? '/graph'
+                        : '';
     const expectedPath = `/api/projects/${projectId}/native-intents${collection ? '' : `/${intentId}`}${suffix}`;
     if (event.path !== undefined && event.path !== expectedPath) return invalid();
     if (
@@ -279,10 +281,26 @@ export const createNativeRuntimeApi =
       if (outputRead) {
         const single = event.queryStringParameters ?? {};
         const multi = event.multiValueQueryStringParameters ?? {};
-        if (!record(single) || !record(multi) || Object.keys(single).some(k => k !== 'afterSeq') ||
-          Object.entries(multi).some(([k,v]) => k !== 'afterSeq' || !Array.isArray(v) || v.length !== 1 || (single[k] !== undefined && single[k] !== v[0]))) return invalid();
+        if (
+          !record(single) ||
+          !record(multi) ||
+          Object.keys(single).some((k) => k !== 'afterSeq') ||
+          Object.entries(multi).some(
+            ([k, v]) =>
+              k !== 'afterSeq' ||
+              !Array.isArray(v) ||
+              v.length !== 1 ||
+              (single[k] !== undefined && single[k] !== v[0]),
+          )
+        )
+          return invalid();
         const raw = single.afterSeq ?? multi.afterSeq?.[0] ?? '0';
-        if (typeof raw !== 'string' || !/^(0|[1-9][0-9]{0,15})$/.test(raw) || !Number.isSafeInteger(Number(raw))) return invalid();
+        if (
+          typeof raw !== 'string' ||
+          !/^(0|[1-9][0-9]{0,15})$/.test(raw) ||
+          !Number.isSafeInteger(Number(raw))
+        )
+          return invalid();
         after = Number(raw);
       }
       const listing = outputRead ? null : nativeListQuery(event, { collection, projectId });

@@ -33,6 +33,18 @@ variable "cognito_user_pool_arn" {
   type        = string
 }
 
+variable "web_acl_arn" {
+  description = "ARN of a regional AWS WAFv2 web ACL. Empty leaves the API stage without AWS WAF."
+  type        = string
+  default     = ""
+}
+
+variable "waf_enabled" {
+  description = "Whether to associate the API stage with AWS WAF"
+  type        = bool
+  default     = false
+}
+
 variable "projects_lambda_invoke_arn" {
   description = "Invoke ARN of the projects Lambda"
   type        = string
@@ -192,6 +204,11 @@ variable "agentcore_runtime_arn" {
   default     = ""
 }
 
+variable "bedrock_region" {
+  description = "AWS region the agents Lambda lists Bedrock inference profiles from for the model picker"
+  type        = string
+}
+
 variable "environment_registry_table_name" {
   description = "Managed environment registry table used to resolve project runtime targets"
   type        = string
@@ -244,6 +261,18 @@ variable "source_control_lambda_invoke_arn" {
 
 variable "bitbucket_lambda_name" {
   description = "Name of the bitbucket Lambda function"
+  type        = string
+  default     = ""
+}
+
+variable "codecommit_lambda_invoke_arn" {
+  description = "Invoke ARN of the codecommit Lambda"
+  type        = string
+  default     = ""
+}
+
+variable "codecommit_lambda_name" {
+  description = "Name of the codecommit Lambda function"
   type        = string
   default     = ""
 }
@@ -324,5 +353,10 @@ variable "enable_cloudfront_origin_policy" {
 
 variable "api_gateway_account_id" {
   description = "An attribute of the aws_api_gateway_account resource (its cloudwatch_role_arn). The value is unused — it is interpolated into the stage description to create an implicit dependency so the REST API stage waits for account-level CloudWatch logging to be configured."
+  type        = string
+}
+
+variable "v2_executions_table_name" {
+  description = "Process table used for authentication policy, reviews, and invocation inventory"
   type        = string
 }

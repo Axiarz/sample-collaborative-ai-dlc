@@ -1,6 +1,7 @@
 output "agents_orchestrator_role_arn" {
   description = "ARN of the IAM role for the agents Lambda (most privileged: Neptune + DDB + SSM + AgentCore invoke). Consumed by the api module to wire the agents_lambda created in api/agents.tf."
   value       = aws_iam_role.agents_orchestrator.arn
+  depends_on  = [aws_iam_role_policy.agents_orchestrator]
 }
 
 output "lambda_security_group_id" {
@@ -171,6 +172,26 @@ output "bitbucket_lambda_invoke_arn" {
 output "bitbucket_lambda_name" {
   description = "Name of the bitbucket Lambda function"
   value       = module.bitbucket_lambda.lambda_function_name
+}
+
+output "codecommit_lambda_arn" {
+  description = "ARN of the codecommit Lambda function"
+  value       = module.codecommit_lambda.lambda_function_arn
+}
+
+output "codecommit_lambda_invoke_arn" {
+  description = "Invoke ARN of the codecommit Lambda function"
+  value       = module.codecommit_lambda.lambda_function_invoke_arn
+}
+
+output "codecommit_lambda_name" {
+  description = "Name of the codecommit Lambda function"
+  value       = module.codecommit_lambda.lambda_function_name
+}
+
+output "codecommit_platform_principals" {
+  description = "Execution role ARNs a tenant CodeCommit access role must trust (comma-separated)"
+  value       = local.codecommit_platform_principals
 }
 
 output "source_control_lambda_arn" {

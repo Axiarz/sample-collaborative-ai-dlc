@@ -1,3 +1,9 @@
+import { AUTHENTICATION_BINDING_RESOLVERS } from './authentication-command-registry.js';
+import { CREDENTIAL_ADAPTER_ENV_NAMES } from './credential-material-registry.js';
+import {
+  credentialLeaseFromResponse,
+  prepareCredentialLeases,
+} from './credential-lease-adapters.js';
 // Invocation-scoped agent authentication.
 //
 // AgentCore sessions are long-lived and can serve different authenticated
@@ -11,15 +17,14 @@
 import {
   AGENT_CREDENTIAL_ENV_NAMES,
   AGENT_CREDENTIAL_PROVIDERS,
-  credentialEnvName,
   credentialProviderForCli,
   normalizeCredentialBinding,
-} from '../shared/agent-credentials.js';
+  bindingIdentity,
+} from '../shared/agent-auth-contracts.js';
 import { AGENT_AUTH_MODES } from './command-registry.js';
 import { invokeCredentialBroker } from './clients.js';
 
-const bindingKey = (binding) =>
-  `${binding.provider}:${binding.source}:${binding.source === 'user' ? binding.userId : ''}`;
+const bindingKey = bindingIdentity;
 const grantMismatch = () =>
   Object.assign(new Error('Agent credential grant does not match this invocation'), {
     code: 'credential_grant_mismatch',
@@ -27,7 +32,8 @@ const grantMismatch = () =>
 
 const cleanBaseEnv = (env) => {
   const invocationEnv = { ...env };
-  for (const name of AGENT_CREDENTIAL_ENV_NAMES) delete invocationEnv[name];
+  for (const name of [...AGENT_CREDENTIAL_ENV_NAMES, ...CREDENTIAL_ADAPTER_ENV_NAMES])
+    delete invocationEnv[name];
   return invocationEnv;
 };
 
@@ -69,6 +75,7 @@ const bindingResolvers = Object.freeze({
     }
     return [binding];
   },
+  ...AUTHENTICATION_BINDING_RESOLVERS,
   [AGENT_AUTH_MODES.CAPABILITIES]: ({ payload }) =>
     payload.credentialBindings
       ? AGENT_CREDENTIAL_PROVIDERS.map((provider) => payload.credentialBindings[provider]).filter(
@@ -116,11 +123,10 @@ const bindingResolvers = Object.freeze({
   },
 });
 
-export const authenticatedClisForEnv = ({ installed = [], env = {} } = {}) =>
-  installed.filter((cli) => {
-    const provider = credentialProviderForCli(cli);
-    return provider && Boolean(env[credentialEnvName(provider)]);
-  });
+// A CLI is authenticated only by a lease prepared for this invocation, never by env,
+// so ambient values cannot fake it. `providers` is the resolver's resolvedProviders.
+export const authenticatedClis = ({ installed = [], providers = [] } = {}) =>
+  installed.filter((cli) => providers.includes(credentialProviderForCli(cli)));
 
 export const resolveInvocationAgentAuth = async ({
   payload = {},
@@ -128,6 +134,7 @@ export const resolveInvocationAgentAuth = async ({
   store = null,
   env = process.env,
   broker = invokeCredentialBroker,
+  leaseAdapters,
 } = {}) => {
   if (
     authMode === AGENT_AUTH_MODES.NATIVE_PROBE &&
@@ -164,6 +171,9 @@ export const resolveInvocationAgentAuth = async ({
     // Keep inspection/cancellation available during credential-store outages.
     return {
       env: invocationEnv,
+      materialTypes: [],
+      projectId,
+      bindings,
       credentialBindings,
       resolvedProviders,
       missingProviders,
@@ -193,7 +203,7 @@ export const resolveInvocationAgentAuth = async ({
       const binding = normalizeCredentialBinding(credential?.binding);
       authorized.set(bindingKey(binding), {
         binding,
-        value: typeof credential?.value === 'string' ? credential.value : '',
+        lease: credentialLeaseFromResponse(credential),
       });
     }
   } catch {
@@ -217,18 +227,26 @@ export const resolveInvocationAgentAuth = async ({
       source: binding.source,
     };
     credentialBindings.push(credentialBinding);
-    const value = authorized.get(bindingKey(binding))?.value || '';
-    if (!value) {
+    const lease = authorized.get(bindingKey(binding))?.lease;
+    if (!lease?.material) {
       missingProviders.push(binding.provider);
       missingCredentialBindings.push(credentialBinding);
       continue;
     }
-    invocationEnv[credentialEnvName(binding.provider)] = value;
     resolvedProviders.push(binding.provider);
   }
 
+  const leaseState = await prepareCredentialLeases({
+    credentials: [...authorized.values()],
+    baseEnv: invocationEnv,
+    broker,
+    context: { purpose: authMode, projectId, executionId },
+    ...(leaseAdapters ? { adapters: leaseAdapters } : {}),
+  });
   return {
-    env: invocationEnv,
+    ...leaseState,
+    projectId,
+    bindings,
     credentialBindings,
     resolvedProviders,
     missingProviders,

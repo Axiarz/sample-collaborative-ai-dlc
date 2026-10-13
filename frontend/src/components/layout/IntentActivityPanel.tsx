@@ -43,7 +43,8 @@ import type { IntentActivityEvent, IntentArtifact, IntentGraphNode } from '@/ser
 const FOLLOW_KEY = 'auto';
 
 export function IntentActivityPanel({ onClose }: { onClose: () => void }) {
-  const { detail, stageRows, agentFocus, previewSeq, executionBackend, nativeWorkspace, intentId } = useIntent();
+  const { detail, stageRows, agentFocus, previewSeq, executionBackend, nativeWorkspace, intentId } =
+    useIntent();
   const [activeTab, setActiveTab] = useState(executionBackend === 'native' ? 'agent' : 'timeline');
   const discussionsCtx = useDiscussions();
   const totalUnread = (discussionsCtx?.discussions ?? []).reduce(
@@ -77,7 +78,12 @@ export function IntentActivityPanel({ onClose }: { onClose: () => void }) {
     setSelectedKey(FOLLOW_KEY);
   }, [intentKey]);
 
-  const running = stageRows.some((s) => s.state === 'RUNNING') || (executionBackend === 'native' && ['RUNNING','DISPATCHING','RECOVERING'].includes(nativeWorkspace?.intent?.execution?.status ?? ''));
+  const running =
+    stageRows.some((s) => s.state === 'RUNNING') ||
+    (executionBackend === 'native' &&
+      ['RUNNING', 'DISPATCHING', 'RECOVERING'].includes(
+        nativeWorkspace?.intent?.execution?.status ?? '',
+      ));
   const events = detail?.events ?? [];
 
   return (
@@ -107,7 +113,11 @@ export function IntentActivityPanel({ onClose }: { onClose: () => void }) {
                 )}
               </TabsTrigger>
               {/* Native threads use their own protected discussion scope. */}
-              <TabsTrigger disabled={!discussionsCtx?.scope} value="discussions" className="h-6 px-2 text-xs gap-1">
+              <TabsTrigger
+                disabled={!discussionsCtx?.scope}
+                value="discussions"
+                className="h-6 px-2 text-xs gap-1"
+              >
                 <MessageSquare className="h-3 w-3 shrink-0" />
                 Discuss
                 {totalUnread > 0 && (
@@ -116,7 +126,11 @@ export function IntentActivityPanel({ onClose }: { onClose: () => void }) {
                   </Badge>
                 )}
               </TabsTrigger>
-              <TabsTrigger disabled={executionBackend === 'native'} value="preview" className="h-6 px-2 text-xs gap-1">
+              <TabsTrigger
+                disabled={executionBackend === 'native'}
+                value="preview"
+                className="h-6 px-2 text-xs gap-1"
+              >
                 <Eye className="h-3 w-3 shrink-0" />
                 Preview
               </TabsTrigger>
@@ -341,6 +355,97 @@ function TimelineTab({ events }: { events: IntentActivityEvent[] }) {
   );
 }
 
+// The release-semantics event families. Their outcome is
+// classified from the SUFFIX rather than enumerated per type, so a later stream
+// only has to EMIT `v2.<family>.<outcome>` and the feed colours it correctly
+// without a frontend change.
+const RELEASE_EVENT_FAMILIES = [
+  'v2.summary.',
+  'v2.persona.',
+  'v2.change.',
+  'v2.loopback.',
+  'v2.review.',
+  'v2.sensor.',
+  'v2.gate.',
+  'v2.plan.',
+  'v2.learning.',
+  'v2.units.',
+];
+const RELEASE_OUTCOME_FAILED = /(failed|blocked|halt|invalid|expired)$/;
+const RELEASE_OUTCOME_ATTENTION =
+  /(requested|noncompliant|waived|gap|recommended|advisory|withheld|changed|gate|dissent|warnings|override)$/;
+
+// Persona events get a readable role label in addition to their outcome color.
+const PERSONA_EVENT_LABELS: Record<string, string> = {
+  'v2.persona.contribution': 'Contribution',
+  'v2.persona.link_completed': 'Pipeline link',
+  'v2.persona.dissent': 'Maintained dissent',
+  'v2.persona.gap': 'No evidence recorded',
+  'v2.persona.question_withdrawn': 'Question withdrawn',
+};
+
+const PERSONA_EXCERPT_LIMIT = 240;
+
+function dissentRoundSuffix(event: IntentActivityEvent): string {
+  if (event.type !== 'v2.persona.dissent') return '';
+  const round = event.detail?.round;
+  if (typeof round !== 'number' || !Number.isFinite(round) || round < 1) return '';
+  const max = event.detail?.maxRounds;
+  return typeof max === 'number' && Number.isFinite(max) && max >= round
+    ? ` (round ${round}/${max})`
+    : ` (round ${round})`;
+}
+
+// Gate-plane sensor families. `v2.sensor.gate` is the per-gate summary ("Gate
+// sensors: X passed, Y flagged") — the ONLY record that the gate plane ran at all
+// when every sensor passed, so it gets a headline of its own rather than being
+// read as just another flagged verdict.
+const SENSOR_EVENT_LABELS: Record<string, string> = {
+  'v2.sensor.gate': 'Gate sensors',
+  'v2.sensor.flagged': 'Sensor flagged',
+  // The advisory reviewer's summary is its whole Markdown report; it reads as a
+  // headline plus a bounded, markup-free excerpt instead of a raw dump.
+  'v2.review.advisory': 'Advisory review',
+};
+
+function sensorEventLabel(event: IntentActivityEvent): string | null {
+  return SENSOR_EVENT_LABELS[event.type] ?? null;
+}
+
+function personaEventLabel(event: IntentActivityEvent): string | null {
+  if (!event.type.startsWith('v2.persona.')) return null;
+  const label = `${PERSONA_EVENT_LABELS[event.type] ?? 'Persona session'}${dissentRoundSuffix(event)}`;
+  return event.actor && event.actor !== 'agentcore' ? `${label} — ${event.actor}` : label;
+}
+
+function personaExcerpt(summary: string | null): string {
+  const text = (summary ?? '')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/^\|?[\s:|-]+\|[\s:|-]*$/gm, '')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+  return text.length > PERSONA_EXCERPT_LIMIT
+    ? `${text.slice(0, PERSONA_EXCERPT_LIMIT).trimEnd()}…`
+    : text;
+}
+
+function releaseEventDotColor(type: string): string | null {
+  if (!RELEASE_EVENT_FAMILIES.some((family) => type.startsWith(family))) return null;
+  if (RELEASE_OUTCOME_FAILED.test(type)) return 'bg-agent-error';
+  if (RELEASE_OUTCOME_ATTENTION.test(type)) return 'bg-agent-waiting';
+  return 'bg-agent-success';
+}
+
+// A gate pass whose summary reports nothing flagged is a clean pass, not an
+// attention item; every other event keeps its type-derived colour.
+function timelineDotColor(event: IntentActivityEvent): string {
+  if (event.type === 'v2.sensor.gate' && /\b0 flagged\b/.test(event.summary ?? '')) {
+    return 'bg-agent-success';
+  }
+  return eventDotColor(event.type);
+}
+
 // v2 event type → dot color (mirrors v1's TimelineEventItem visual, which is
 // typed to sprint events and can't be reused directly).
 function eventDotColor(type: string): string {
@@ -370,7 +475,10 @@ function eventDotColor(type: string): string {
   if (type === 'v2.pr.failed' || type === 'v2.pr.record_failed') return 'bg-agent-error';
   if (type === 'v2.pr.skipped') return 'bg-agent-waiting';
   if (type.startsWith('v2.workspace.')) return 'bg-phase-inception';
-  return 'bg-muted-foreground';
+  // A gate answer that could not resume its run is a wait the human must clear,
+  // not a failure of the work — the answer itself is safely recorded.
+  if (type === 'v2.gate.resume_failed') return 'bg-agent-waiting';
+  return releaseEventDotColor(type) ?? 'bg-muted-foreground';
 }
 
 function parseQuestions(
@@ -420,14 +528,26 @@ function IntentTimelineItem({ event }: { event: IntentActivityEvent }) {
   const questions = isAnswer ? parseQuestions(event.questions) : [];
   const questionTexts = questions.map((q) => String(q.text ?? '')).filter(Boolean);
   const answer = isAnswer ? answerSummary(event.answer, questions) : '';
+  // A headline label replaces the raw summary; the summary then rides underneath
+  // as a bounded excerpt. Sensor-plane events use the same treatment so a gate
+  // pass reads as "Gate sensors" with the counts below it.
+  const headlineLabel = personaEventLabel(event) ?? sensorEventLabel(event);
+  const excerpt = headlineLabel ? personaExcerpt(event.summary) : '';
   return (
     <div className="flex gap-3 py-2">
       <div className="flex flex-col items-center">
-        <div className={cn('h-2 w-2 rounded-full mt-1.5 shrink-0', eventDotColor(event.type))} />
+        <div className={cn('h-2 w-2 rounded-full mt-1.5 shrink-0', timelineDotColor(event))} />
         <div className="w-px flex-1 bg-border mt-1" />
       </div>
       <div className="flex-1 min-w-0 pb-2">
-        <p className="text-xs font-medium leading-tight">{event.summary || event.type}</p>
+        <p className="text-xs font-medium leading-tight">
+          {headlineLabel ?? (event.summary || event.type)}
+        </p>
+        {headlineLabel && excerpt && (
+          <p className="mt-1 line-clamp-3 whitespace-pre-wrap break-words text-[11px] text-muted-foreground">
+            {excerpt}
+          </p>
+        )}
         {isAnswer && (
           <div className="mt-1 space-y-1 rounded border bg-muted/20 px-2 py-1.5 text-[11px]">
             {questionTexts.length > 0 && (

@@ -82,11 +82,11 @@ SHA256:
 
 The exact planned changes are:
 
-| Resource | Change |
-| --- | --- |
-| Workflow-source Lambda | Deploy the capability response and enable source settings. `NATIVE_PACKAGE_JOBS_ENABLED` stays `"false"`. |
-| Intents Lambda | Update `CORE_RUNTIME_VERSION` from 101 to the already-deployed 102. |
-| Environment-control Lambda | Update the same existing runtime-version reference from 101 to 102. |
+| Resource                                | Change                                                                                                                     |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Workflow-source Lambda                  | Deploy the capability response and enable source settings. `NATIVE_PACKAGE_JOBS_ENABLED` stays `"false"`.                  |
+| Intents Lambda                          | Update `CORE_RUNTIME_VERSION` from 101 to the already-deployed 102.                                                        |
+| Environment-control Lambda              | Update the same existing runtime-version reference from 101 to 102.                                                        |
 | Three local Terraform packaging helpers | Replace the source Lambda's archive manifest, archive build trigger, and filename/hash helper to package its changed code. |
 
 There are no AWS resource creates/deletes/replacements, IAM or persistent-storage

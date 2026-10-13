@@ -66,8 +66,29 @@ export type ExecutionCapability =
   | 'nativeExport'
   | 'derive'
   | 'stageSkipping';
+// The AI-DLC release the intent was pinned to at creation.
+// Shape mirrors releasePinFromRecord (lambda/shared/release-registry.js). Null
+// on unpinned intents — those keep the legacy platform-baseline behaviour.
+export interface MethodologyReleasePin {
+  releaseId: string;
+  sourceSha: string;
+  importerRevision: number;
+  closureDigest: string;
+  catalogKey?: string | null;
+  manifestKey?: string | null;
+  // Not part of the execution pin; present only when a richer record was
+  // stamped. The UI falls back to the short source sha without it.
+  upstreamVersion?: string | null;
+}
+
+export interface IntentResumeRequired {
+  humanTaskId: string;
+  callbackId: string;
+  answeredAt: string | null;
+}
 
 export interface Intent {
+  draftRevision?: number;
   id: string;
   executionId: string;
   // Missing on legacy platform executions. Unknown backend values fail closed in the UI.
@@ -84,12 +105,17 @@ export interface Intent {
   // branch. null when the caller didn't override anything (the common case).
   baseBranches: Record<string, string> | null;
   repos: string[] | null;
-  // Code host the intent's repos live on ('github' | 'gitlab'), used to build
-  // branch/PR web links. null on older executions.
+  // Per-repository provider override ({ [repoUrl or repo slug]: provider }).
+  // Present for mixed-provider projects; `gitProvider` remains the fallback.
+  repoProviders?: Record<string, string> | null;
+  // Default code host for the intent's repos, used to build branch/PR web
+  // links. Supported values are GitHub, GitLab and Bitbucket wire IDs.
   gitProvider?: string | null;
   workflowId: string;
   workflowVersion: number | null;
   aidlcRepoRef?: string | null;
+  // Per-intent AI-DLC release pin; null/absent on unpinned (legacy) intents.
+  methodologyRelease?: MethodologyReleasePin | null;
   scope: string | null;
   currentPhase: string | null;
   currentStage: string | null;
@@ -98,8 +124,23 @@ export interface Intent {
   failure?: IntentFailure | null;
   // Set when the run was relaunched from a mid-plan stage (steering rewind).
   rewindFromStageId?: string | null;
+  // Set when a gate answer is recorded but its durable callback could not be
+  // completed: the run is parked with nothing able to wake it until someone
+  // resumes it. Drives the Resume run action.
+  resumeRequired?: IntentResumeRequired | null;
   agentCli?: AgentCli | null;
   credentialSource?: AgentCredentialSource | null;
+  credentialConnection?: {
+    mode: string;
+    backend: string;
+    mechanism: string;
+    source: AgentCredentialSource;
+    connectionId: string | null;
+    connectionRevision: number | null;
+    policyRevision: number | null;
+    configuration: { endpoint?: string; issuer?: string };
+    legacy: boolean;
+  } | null;
   cliModels: Record<string, string> | null;
   environment: IntentEnvironmentSnapshot | null;
   parkReleaseSeconds: number | null;
@@ -260,6 +301,23 @@ export interface IntentStage {
   pendingHumanTaskId?: string | null;
 }
 
+// One gate-precondition finding. `overridable` is what puts
+// `override-and-approve` in `options`; a blocking finding that is NOT overridable
+// leaves `request-changes` as the only answer, which re-runs the stage.
+export interface GateFinding {
+  code: string;
+  severity: 'blocking' | 'advisory';
+  title: string;
+  detail?: unknown;
+  overridable: boolean;
+  receiptKind?: string | null;
+  remediation?: string | null;
+  // Verbatim text the finding is ABOUT — today a maintained dissent's position.
+  // Rendered as a quote, never folded into `title`: a paraphrase of an objection
+  // is a different objection. Absent on every finding that quotes nothing.
+  quote?: string | null;
+}
+
 // A human gate (HUMAN# row). `questions` is the v1-shaped structured-questions
 // JSON string when kind === 'question' — parsed into the QuestionEditor shape
 // by the IntentView.
@@ -272,6 +330,8 @@ export interface IntentGate {
   kind: 'approval' | 'question' | 'review-verdict' | 'validation';
   // `superseded` = the gate was retired unanswered by a cancel/rewind.
   status: 'pending' | 'answered' | 'approved' | 'rejected' | 'superseded';
+  // True while the answered gate's bound durable callback still needs delivery.
+  resumeAvailable?: boolean;
   prompt: string | null;
   options: unknown;
   // Valid "skip to stage X" targets on a validation gate (stage ids the human
@@ -284,6 +344,27 @@ export interface IntentGate {
   // contiguous jump. Null when stage skipping is disabled or nothing
   // qualifies. Advisory; the engine re-validates every entry.
   recomposeTargets?: string[] | null;
+  // Gate preconditions the human must decide with. Absent on every gate without
+  // a resolved release policy.
+  findings?: GateFinding[] | null;
+  // The learnings ritual rides this gate: when set, the review panel offers an
+  // optional "anything to add for next time?" field whose text rides the approve
+  // answer as `learnings`. Absent on every gate that does not run the ritual.
+  learningsRitual?: boolean | null;
+  // The stage a `loop-back` answer sends the run back to. Present only when the
+  // gate actually offers the option: the pinned release has a construction
+  // loop-back, the agent recommended one in this run of the stage, and the cap
+  // is not spent. Absent on every other gate.
+  loopBackTarget?: string | null;
+  // Why the agent recommended the loop-back, and what the engine decided about
+  // it: 'offered' | 'at-cap' | 'unavailable'. Present whenever the agent
+  // recommended one, INCLUDING the outcomes that offer no option — those are the
+  // ones the reviewer would otherwise be told nothing about. Absent on every gate
+  // with no recommendation.
+  loopBackReason?: string | null;
+  loopBackStatus?: 'offered' | 'at-cap' | 'unavailable' | null;
+  // That decision in one sentence, written by the engine.
+  loopBackNote?: string | null;
   // The COMPUTED next stage a plain approve continues to (upstream 2.2.6):
   // string = its stageId, null = approving completes the workflow. Absent on
   // legacy gates / gates where it was never computed — fall back to generic
@@ -397,6 +478,7 @@ export interface SensorDetail {
 }
 
 export interface IntentArtifact {
+  editRevision?: string | null;
   id: string;
   artifactType: string | null;
   title: string | null;
@@ -406,6 +488,7 @@ export interface IntentArtifact {
   unitSlug?: string | null;
   stageAttempt?: number;
   generation?: number;
+  collaborationEpoch?: string | null;
   versionCount?: number;
   aliases?: string[];
   createdAt: string | null;
@@ -592,6 +675,11 @@ export interface IntentActivityEvent {
   answeredBy?: string | null;
   answeredByName?: string | null;
   artifacts?: { id: string; title: string }[];
+  // A bounded slice of the durable event's `detail`, forwarded only for the
+  // fields the timeline renders. Kept to a whitelist rather than the whole
+  // object: `detail` carries agent text and ids the feed has no business
+  // shipping to the browser.
+  detail?: { round?: number | null; maxRounds?: number | null } | null;
 }
 
 // Unit lanes (docs/v2-parallel.md WP4): the promoted UNITPLAN scheduling
@@ -757,6 +845,10 @@ export interface CreateIntentInput {
   // Per-intent composed EXECUTE/SKIP grid — replaces the scope projection
   // (scope becomes a label). Validated server-side by the plan resolver.
   composedGrid?: Record<string, 'EXECUTE' | 'SKIP'>;
+  // Pin this intent to a registered AI-DLC release. Only
+  // selectable releases are accepted; 400 codes: release_not_selectable,
+  // release_not_found, release_selection_disabled. Omit for legacy behaviour.
+  methodologyReleaseId?: string;
   // Optional tracker provenance when seeded from a GitHub issue / Jira artifact.
   source?: {
     bindingId: string;
@@ -1005,10 +1097,19 @@ export const intentsService = {
     api.post<Intent>(`/projects/${projectId}/intents`, input),
   // DRAFT-only header edit (the collaborative draft page's auto-save target):
   // title/prompt/scope/composedGrid/skipStageIds. 409 once the intent starts.
+  draftEditState: (projectId: string, intentId: string) =>
+    api.get<{ draftRevision: number; status: IntentStatus }>(
+      `/projects/${projectId}/intents/${intentId}?editState=draft`,
+    ),
+  artifactEditState: (projectId: string, intentId: string, artifactId: string) =>
+    api.get<{ editRevision: string | null; collaborationEpoch: string | null }>(
+      `/projects/${projectId}/intents/${intentId}?editState=${encodeURIComponent(artifactId)}`,
+    ),
   update: (
     projectId: string,
     intentId: string,
     patch: {
+      ifDraftRevision: number;
       title?: string | null;
       prompt?: string | null;
       scope?: string;
@@ -1103,6 +1204,14 @@ export const intentsService = {
     ),
   repair: (projectId: string, intentId: string) =>
     api.post<IntentRepairResult>(`/projects/${projectId}/intents/${intentId}/repair`, {}),
+  // Re-attempt the durable callback for an already-recorded gate answer
+  // (`intent.resumeRequired`). Idempotent: `resumed: false` means there was
+  // nothing left to resume, which is a success, not an error.
+  resume: (projectId: string, intentId: string) =>
+    api.post<{ intent: Intent; resumed: boolean }>(
+      `/projects/${projectId}/intents/${intentId}/resume`,
+      {},
+    ),
   answerGate: (projectId: string, intentId: string, humanTaskId: string, input: GateAnswer) =>
     api.post<IntentGate>(
       `/projects/${projectId}/intents/${intentId}/gates/${humanTaskId}/answer`,
@@ -1140,6 +1249,8 @@ export const intentsService = {
     intentId: string,
     artifactId: string,
     content: string,
+    collaborationEpoch: string | null,
+    ifEditRevision: string | null,
   ) =>
     api.put<{
       artifactId: string;
@@ -1149,7 +1260,7 @@ export const intentsService = {
       steering: IntentSteering | null;
     }>(
       `/projects/${projectId}/intents/${intentId}/artifacts/${encodeURIComponent(artifactId)}/content`,
-      { content },
+      { content, collaborationEpoch, ifEditRevision },
     ),
   // Clear the drift marker: reviewed against the upstream edit, still valid.
   verifyArtifact: (projectId: string, intentId: string, artifactId: string, note?: string) =>

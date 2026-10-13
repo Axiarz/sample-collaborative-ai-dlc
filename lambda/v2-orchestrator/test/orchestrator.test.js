@@ -295,7 +295,122 @@ describe('orchestrator durable handler', () => {
       .mockResolvedValueOnce(META)
       .mockResolvedValue({ ...META, pendingHumanTaskId: 'h1' });
     deps.store.setGateCallbackId.mockResolvedValueOnce(null);
+    deps.store.getHumanTask.mockResolvedValue({ status: 'pending' });
     deps.loadPlan.mockResolvedValue({ valid: true, plan: { stages: [{ stageId: 'a' }] } });
+    deps.invokeRuntime = makeRuntime(ctx, (payload, n) => {
+      if (n === 1) return { ok: true };
+      return { ok: true, state: 'WAITING_FOR_HUMAN', humanTaskId: 'h1' };
+    });
+
+    const res = await __durableHandler(
+      { action: 'start', intentId: 'i1', executionId: 'i1' },
+      ctx,
+      deps,
+    );
+
+    expect(res).toMatchObject({ ok: false, reason: 'gate_callback_conflict' });
+    expect(stageStarts()).toHaveLength(1);
+  });
+
+  it.each(['answered', 'approved', 'rejected'])(
+    'resumes when a %s decision wins before the gate callback can be bound',
+    async (status) => {
+      deps.store.getExecution
+        .mockResolvedValueOnce(META)
+        .mockResolvedValue({ ...META, pendingHumanTaskId: 'h1' });
+      deps.store.setGateCallbackId.mockResolvedValueOnce(null);
+      deps.store.getHumanTask.mockResolvedValue({
+        status,
+        answer: { choice: 'A' },
+        stageInstanceId: 'si-a',
+        unitSlug: null,
+        sectionIndex: null,
+      });
+      deps.loadPlan.mockResolvedValue({
+        valid: true,
+        plan: { stages: [{ stageId: 'a', stageInstanceId: 'si-a' }] },
+      });
+      deps.invokeRuntime = makeRuntime(ctx, (payload, n) => {
+        if (n === 1) return { ok: true };
+        if (n === 2) return { ok: true, state: 'WAITING_FOR_HUMAN', humanTaskId: 'h1' };
+        return { ok: true, state: 'SUCCEEDED' };
+      });
+
+      const res = await __durableHandler(
+        { action: 'start', intentId: 'i1', executionId: 'i1' },
+        ctx,
+        deps,
+      );
+
+      expect(res.ok).toBe(true);
+      expect(stageStarts()).toHaveLength(2);
+      expect(stageStarts()[1].resumeFrom).toBe('h1');
+      expect(deps.stopSession).not.toHaveBeenCalled();
+      expect(deps.store.getHumanTask).toHaveBeenCalledWith('i1', 'h1', {
+        consistentRead: true,
+      });
+    },
+  );
+
+  it.each([
+    [
+      'stage ownership mismatch',
+      {
+        status: 'answered',
+        stageInstanceId: 'si-other',
+        unitSlug: null,
+        sectionIndex: null,
+      },
+    ],
+    [
+      'unit ownership mismatch',
+      {
+        status: 'answered',
+        stageInstanceId: 'si-a',
+        unitSlug: 'other-unit',
+        sectionIndex: null,
+      },
+    ],
+    [
+      'callback ID mismatch',
+      {
+        status: 'answered',
+        stageInstanceId: 'si-a',
+        unitSlug: null,
+        sectionIndex: null,
+        callbackId: 'cb-other',
+        callbackOwner: 'stage:si-a',
+      },
+    ],
+    [
+      'callback owner mismatch',
+      {
+        status: 'answered',
+        stageInstanceId: 'si-a',
+        unitSlug: null,
+        sectionIndex: null,
+        callbackOwner: 'stage:si-other',
+      },
+    ],
+    [
+      'unexpected terminal status',
+      {
+        status: 'banana',
+        stageInstanceId: 'si-a',
+        unitSlug: null,
+        sectionIndex: null,
+      },
+    ],
+  ])('keeps the callback conflict on bind failure with a %s', async (_case, gate) => {
+    deps.store.getExecution
+      .mockResolvedValueOnce(META)
+      .mockResolvedValue({ ...META, pendingHumanTaskId: 'h1' });
+    deps.store.setGateCallbackId.mockResolvedValueOnce(null);
+    deps.store.getHumanTask.mockResolvedValue(gate);
+    deps.loadPlan.mockResolvedValue({
+      valid: true,
+      plan: { stages: [{ stageId: 'a', stageInstanceId: 'si-a' }] },
+    });
     deps.invokeRuntime = makeRuntime(ctx, (payload, n) => {
       if (n === 1) return { ok: true };
       return { ok: true, state: 'WAITING_FOR_HUMAN', humanTaskId: 'h1' };
@@ -394,6 +509,8 @@ describe('orchestrator durable handler', () => {
   });
 
   it('request-changes validation feedback re-runs the stage through resumeFrom', async () => {
+    const step = vi.fn(async (_name, fn) => fn());
+    ctx.step = step;
     deps.loadPlan.mockResolvedValue({
       valid: true,
       plan: {
@@ -433,6 +550,57 @@ describe('orchestrator durable handler', () => {
     expect(starts).toHaveLength(2);
     expect(starts[0].resumeFrom).toBeNull();
     expect(starts[1].resumeFrom).toBe('eg-validation-si-a-0');
+    expect(step).toHaveBeenCalledWith('stage-validation-revision-a-1', expect.any(Function));
+  });
+
+  // The revision's feedback lives on the validation gate, and a later leg of the
+  // same revision resumes from whatever gate parked it. The container can only
+  // read the real feedback if every leg is told which gate asked for the changes.
+  it('names the validation gate on the revision dispatch, not just the gate it resumes', async () => {
+    const policy = { sensorsEnabled: false, reviewClass: 'none', learnings: 'off' };
+    deps.loadPlan.mockResolvedValue({
+      valid: true,
+      plan: {
+        stages: [
+          {
+            stageId: 'a',
+            stageInstanceId: 'si-a',
+            humanValidation: 'required',
+            outputArtifacts: [],
+            policy,
+          },
+        ],
+      },
+    });
+    // A policy-bearing stage reads its own row for the findings channel.
+    deps.store.getStage = vi.fn(async () => ({ stageInstanceId: 'si-a', attempt: 0 }));
+    deps.store.listReceipts = vi.fn(async () => []);
+    deps.store.listEvents = vi.fn(async () => []);
+    deps.store.getHumanTask = vi
+      .fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        humanTaskId: 'eg-validation-si-a-0',
+        status: 'rejected',
+        answer: { decision: 'request-changes', feedback: 'tighten scope' },
+      })
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        humanTaskId: 'eg-validation-si-a-1',
+        status: 'approved',
+        answer: { decision: 'approve' },
+      });
+
+    await __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
+
+    const starts = stageStarts();
+    expect(starts).toHaveLength(2);
+    expect(starts[0].validationGateId).toBeUndefined();
+    expect(starts[1]).toMatchObject({
+      resumeFrom: 'eg-validation-si-a-0',
+      validationRound: 1,
+      validationGateId: 'eg-validation-si-a-0',
+    });
   });
 
   it('forwards the project cliModels to run-stage-start', async () => {
@@ -462,6 +630,40 @@ describe('orchestrator durable handler', () => {
         aidlcRepoRef: 'a'.repeat(40),
         methodologyPins,
       });
+    }
+  });
+
+  it('forwards the pinned AI-DLC release to the plan load and every stage dispatch', async () => {
+    const methodologyRelease = {
+      releaseId: 'aidlc:abc',
+      sourceSha: 'a'.repeat(40),
+      importerRevision: 1,
+      closureDigest: 'd'.repeat(64),
+      catalogKey: `aidlc-releases/v1/${'a'.repeat(40)}/i1/catalog.json`,
+      manifestKey: `aidlc-releases/v1/${'a'.repeat(40)}/i1/manifest.json`,
+    };
+    deps.store.getExecution = vi.fn(async () => ({ ...META, methodologyRelease }));
+
+    await __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
+
+    expect(deps.loadPlan).toHaveBeenCalledWith(expect.objectContaining({ methodologyRelease }));
+    const starts = stageStarts();
+    expect(starts.length).toBeGreaterThan(0);
+    for (const start of starts) {
+      expect(start.methodologyRelease).toEqual(methodologyRelease);
+    }
+  });
+
+  it('omits methodologyRelease entirely for an unpinned intent', async () => {
+    await __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
+
+    for (const call of deps.loadPlan.mock.calls) {
+      expect(call[0]).not.toHaveProperty('methodologyRelease');
+    }
+    const starts = stageStarts();
+    expect(starts.length).toBeGreaterThan(0);
+    for (const start of starts) {
+      expect(start).not.toHaveProperty('methodologyRelease');
     }
   });
 
@@ -1075,6 +1277,45 @@ describe('retired-run ownership', () => {
     expect(statuses).not.toContain('CANCELLED');
   });
 
+  it('returns retired when a gate is superseded after callback bind and delivery never resolves', async () => {
+    const meta = { ...META, parkReleaseSeconds: null };
+    deps.store.getExecution.mockResolvedValue(meta);
+    deps.loadPlan.mockResolvedValue({
+      valid: true,
+      plan: { stages: [{ stageId: 'a', stageInstanceId: 'si-a' }] },
+    });
+    let superseded = false;
+    deps.store.setGateCallbackId = vi.fn(async () => {
+      superseded = true;
+      return {};
+    });
+    deps.store.getHumanTask = vi.fn(async () => (superseded ? { status: 'superseded' } : null));
+
+    const unresolvedGateCtx = makeCtx();
+    const createStageCallback = unresolvedGateCtx.createCallback;
+    unresolvedGateCtx.createCallback = async (name) =>
+      String(name).startsWith('await-')
+        ? [new Promise(() => {}), `cb-${name}`]
+        : createStageCallback(name);
+    deps.invokeRuntime = makeRuntime(unresolvedGateCtx, (payload, n) => {
+      if (n === 1) return { ok: true }; // init-ws
+      return { ok: true, state: 'WAITING_FOR_HUMAN', humanTaskId: 'h1' };
+    });
+
+    const result = await __durableHandler(
+      { action: 'start', intentId: 'i1', executionId: 'i1' },
+      unresolvedGateCtx,
+      deps,
+    );
+
+    expect(result).toMatchObject({ ok: false, reason: 'retired', humanTaskId: 'h1' });
+    expect(deps.store.setGateCallbackId).toHaveBeenCalledWith(
+      expect.objectContaining({ executionId: 'i1', humanTaskId: 'h1' }),
+    );
+    expect(stageStarts()).toHaveLength(1);
+    expect(stageStarts().some((start) => start.resumeFrom)).toBe(false);
+  });
+
   it('claims the run with an ownership token and CASes terminal writes on it', async () => {
     await __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
     const calls = deps.store.updateExecution.mock.calls.map((c) => c[0]);
@@ -1508,6 +1749,33 @@ describe('WP5 — parallel sections: lanes, skeleton, ladder, halt-and-ask', () 
     expect(eventCalls.some((e) => e.type === 'v2.units.halt_decision')).toBe(true);
   });
 
+  it('treats a lane stage failed for a missing checkpoint like any lane failure', async () => {
+    deps.invokeRuntime = makeRuntime(ctx, (payload) => {
+      if (payload.command === 'init-ws') return { ok: true };
+      if (payload.command === 'promote-units')
+        return { ok: true, unitCount: 2, batchCount: 2, walkingSkeleton: 'auth' };
+      if (payload.stageId === 'cg' && payload.unitSlug === 'auth')
+        return {
+          ok: false,
+          state: 'FAILED',
+          reason: 'plan_approval_missing',
+          detail: 'The implementation plan was never approved',
+        };
+      return { ok: true, state: 'SUCCEEDED' };
+    });
+
+    const res = await start();
+
+    expect(res).toMatchObject({ ok: false, reason: 'section_aborted' });
+    expect(unitStates.map((u) => `${u.slug}:${u.state}`)).toEqual(['auth:RUNNING', 'auth:FAILED']);
+    expect(unitStates[1].fields.failureReason).toContain('plan_approval_missing');
+    expect(stageStarts().some((p) => p.command === 'merge-lane' && p.unitSlug === 'auth')).toBe(
+      false,
+    );
+    const eventCalls = deps.store.appendEvent.mock.calls.map((c) => c[0]);
+    expect(eventCalls.some((e) => e.type === 'v2.unit.failed' && e.unitSlug === 'auth')).toBe(true);
+  });
+
   it('fails deterministically (unit_plan_missing) when a section starts without a promoted plan', async () => {
     deps.store.getUnitPlan = vi.fn(async () => null);
     // Drop the promote hook trigger so the missing plan is what's under test.
@@ -1543,6 +1811,55 @@ describe('WP5 — parallel sections: lanes, skeleton, ladder, halt-and-ask', () 
       'cb-stage-cb-fd-s1-u-auth',
       'cb-stage-cb-fd-s1-u-auth-resume-h9',
     ]);
+  });
+
+  it('resumes a lane gate while META remains RUNNING without applying the WAITING CAS', async () => {
+    let runId = null;
+    const cas = Object.assign(new Error('META is not WAITING'), {
+      name: 'ConditionalCheckFailedException',
+    });
+    deps.store.updateExecution = vi.fn(async (input) => {
+      if (input.orchestratorRunId) runId = input.orchestratorRunId;
+      if (input.fromStatus === 'WAITING') throw cas;
+      return input.orchestratorRunId ? { orchestratorRunId: input.orchestratorRunId } : {};
+    });
+    deps.store.getExecution = vi.fn(async (_executionId, options) =>
+      options?.consistentRead
+        ? META
+        : {
+            ...META,
+            status: 'RUNNING',
+            pendingHumanTaskId: null,
+            orchestratorRunId: runId,
+          },
+    );
+    deps.store.getHumanTask = vi.fn(async () => ({ status: 'answered' }));
+    let parked = false;
+    deps.invokeRuntime = makeRuntime(ctx, (payload) => {
+      if (payload.command === 'init-ws') return { ok: true };
+      if (payload.command === 'promote-units') return { ok: true, unitCount: 2, batchCount: 2 };
+      if (payload.stageId === 'fd' && payload.unitSlug === 'auth' && !parked) {
+        parked = true;
+        return { ok: true, state: 'WAITING_FOR_HUMAN', humanTaskId: 'h-lane', unitSlug: 'auth' };
+      }
+      return { ok: true, state: 'SUCCEEDED' };
+    });
+
+    const res = await start();
+
+    expect(res.ok).toBe(true);
+    const fdAuth = stageStarts().filter(
+      (payload) => payload.stageId === 'fd' && payload.unitSlug === 'auth',
+    );
+    expect(fdAuth.map((payload) => payload.resumeFrom)).toEqual([null, 'h-lane']);
+    expect(
+      deps.store.updateExecution.mock.calls.some(([input]) => input.fromStatus === 'WAITING'),
+    ).toBe(false);
+    expect(
+      deps.store.updateExecution.mock.calls.some(
+        ([input]) => input.status === 'RUNNING' && input.pendingHumanTaskId === null,
+      ),
+    ).toBe(false);
   });
 
   it('rewind past a section verifies every unit instance (SUCCEEDED or SKIPPED)', async () => {
@@ -1674,6 +1991,67 @@ describe('PR per unit delivery', () => {
   const start = () =>
     __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
 
+  it('refuses pr-per-unit on a provider without drafts before any lane starts', async () => {
+    const arn = 'arn:aws:codecommit:eu-west-1:123456789012:app';
+    configure({ repos: [arn], statusFor: async () => null });
+    const baseMeta = await deps.store.getExecution();
+    deps.store.getExecution = vi.fn(async () => ({
+      ...baseMeta,
+      repoProviders: { [arn]: 'codecommit' },
+    }));
+    const result = await start();
+    // The execution fails loudly with the reason, before any unit PR call.
+    expect(result).toMatchObject({
+      ok: false,
+      detail: expect.stringContaining('PR per unit needs draft pull requests'),
+    });
+    expect(deps.unitPrProvider.createDraft).not.toHaveBeenCalled();
+    expect(deps.unitPrProvider.setDraft).not.toHaveBeenCalled();
+    expect(unitStates.map((row) => row.state)).not.toContain('PR_DRAFT');
+  });
+
+  it('replaces a closed unit PR with a new creation attempt', async () => {
+    const calls = new Map();
+    configure({
+      statusFor: async ({ number }) => {
+        const call = (calls.get(number) ?? 0) + 1;
+        calls.set(number, call);
+        return {
+          providerId: `provider-${number}`,
+          number,
+          url: `https://example.test/pr/${number}`,
+          sourceBranch: 'aidlc/i1--s1-unit-auth',
+          targetBranch: 'aidlc/i1',
+          headSha: `head-${number}`,
+          targetSha: 'intent-before',
+          // PR 5 was closed and cannot reopen (CodeCommit); the replacement
+          // follows the normal draft -> merged lifecycle.
+          state: number === 5 ? 'closed' : call >= 3 ? 'merged' : 'open',
+          draft: number !== 5 && call < 3,
+          mergeable: true,
+        };
+      },
+    });
+    unitPrRows.set('owner/repo', {
+      executionId: 'i1',
+      sectionIndex: 1,
+      unitSlug: 'auth',
+      repository: 'owner/repo',
+      provider: 'github',
+      number: 5,
+      sourceBranch: 'aidlc/i1--s1-unit-auth',
+      targetBranch: 'aidlc/i1',
+      state: 'CLOSED',
+    });
+
+    const result = await start();
+    expect(result.ok).toBe(true);
+    expect(deps.unitPrProvider.createDraft).toHaveBeenCalledOnce();
+    // The key names the PR being replaced, so the provider cannot hand back
+    // the closed PR for a reused idempotency token.
+    expect(deps.unitPrProvider.createDraft.mock.calls[0][0].attemptKey).toBe('i1:1:auth:5');
+  });
+
   it('opens a draft, releases lane compute, reconciles, promotes, and verifies integration', async () => {
     const calls = new Map();
     configure({
@@ -1701,6 +2079,8 @@ describe('PR per unit delivery', () => {
     expect(deps.unitPrProvider.createDraft.mock.calls[0][0].body).toContain(
       '[AI-DLC](https://aidlc.example.test/space/p1/intent/i1) unit review for auth',
     );
+    // First creation attempt for this unit: no PR being replaced.
+    expect(deps.unitPrProvider.createDraft.mock.calls[0][0].attemptKey).toBe('i1:1:auth:initial');
     expect(deps.unitPrProvider.setDraft).toHaveBeenCalledWith(
       expect.objectContaining({ number: 7, draft: false }),
     );
@@ -2558,6 +2938,11 @@ describe('WP6 — PR opened on SUCCEEDED (intent-pr)', () => {
       baseBranch: 'main',
       title: 'Bookstore API',
     });
+    // One creation attempt per orchestrator run (the run's ownership token).
+    const claim = deps.store.updateExecution.mock.calls
+      .map((c) => c[0])
+      .find((c) => c.orchestratorRunId);
+    expect(deps.openPr.mock.calls[0][0].attemptKey).toBe(`i1:${claim.orchestratorRunId}`);
     expect(deps.openPr.mock.calls[0][0].body).toContain(
       'created by [AI-DLC](https://aidlc.example.test/space/p1/intent/i1)',
     );
@@ -2566,6 +2951,22 @@ describe('WP6 — PR opened on SUCCEEDED (intent-pr)', () => {
     const opened = events().filter((e) => e.type === 'v2.pr.opened');
     expect(opened).toHaveLength(2);
     expect(opened[0].summary).toContain('https://github.com/o/r/pull/7');
+  });
+
+  it('a relaunch of the same intent is a new PR creation attempt', async () => {
+    // Rewind/repair relaunch the SAME execution id under a new run id. The PR
+    // a reviewer closed meanwhile must not be replayed by a reused
+    // idempotency key (CodeCommit returns the original, closed PR for it).
+    deps.openPr = vi.fn(async () => ({ prUrl: 'https://example.test/pr/1', prNumber: 1 }));
+    await start();
+    ctx = makeCtx();
+    deps.invokeRuntime = makeRuntime(ctx, okScript);
+    await start();
+    const keys = deps.openPr.mock.calls.map((c) => c[0].attemptKey);
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toMatch(/^i1:run-/);
+    expect(keys[1]).toMatch(/^i1:run-/);
+    expect(keys[0]).not.toBe(keys[1]);
   });
 
   it('dispatches record-pr to the runtime with the structured PR data for each opened PR', async () => {

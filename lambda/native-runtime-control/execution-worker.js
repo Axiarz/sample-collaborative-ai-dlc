@@ -215,7 +215,8 @@ const checkedCredentials = (row, material) => {
   if (!material?.ok) {
     const code = material?.code;
     if (code === 'NATIVE_EXECUTION_CREDENTIALS_FORBIDDEN') fail('NATIVE_EXECUTION_FORBIDDEN');
-    if (code === 'NATIVE_EXECUTION_CREDENTIALS_IMAGE_REVOKED') fail('NATIVE_EXECUTION_IMAGE_REVOKED');
+    if (code === 'NATIVE_EXECUTION_CREDENTIALS_IMAGE_REVOKED')
+      fail('NATIVE_EXECUTION_IMAGE_REVOKED');
     if (
       [
         'NATIVE_EXECUTION_CREDENTIALS_CHANGED',
@@ -272,27 +273,50 @@ export const createNativeExecutionSupervisor =
     const observe = (value) => emitNativeExecutionDiagnostic(diagnostics, value);
     const observedInvoke = async (input) => {
       const phase = nativeDiagnosticPhase(input.payload.command);
-      if (['native-start','native-continue','native-recover'].includes(input.payload.command)) recordNativeBoundary(executionIdentity(row),'dispatchStarted',now(),{sequence:nativeTurnSequence(row),writerGeneration:nativeWriterGeneration(row)});
+      if (['native-start', 'native-continue', 'native-recover'].includes(input.payload.command))
+        recordNativeBoundary(executionIdentity(row), 'dispatchStarted', now(), {
+          sequence: nativeTurnSequence(row),
+          writerGeneration: nativeWriterGeneration(row),
+        });
       try {
         const report = await invoke(input);
-        if (activity && input.payload.command === 'native-status' && report?.capabilities?.includes('activity-v1')) {
+        if (
+          activity &&
+          input.payload.command === 'native-status' &&
+          report?.capabilities?.includes('activity-v1')
+        ) {
           checkReportIdentity(row, report);
           let after = await activity.cursor(row);
           for (let page = 0; page < 4; page++) {
             await check();
-            const batch = await invoke({ execution: row, payload: {
-              command: 'native-activity', ...writerPayload(row), after,
-            } });
+            const batch = await invoke({
+              execution: row,
+              payload: {
+                command: 'native-activity',
+                ...writerPayload(row),
+                after,
+              },
+            });
             const persisted = await activity.ingest(row, batch);
             // The next pull is the acknowledgment; this cursor exists only
             // after persistence. A failed transaction leaves the prior cursor.
             if (persisted === after && !batch.events?.length) {
-              if (!batch.complete && ['publication_ready','failed','cancelled','stopped_needs_review'].includes(report.status))
-                throw Object.assign(new Error('Final native activity pending'), { code: batch.cold ? 'NATIVE_ACTIVITY_UNCLOSED' : 'NATIVE_ACTIVITY_PENDING' });
+              if (
+                !batch.complete &&
+                ['publication_ready', 'failed', 'cancelled', 'stopped_needs_review'].includes(
+                  report.status,
+                )
+              )
+                throw Object.assign(new Error('Final native activity pending'), {
+                  code: batch.cold ? 'NATIVE_ACTIVITY_UNCLOSED' : 'NATIVE_ACTIVITY_PENDING',
+                });
               break;
             }
             after = persisted;
-            if (page === 3) throw Object.assign(new Error('Native activity catch-up pending'), { code: 'NATIVE_ACTIVITY_PENDING' });
+            if (page === 3)
+              throw Object.assign(new Error('Native activity catch-up pending'), {
+                code: 'NATIVE_ACTIVITY_PENDING',
+              });
           }
         }
         observation = { phase, ...nativeDiagnosticReport(row, report) };
@@ -507,7 +531,7 @@ export const createNativeExecutionSupervisor =
           interactions,
         });
         await check();
-        recordNativeBoundary(executionIdentity(row),'graphStarted',now());
+        recordNativeBoundary(executionIdentity(row), 'graphStarted', now());
         await project({
           draft,
           publication: row.publication,
@@ -515,7 +539,7 @@ export const createNativeExecutionSupervisor =
           interaction,
           authorize: check,
         });
-        recordNativeBoundary(executionIdentity(row),'graphCompleted',now());
+        recordNativeBoundary(executionIdentity(row), 'graphCompleted', now());
         row = await store.projected({ row });
         return {
           pending: ['DISPATCHING', 'RUNNING', 'RECOVERING'].includes(row.status),
@@ -530,7 +554,7 @@ export const createNativeExecutionSupervisor =
         if (!row.target) {
           const result = await upgrade({ draft, execution: row, authorize: check });
           if (result.ready) {
-            recordNativeBoundary(executionIdentity(row),'targetReady',now());
+            recordNativeBoundary(executionIdentity(row), 'targetReady', now());
             await advance({ target: result.target });
           }
           return yieldPending();
@@ -837,7 +861,8 @@ export const createNativeExecutionSupervisor =
         }
       }
       if (error?.code === 'NATIVE_ACTIVITY_UNCLOSED') return requireRecovery('DELIVERY_UNCERTAIN');
-      if (['NATIVE_ACTIVITY_PENDING', 'NATIVE_ACTIVITY_CONFLICT'].includes(error?.code)) return yieldPending();
+      if (['NATIVE_ACTIVITY_PENDING', 'NATIVE_ACTIVITY_CONFLICT'].includes(error?.code))
+        return yieldPending();
       if (shortTransportRetry(error)) {
         // SDK transport uncertainty retains the same attempt/session. Release
         // and send a fresh short-delay pointer instead of waiting for the long
@@ -1084,7 +1109,11 @@ export const createNativeExecutionWorker =
           publications,
           interactions,
           diagnostics,
-          activity: createNativeActivityStore({ ddb, tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE, broadcast: broadcastToNativeIntentChannel }),
+          activity: createNativeActivityStore({
+            ddb,
+            tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE,
+            broadcast: broadcastToNativeIntentChannel,
+          }),
           imagePolicy: createNativeRuntimeImagePolicy({
             ddb,
             tableName: env.NATIVE_RUNTIME_BINDINGS_TABLE,

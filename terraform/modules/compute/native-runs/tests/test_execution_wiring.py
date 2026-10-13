@@ -117,9 +117,12 @@ class NativeExecutionWiring(unittest.TestCase):
     def test_api_cannot_redeem_credentials_or_write_publications(self):
         api = EXECUTION.split("execution_api_statements = [", 1)[1].split("execution_runtime_boundary_statements = [", 1)[0]
         self.assertEqual(actions(api), {
-            "dynamodb:ConditionCheckItem", "dynamodb:GetItem", "ssm:GetParameter",
+            "dynamodb:ConditionCheckItem", "dynamodb:GetItem", "dynamodb:Query", "ssm:GetParameter",
             "lambda:InvokeFunction", "s3:GetObjectVersion", "sqs:SendMessage",
         })
+        # Output history queries are restricted to the protected native table.
+        self.assertRegex(api, r'Sid\s*=\s*"ReadNativeOutputHistory"[^}]*Action\s*=\s*\["dynamodb:Query"\][^}]*Resource\s*=\s*aws_dynamodb_table\.bindings\.arn')
+        self.assertNotIn("dynamodb:Scan", actions(api))
         self.assertIn("var.agent_credential_metadata_function_arn", api)
         self.assertNotIn("module.execution_credentials", api)
         self.assertIn('"${local.ssm_prefix_arn}/cli-models"', api)

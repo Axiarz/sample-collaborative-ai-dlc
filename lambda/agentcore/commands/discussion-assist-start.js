@@ -1,3 +1,4 @@
+import { runCredentialJob } from '../credential-session.js';
 // discussion-assist-start — async Quorum responses for intent discussions.
 //
 // The discussions Lambda creates a pending agent-authored DiscussionMessage and
@@ -62,7 +63,8 @@ const NATIVE_ID_PROP = 'native_discussion_root';
 const scopeProp = (native) => (native ? NATIVE_ID_PROP : 'intent_id');
 // Error-only, redacted, bounded CLI diagnostic: lines that look like errors,
 // with token-shaped strings removed. Never the prompt or an answer body.
-const ERROR_LINE = /error|fail|denied|unauthori[sz]ed|forbidden|invalid|not found|unsupported|throttl|quota/i;
+const ERROR_LINE =
+  /error|fail|denied|unauthori[sz]ed|forbidden|invalid|not found|unsupported|throttl|quota/i;
 export const cliErrorTail = (sample) => {
   if (typeof sample !== 'string' || !sample) return null;
   const lines = sample
@@ -71,7 +73,10 @@ export const cliErrorTail = (sample) => {
     .map((line) =>
       line
         .replace(/ABSK[A-Za-z0-9+/=_-]{8,}/g, '[redacted]')
-        .replace(/(?:Bearer|token|key|secret|signature)["'=:\s]+[A-Za-z0-9+/=._-]{12,}/gi, '[redacted]')
+        .replace(
+          /(?:Bearer|token|key|secret|signature)["'=:\s]+[A-Za-z0-9+/=._-]{12,}/gi,
+          '[redacted]',
+        )
         .replace(/[A-Za-z0-9+/=_-]{40,}/g, '[redacted]'),
     );
   const tail = lines.slice(-3).join(' | ').trim();
@@ -392,7 +397,7 @@ const buildPrompt = async ({
   } else {
     appendBounded(
       parts,
-      'This is a native execution artifact. Discuss only the supplied revision and thread; you cannot approve, apply edits, or answer workflow questions on anyone\'s behalf.',
+      "This is a native execution artifact. Discuss only the supplied revision and thread; you cannot approve, apply edits, or answer workflow questions on anyone's behalf.",
     );
   }
   if (recentEvents.length)
@@ -480,7 +485,13 @@ export const createDiscussionAssistStart = ({
             { projectId, executionId: nativeContext.executionId },
             { action: 'discussion.message', sprintId: intentId, discussionId, message },
           )
-        : broadcast({ action: 'discussion.message', intentId, sprintId: intentId, discussionId, message });
+        : broadcast({
+            action: 'discussion.message',
+            intentId,
+            sprintId: intentId,
+            discussionId,
+            message,
+          });
     const key = jobKey(payload);
     if (activeJobs.has(key)) {
       return { ok: true, accepted: true, alreadyRunning: true, requestId, messageId };
@@ -488,7 +499,7 @@ export const createDiscussionAssistStart = ({
     activeJobs.set(key, { startedAt: Date.now(), messageId });
     busy?.enter();
 
-    const job = (async () => {
+    const job = runCredentialJob(async () => {
       let g;
       try {
         g = await openGraph();
@@ -526,6 +537,7 @@ export const createDiscussionAssistStart = ({
           projectId,
           stageInstanceId: null,
           role: 'reader',
+          mode: 'discussion',
           discussionId,
           messageId,
         };
@@ -569,14 +581,15 @@ export const createDiscussionAssistStart = ({
               })
               .catch(() => {});
           }
-          if (!native) await store
-            ?.appendEvent?.({
-              executionId: intentId,
-              type: 'v2.discussion_assist.completed',
-              actor: 'quorum',
-              summary: `Quorum ${assistCommand} completed for discussion ${discussionId}`,
-            })
-            .catch(() => {});
+          if (!native)
+            await store
+              ?.appendEvent?.({
+                executionId: intentId,
+                type: 'v2.discussion_assist.completed',
+                actor: 'quorum',
+                summary: `Quorum ${assistCommand} completed for discussion ${discussionId}`,
+              })
+              .catch(() => {});
         } else {
           // Native threads have no platform process events; keep the reason code
           // (never prompt or answer content) diagnosable in the container log.
@@ -598,14 +611,15 @@ export const createDiscussionAssistStart = ({
             status: 'failed',
             native,
           });
-          if (!native) await store
-            ?.appendEvent?.({
-              executionId: intentId,
-              type: 'v2.discussion_assist.failed',
-              actor: 'quorum',
-              summary: `Quorum ${assistCommand} failed: ${out.reason || 'unknown'}`,
-            })
-            .catch(() => {});
+          if (!native)
+            await store
+              ?.appendEvent?.({
+                executionId: intentId,
+                type: 'v2.discussion_assist.failed',
+                actor: 'quorum',
+                summary: `Quorum ${assistCommand} failed: ${out.reason || 'unknown'}`,
+              })
+              .catch(() => {});
         }
         if (message) await publish(message);
       } catch (err) {
@@ -631,7 +645,7 @@ export const createDiscussionAssistStart = ({
         activeJobs.delete(key);
         busy?.leave();
       }
-    })();
+    });
     job.catch((err) => log(`job promise rejected unexpectedly (${key}):`, err?.message));
 
     return { ok: true, accepted: true, requestId, messageId, jobKey: key };

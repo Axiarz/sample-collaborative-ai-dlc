@@ -54,6 +54,54 @@ variable "sso_providers" {
   sensitive = true
 }
 
+variable "custom_domain" {
+  description = "Custom hostname for the Cognito managed-login domain. Empty uses only the generated *.amazoncognito.com prefix domain."
+  type        = string
+  default     = ""
+}
+
+variable "custom_domain_active" {
+  description = "Select the custom domain for login outputs only after the operator has verified DNS and upstream IdP callback readiness."
+  type        = bool
+  default     = false
+}
+
+variable "custom_domain_certificate_arn" {
+  description = "ARN of an issued us-east-1 ACM certificate covering custom_domain. Required when custom_domain is set."
+  type        = string
+  default     = ""
+}
+
+variable "lambda_vpc_scope" {
+  description = "Lambda VPC placement scope"
+  type        = string
+  default     = "required"
+}
+
+variable "vpc_subnet_ids" {
+  description = "Private subnet IDs used when lambda_vpc_scope is all"
+  type        = list(string)
+  default     = []
+}
+
+variable "vpc_security_group_ids" {
+  description = "Security group IDs used when lambda_vpc_scope is all"
+  type        = list(string)
+  default     = []
+}
+
+variable "web_acl_arn" {
+  description = "ARN of a regional AWS WAFv2 web ACL. Empty leaves the user pool without AWS WAF."
+  type        = string
+  default     = ""
+}
+
+variable "waf_enabled" {
+  description = "Whether to associate the user pool with AWS WAF"
+  type        = bool
+  default     = false
+}
+
 variable "tags" {
   description = "Tags to apply to resources"
   type        = map(string)

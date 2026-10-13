@@ -147,9 +147,9 @@ describe('native API image policy availability', () => {
     expect((await api.publication(f.prepared, f.recheck)).files).toHaveLength(1);
     expect((await api.interaction(f.prepared, f.recheck)).messages).toHaveLength(1);
     const before = f.row();
-    await expect(api.respond(f.prepared, 'member-two', f.replyRequest(), f.recheck)).rejects.toMatchObject(
-      { code: 'NATIVE_EXECUTION_UNAVAILABLE' },
-    );
+    await expect(
+      api.respond(f.prepared, 'member-two', f.replyRequest(), f.recheck),
+    ).rejects.toMatchObject({ code: 'NATIVE_EXECUTION_UNAVAILABLE' });
     expect(f.row()).toEqual(before);
   });
 });

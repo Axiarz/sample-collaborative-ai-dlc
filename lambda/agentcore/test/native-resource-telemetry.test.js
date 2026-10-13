@@ -12,7 +12,10 @@ const system = {
   freemem: () => GiB,
   loadavg: () => [1.234, 0, 0],
 };
-const proc = { memoryUsage: () => ({ rss: 300 * 1024 ** 2, heapUsed: 90 * 1024 ** 2 }), uptime: () => 41.7 };
+const proc = {
+  memoryUsage: () => ({ rss: 300 * 1024 ** 2, heapUsed: 90 * 1024 ** 2 }),
+  uptime: () => 41.7,
+};
 const cgroup = {
   '/sys/fs/cgroup/memory.current': '7516192768\n',
   '/sys/fs/cgroup/memory.max': 'max\n',
@@ -25,13 +28,25 @@ const read = vi.fn(async (path) => {
   throw Object.assign(new Error('missing'), { code: 'ENOENT' });
 });
 const readdir = vi.fn(async () => ['1', '17', '204', 'self', 'meminfo']);
-const statfs = vi.fn(async (path) => ({ bsize: 4096, blocks: path === '/tmp' ? 1000 : 2000, bavail: path === '/tmp' ? 10 : 500 }));
+const statfs = vi.fn(async (path) => ({
+  bsize: 4096,
+  blocks: path === '/tmp' ? 1000 : 2000,
+  bavail: path === '/tmp' ? 10 : 500,
+}));
 
 afterEach(() => vi.useRealTimers());
 
 describe('native resource samples', () => {
   it('reports cgroup memory, OOM counters, processes and free disk as numbers only', async () => {
-    const sample = await sampleNativeResources({ reason: 'busy', read, readdir, statfs, system, proc, now: () => 5 });
+    const sample = await sampleNativeResources({
+      reason: 'busy',
+      read,
+      readdir,
+      statfs,
+      system,
+      proc,
+      now: () => 5,
+    });
     expect(sample).toEqual({
       type: 'native.resources',
       reason: 'busy',
@@ -61,22 +76,51 @@ describe('native resource samples', () => {
     const fail = vi.fn(async () => {
       throw new Error('denied');
     });
-    const sample = await sampleNativeResources({ reason: 'boot', read: fail, readdir: fail, statfs: fail, system, proc });
-    expect(sample.cgroup).toEqual({ currentBytes: null, maxBytes: null, peakBytes: null, oom: null, oomKill: null });
+    const sample = await sampleNativeResources({
+      reason: 'boot',
+      read: fail,
+      readdir: fail,
+      statfs: fail,
+      system,
+      proc,
+    });
+    expect(sample.cgroup).toEqual({
+      currentBytes: null,
+      maxBytes: null,
+      peakBytes: null,
+      oom: null,
+      oomKill: null,
+    });
     expect(sample.processes).toBeNull();
     expect(sample.kernelOomKills).toBeNull();
     expect(sample.disks).toEqual({ root: null, tmp: null, homes: null });
   });
 
   it('ignores malformed cgroup values', async () => {
-    const bad = vi.fn(async (path) => ({
-      '/sys/fs/cgroup/memory.current': '-1\n',
-      '/sys/fs/cgroup/memory.max': '1e9',
-      '/sys/fs/cgroup/memory.peak': '',
-      '/sys/fs/cgroup/memory.events': 'oom x\noom_kill -2\n',
-    })[path]);
-    const sample = await sampleNativeResources({ reason: 'busy', read: bad, readdir, statfs, system, proc });
-    expect(sample.cgroup).toEqual({ currentBytes: null, maxBytes: null, peakBytes: null, oom: null, oomKill: null });
+    const bad = vi.fn(
+      async (path) =>
+        ({
+          '/sys/fs/cgroup/memory.current': '-1\n',
+          '/sys/fs/cgroup/memory.max': '1e9',
+          '/sys/fs/cgroup/memory.peak': '',
+          '/sys/fs/cgroup/memory.events': 'oom x\noom_kill -2\n',
+        })[path],
+    );
+    const sample = await sampleNativeResources({
+      reason: 'busy',
+      read: bad,
+      readdir,
+      statfs,
+      system,
+      proc,
+    });
+    expect(sample.cgroup).toEqual({
+      currentBytes: null,
+      maxBytes: null,
+      peakBytes: null,
+      oom: null,
+      oomKill: null,
+    });
   });
 });
 
@@ -89,7 +133,13 @@ describe('native resource telemetry cadence', () => {
     let busy = false;
     const log = vi.fn();
     const sample = vi.fn(async ({ reason }) => ({ type: 'native.resources', reason }));
-    const stop = startNativeResourceTelemetry({ isBusy: () => busy, intervalMs: 1000, log, sample, proc: fakeProc() });
+    const stop = startNativeResourceTelemetry({
+      isBusy: () => busy,
+      intervalMs: 1000,
+      log,
+      sample,
+      proc: fakeProc(),
+    });
     await flush();
     vi.advanceTimersByTime(3000);
     await flush();
@@ -146,7 +196,9 @@ describe('native resource telemetry cadence', () => {
     const log = vi.fn();
     startNativeResourceTelemetry({ isBusy: () => true, log, sample: async () => ({}), proc: p });
     p.emit('SIGTERM');
-    expect(log).toHaveBeenCalledWith(expect.objectContaining({ type: 'native.signal', signal: 'SIGTERM', busy: true }));
+    expect(log).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'native.signal', signal: 'SIGTERM', busy: true }),
+    );
     expect(p.kill).toHaveBeenCalledWith(4242, 'SIGTERM');
     // The handler was registered once, so the re-raised signal terminates normally.
     expect(p.listenerCount('SIGTERM')).toBe(0);

@@ -63,7 +63,7 @@ locals {
     }
     outputs = {
       method = "GET", resource_id = aws_api_gateway_resource.native_execution_action["outputs"].id,
-      path = "api/projects/*/native-intents/*/outputs", item = true
+      path   = "api/projects/*/native-intents/*/outputs", item = true
     }
     publication = {
       method = "GET", resource_id = aws_api_gateway_resource.native_execution_action["publication"].id,

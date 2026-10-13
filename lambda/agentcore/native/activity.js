@@ -29,211 +29,22 @@ import {
 import { join } from 'node:path';
 import { createCliOutputSink } from '../output-normalizer.js';
 
-export const NATIVE_ACTIVITY_CAPABILITY = 'activity-v1';
-export const NATIVE_ACTIVITY_LIMITS = Object.freeze({
-  contentBytes: 8 * 1024,
-  detailsBytes: 8 * 1024,
-  summaryBytes: 1024,
-  titleBytes: 512,
-  memoryEvents: 2000,
-  memoryBytes: 4 * 1024 * 1024,
-  segmentBytes: 1024 * 1024,
-  spoolBytes: 256 * 1024 * 1024,
-  lineChars: 1024 * 1024,
-  batchEvents: 64,
-  batchBytes: 160 * 1024,
-  heldEvents: 32,
-  flushMs: 80,
-});
-const TYPES = new Set(['message', 'tool', 'edit', 'batch_read', 'artifact', 'question', 'system']);
-const LEVELS = new Set(['info', 'success', 'warning', 'error']);
-const PROJECT = '/mnt/native/project';
-const REDACTED = '[REDACTED]';
-// A secret window this long is treated as a credential fragment. Shorter runs
-// at a boundary may leak at most HOLD - 1 characters before being held.
-const GRAM = 4;
-const HOLD = 4;
-
+import {
+  NATIVE_ACTIVITY_LIMITS,
+  nativePublicActivity,
+  createNativeSecretGuard,
+  FIELDS,
+  applyMarks,
+} from '../../shared/native-activity.js';
+export {
+  NATIVE_ACTIVITY_CAPABILITY,
+  NATIVE_ACTIVITY_LIMITS,
+  nativePublicActivity,
+  createNativeSecretGuard,
+  truncateUtf8,
+  redactCredentialShapes,
+} from '../../shared/native-activity.js';
 const utf8Bytes = (value) => Buffer.byteLength(value, 'utf8');
-export const truncateUtf8 = (value, maxBytes) => {
-  if (utf8Bytes(value) <= maxBytes) return value;
-  const suffix = (omitted) => `\n… [${omitted} bytes omitted]`;
-  const budget = maxBytes - utf8Bytes(suffix(9999999));
-  let end = Math.max(0, Math.min(value.length, budget));
-  while (end > 0 && utf8Bytes(value.slice(0, end)) > budget) end--;
-  // Never split a surrogate pair.
-  if (end > 0 && /[\uD800-\uDBFF]/.test(value[end - 1])) end--;
-  return `${value.slice(0, end)}${suffix(utf8Bytes(value) - utf8Bytes(value.slice(0, end)))}`;
-};
-
-// Paths whose contents belong to the runtime, harness homes, recovery state or
-// the private project subset (see shared/native-project-files.js).
-const PRIVATE_PATH =
-  /(?:\/mnt\/native\/(?:\.native-control|machine|packages|package-downloads)(?![\w-])|\/home\/node(?![\w-])|(?<![\w.-])\/root(?![\w.-])|\/proc\/|\/run\/secrets|(?<![\w-])\.native-(?:control|homes)(?![\w-])|\.aidlc-sessions|steering-token-key|(?<![\w-])\.(?:codex|claude|kiro|opencode|agents|aidlc)\/|(?<![\w-])\.git\/(?:config|credentials|objects|index|HEAD|refs|hooks)|\.aidlc-engine\/\S*(?:lock|mutex|key))/;
-const ABSOLUTE_PRIVATE =
-  /(?:\/mnt\/native\/(?:\.native-control|machine|packages|package-downloads)|\/home\/node|(?<![\w.-])\/root(?=\/|\b)|\/proc|\/run\/secrets)[^\s"'`)\]}>,;]*/g;
-const PLACEHOLDER = '‹private path›';
-
-const CREDENTIAL_PATTERNS = [
-  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, `${REDACTED}`],
-  [/\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b/g, REDACTED],
-  [
-    /\b(?:gh[pousr]_[A-Za-z0-9]{30,255}|github_pat_[A-Za-z0-9_]{22,255}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g,
-    REDACTED,
-  ],
-  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED],
-  [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}/gi, `$1 ${REDACTED}`],
-  [/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi, `$1${REDACTED}@`],
-  [
-    /\b([A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|ACCESS_?KEY|SESSION|PRIVATE_?KEY|AUTH)[A-Za-z0-9_]*)=(?:"[^"\n]*"|'[^'\n]*'|[^\s"']+)/gi,
-    `$1=${REDACTED}`,
-  ],
-  [
-    /("[A-Za-z0-9_-]*(?:token|secret|password|passwd|credential|api_?key|access_?key|session|private_?key|authorization)[A-Za-z0-9_-]*"\s*:\s*)"(?:[^"\\]|\\.)*"/gi,
-    `$1"${REDACTED}"`,
-  ],
-];
-export const redactCredentialShapes = (value) =>
-  CREDENTIAL_PATTERNS.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), value);
-
-const relativize = (value) =>
-  value
-    .replaceAll(`${PROJECT}/`, '')
-    .replace(new RegExp(`${PROJECT.replaceAll('/', '\\/')}(?![\\w/.-])`, 'g'), '.');
-
-/**
- * Streaming guard for known credential values. Any window of GRAM characters
- * shared with a secret is redacted, across field and event boundaries. An
- * event whose tail could continue a secret is held until more output arrives.
- */
-export const createNativeSecretGuard = (forbiddenBytes = []) => {
-  const secrets = new Set();
-  for (const value of forbiddenBytes) {
-    const text = Buffer.isBuffer(value) ? value.toString('utf8') : String(value ?? '');
-    if (text.length < 6) continue;
-    secrets.add(text);
-    for (const encoded of [encodeURIComponent(text), JSON.stringify(text).slice(1, -1)])
-      if (encoded !== text) secrets.add(encoded);
-  }
-  const windows = new Map();
-  const holdGrams = new Set();
-  for (const secret of secrets) {
-    const width = Math.min(GRAM, secret.length);
-    let grams = windows.get(width);
-    if (!grams) windows.set(width, (grams = new Set()));
-    for (let i = 0; i + width <= secret.length; i++) grams.add(secret.slice(i, i + width));
-    for (let width = 1; width <= HOLD; width++)
-      for (let i = 0; i + width <= secret.length; i++) holdGrams.add(secret.slice(i, i + width));
-  }
-  const tailLength = Math.max(0, ...windows.keys()) - 1;
-  return {
-    active: secrets.size > 0,
-    tailLength: Math.max(0, tailLength),
-    mark(text) {
-      const marks = new Uint8Array(text.length);
-      for (const [width, grams] of windows) {
-        for (let i = 0; i + width <= text.length; i++) {
-          if (grams.has(text.slice(i, i + width))) marks.fill(1, i, i + width);
-        }
-      }
-      return marks;
-    },
-    risky: (text) => {
-      for (let width = Math.min(HOLD, text.length); width > 0; width--)
-        if (holdGrams.has(text.slice(-width))) return width;
-      return 0;
-    },
-  };
-};
-
-const FIELDS = ['content', 'title', 'summary', 'details'];
-const applyMarks = (value, marks, offset) => {
-  let result = '';
-  let redacting = false;
-  for (let i = 0; i < value.length; i++) {
-    if (marks[offset + i]) {
-      if (!redacting) result += REDACTED;
-      redacting = true;
-    } else {
-      redacting = false;
-      result += value[i];
-    }
-  }
-  return result;
-};
-
-const toolLike = (display, content) =>
-  ['tool', 'edit', 'batch_read', 'artifact', 'question'].includes(display?.type) ||
-  /^\s*Running tool\b/.test(content);
-const toolName = (content, display) =>
-  /^\s*Running tool\s+[`'"]?([A-Za-z0-9_.:-]{1,80})/.exec(content)?.[1] ??
-  display?.title?.split(/[:\s]/)[0] ??
-  'tool';
-
-/**
- * Normalizer event -> bounded public fields, before the streaming secret guard.
- * Returns null for events that are never public (raw diagnostics).
- */
-export const nativePublicActivity = (event, limits = NATIVE_ACTIVITY_LIMITS, guard = null) => {
-  const display = event?.display ?? { type: 'message', level: 'info' };
-  const rawContent = typeof event?.content === 'string' ? event.content : '';
-  // Raw non-JSON diagnostics are not assistant or tool content. Errors keep
-  // their own sanitized fields; everything else is withheld.
-  if (display.type === 'raw' && display.level !== 'error') return null;
-  const type = display.type === 'raw' ? 'system' : TYPES.has(display.type) ? display.type : 'message';
-  const level = LEVELS.has(display.level) ? display.level : 'info';
-  const fields = {
-    content: rawContent,
-    title: typeof display.title === 'string' ? display.title : undefined,
-    summary: typeof display.summary === 'string' ? display.summary : undefined,
-    details: typeof display.details === 'string' ? display.details : undefined,
-  };
-  const privateTouch = FIELDS.some((key) => fields[key] && PRIVATE_PATH.test(fields[key]));
-  if (guard?.active) {
-    const joined = FIELDS.map((key) => fields[key] ?? '').join('');
-    const marks = guard.mark(joined);
-    let offset = 0;
-    for (const key of FIELDS) {
-      const value = fields[key] ?? '';
-      if (fields[key] !== undefined) fields[key] = applyMarks(value, marks, offset);
-      offset += value.length;
-    }
-  }
-  if (privateTouch && (toolLike(display, rawContent) || type === 'system')) {
-    // Never forward a tool's input/output once it touches private state.
-    const name = toolName(rawContent, display).replace(/[^A-Za-z0-9_.:-]/g, '');
-    fields.content = `Running tool ${name}\n[Input and output withheld: private runtime path]\n`;
-    fields.details = undefined;
-    fields.summary = 'Private runtime content withheld';
-  }
-  const limit = { content: limits.contentBytes, title: limits.titleBytes, summary: limits.summaryBytes, details: limits.detailsBytes };
-  for (const key of FIELDS) {
-    if (fields[key] === undefined) continue;
-    // Redact before truncation: cutting a credential must not defeat matching.
-    let value = guard?.active ? applyMarks(fields[key], guard.mark(fields[key]), 0) : fields[key];
-    value = value.replace(ABSOLUTE_PRIVATE, PLACEHOLDER);
-    value = redactCredentialShapes(relativize(value));
-    value = truncateUtf8(value, limit[key]);
-    if (guard?.active && value.includes('\n… [')) {
-      const cut = value.indexOf('\n… [');
-      const tail = guard.risky(value.slice(0, cut));
-      if (tail) value = truncateUtf8(`${value.slice(0, cut - tail)}${REDACTED}${value.slice(cut)}`, limit[key]);
-    }
-    fields[key] = value;
-  }
-  if (!fields.content && !fields.title && !fields.summary) return null;
-  return {
-    content: fields.content,
-    display: {
-      type,
-      level,
-      ...(fields.title ? { title: fields.title } : {}),
-      ...(fields.summary ? { summary: fields.summary } : {}),
-      ...(fields.details ? { details: fields.details } : {}),
-      ...(display.hiddenByDefault ? { hiddenByDefault: true } : {}),
-    },
-  };
-};
 
 const SEGMENT = /^[0-9]{8}\.jsonl$/;
 const privateSpool = (directory) => {
@@ -251,7 +62,10 @@ const privateSpool = (directory) => {
 const readSegment = (path) => {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    if (!fstatSync(fd).isFile() || fstatSync(fd).size > NATIVE_ACTIVITY_LIMITS.segmentBytes + NATIVE_ACTIVITY_LIMITS.batchBytes)
+    if (
+      !fstatSync(fd).isFile() ||
+      fstatSync(fd).size > NATIVE_ACTIVITY_LIMITS.segmentBytes + NATIVE_ACTIVITY_LIMITS.batchBytes
+    )
       throw new Error('native_activity_spool_invalid');
     return readFileSync(fd, 'utf8')
       .split('\n')
@@ -266,7 +80,12 @@ const readSegment = (path) => {
  * Read a previous hot owner's durable spool after process loss. Only events
  * after the controller's cursor are returned; nothing is deleted here.
  */
-export const readNativeActivitySpool = ({ spoolDirectory, writerGeneration, after = 0, limits = NATIVE_ACTIVITY_LIMITS }) => {
+export const readNativeActivitySpool = ({
+  spoolDirectory,
+  writerGeneration,
+  after = 0,
+  limits = NATIVE_ACTIVITY_LIMITS,
+}) => {
   const events = [];
   let bytes = 0;
   let more = false;
@@ -274,18 +93,35 @@ export const readNativeActivitySpool = ({ spoolDirectory, writerGeneration, afte
   try {
     privateSpool(spoolDirectory);
     try {
-      const fd = openSync(join(spoolDirectory, 'closed.json'), constants.O_RDONLY | constants.O_NOFOLLOW);
+      const fd = openSync(
+        join(spoolDirectory, 'closed.json'),
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      );
       try {
-        if (!fstatSync(fd).isFile() || fstatSync(fd).size > 1024) throw new Error('native_activity_spool_invalid');
+        if (!fstatSync(fd).isFile() || fstatSync(fd).size > 1024)
+          throw new Error('native_activity_spool_invalid');
         const value = JSON.parse(readFileSync(fd, 'utf8'));
-        if (value.writerGeneration === writerGeneration && Number.isSafeInteger(value.last) && value.last >= after)
+        if (
+          value.writerGeneration === writerGeneration &&
+          Number.isSafeInteger(value.last) &&
+          value.last >= after
+        )
           closed = value;
-      } finally { closeSync(fd); }
-    } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    for (const name of readdirSync(spoolDirectory).filter((entry) => SEGMENT.test(entry)).toSorted()) {
+      } finally {
+        closeSync(fd);
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    for (const name of readdirSync(spoolDirectory)
+      .filter((entry) => SEGMENT.test(entry))
+      .toSorted()) {
       for (const { record, bytes: size } of readSegment(join(spoolDirectory, name))) {
         if (record?.writerGeneration !== writerGeneration || !(record.index > after)) continue;
-        if (events.length >= limits.batchEvents || (events.length && bytes + size > limits.batchBytes)) {
+        if (
+          events.length >= limits.batchEvents ||
+          (events.length && bytes + size > limits.batchBytes)
+        ) {
           more = true;
           break;
         }
@@ -298,8 +134,14 @@ export const readNativeActivitySpool = ({ spoolDirectory, writerGeneration, afte
     return null;
   }
   const next = events.at(-1)?.index ?? after;
-  return { writerGeneration, after, events, last: closed?.last ?? next,
-    complete: Boolean(closed) && !more && next === closed.last, cold: true };
+  return {
+    writerGeneration,
+    after,
+    events,
+    last: closed?.last ?? next,
+    complete: Boolean(closed) && !more && next === closed.last,
+    cold: true,
+  };
 };
 
 /**
@@ -360,7 +202,11 @@ export const createNativeActivityLog = ({
       const path = join(spoolDirectory, `${String(++segmentCounter).padStart(8, '0')}.jsonl`);
       const fd = openSync(
         path,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_APPEND,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          constants.O_NOFOLLOW |
+          constants.O_APPEND,
         0o600,
       );
       segment = { path, fd, last: record.index, bytes: 0 };
@@ -386,7 +232,8 @@ export const createNativeActivityLog = ({
   const spooling = () => Boolean(spoolDirectory) && !spoolFailed;
   // The cache is a contiguous window starting after the acknowledged cursor.
   const cacheEnd = () => cache.at(-1)?.record.index ?? acknowledged;
-  const cacheRoom = (bytes) => cache.length < limits.memoryEvents && cacheBytes + bytes <= limits.memoryBytes;
+  const cacheRoom = (bytes) =>
+    cache.length < limits.memoryEvents && cacheBytes + bytes <= limits.memoryBytes;
   const append = (event) => {
     const record = { index: nextIndex++, writerGeneration, ...event };
     const line = JSON.stringify(record);
@@ -432,8 +279,11 @@ export const createNativeActivityLog = ({
   const turn = ({ sequence, harness, forbiddenBytes = [], signal }) => {
     if (open) open.close({ failed: true });
     if (spoolDirectory) {
-      try { unlinkSync(join(spoolDirectory, 'closed.json')); }
-      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      try {
+        unlinkSync(join(spoolDirectory, 'closed.json'));
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
     }
     const guard = createNativeSecretGuard(forbiddenBytes);
     let pending = [];
@@ -488,7 +338,9 @@ export const createNativeActivityLog = ({
       const risky =
         guard.active &&
         FIELDS.some((key) =>
-          guard.risky((rawTail[key] + pending.map((item) => fieldOf(item, key)).join('')).slice(-8)),
+          guard.risky(
+            (rawTail[key] + pending.map((item) => fieldOf(item, key)).join('')).slice(-8),
+          ),
         );
       if (!risky || pending.length >= limits.heldEvents) flush(Boolean(risky));
       else if (!flushTimer) {
@@ -523,7 +375,12 @@ export const createNativeActivityLog = ({
             if (record?.transport === 'kiro-acp-activity' && record.schemaVersion === 1) {
               kiroStreamed = true;
               emitPublic(record.event);
-            } else if (!kiroStreamed && record?.transport === 'kiro-acp' && typeof record.text === 'string' && record.text)
+            } else if (
+              !kiroStreamed &&
+              record?.transport === 'kiro-acp' &&
+              typeof record.text === 'string' &&
+              record.text
+            )
               emitPublic({ content: record.text, display: { type: 'message', level: 'info' } });
             else omittedDiagnostics++;
           } catch {
@@ -537,7 +394,9 @@ export const createNativeActivityLog = ({
       };
     } else {
       sink = createCliOutputSink({
-        cli: harness, retainState: false, maxPendingTools: 64,
+        cli: harness,
+        retainState: false,
+        maxPendingTools: 64,
         emit: (value) => emitPublic(value),
       });
     }
@@ -606,7 +465,8 @@ export const createNativeActivityLog = ({
           });
         if (failed)
           handle.lifecycle({
-            level: 'error', title: 'Agent turn ended without a published response',
+            level: 'error',
+            title: 'Agent turn ended without a published response',
           });
         flush(true);
         closed = true;
@@ -621,14 +481,24 @@ export const createNativeActivityLog = ({
           if (spooling()) {
             ensureSpool();
             const temp = join(spoolDirectory, 'closed.tmp');
-            const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+            const fd = openSync(
+              temp,
+              constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+              0o600,
+            );
             try {
               writeSync(fd, JSON.stringify({ writerGeneration, last: nextIndex - 1 }));
               fsyncSync(fd);
-            } finally { closeSync(fd); }
+            } finally {
+              closeSync(fd);
+            }
             renameSync(temp, join(spoolDirectory, 'closed.json'));
             const directoryFd = openSync(spoolDirectory, constants.O_RDONLY | constants.O_NOFOLLOW);
-            try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+            try {
+              fsyncSync(directoryFd);
+            } finally {
+              closeSync(directoryFd);
+            }
           }
         } catch {
           spoolFailed = true;
@@ -660,7 +530,11 @@ export const createNativeActivityLog = ({
       const accept = ({ record, bytes: size }) => {
         if (record.index < expected) return true;
         if (record.index !== expected) return false;
-        if (events.length >= limits.batchEvents || (events.length && bytes + size > limits.batchBytes)) return false;
+        if (
+          events.length >= limits.batchEvents ||
+          (events.length && bytes + size > limits.batchBytes)
+        )
+          return false;
         events.push(structuredClone(record));
         bytes += size;
         expected++;
@@ -670,11 +544,17 @@ export const createNativeActivityLog = ({
       let full = false;
       for (const segment of segments) {
         for (const entry of readSegment(segment.path)) {
-          if (!accept(entry)) { full = true; break; }
+          if (!accept(entry)) {
+            full = true;
+            break;
+          }
         }
         if (full) break;
       }
-      if (!full) for (const entry of cache) { if (!accept(entry)) break; }
+      if (!full)
+        for (const entry of cache) {
+          if (!accept(entry)) break;
+        }
       delivered = Math.max(delivered, events.at(-1)?.index ?? acknowledged);
       const last = nextIndex - 1;
       const next = events.at(-1)?.index ?? Math.min(cursor, last);

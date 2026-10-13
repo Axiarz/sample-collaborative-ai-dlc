@@ -218,7 +218,10 @@ describe('bounded completed native turn output', () => {
         { type: 'turn.failed', error: { message: 'unexpected status 500' } },
       ],
     ],
-    ['interrupted turn after an error notice', () => [...codex().slice(0, -1), { type: 'error', message: 'stream closed' }]],
+    [
+      'interrupted turn after an error notice',
+      () => [...codex().slice(0, -1), { type: 'error', message: 'stream closed' }],
+    ],
     [
       'unfinished message',
       () => [

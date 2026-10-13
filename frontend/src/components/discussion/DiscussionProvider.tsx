@@ -112,7 +112,9 @@ export function DiscussionProvider({
   const scope = useMemo<DiscussionScope | null>(() => {
     if (backend === 'native') {
       // Never fall back to the platform intent scope for a native route.
-      return intentId && projectId && digest ? { kind: 'native', projectId, intentId, digest } : null;
+      return intentId && projectId && digest
+        ? { kind: 'native', projectId, intentId, digest }
+        : null;
     }
     if (sprintId) return { kind: 'sprint', sprintId };
     if (intentId && projectId) return { kind: 'intent', projectId, intentId };

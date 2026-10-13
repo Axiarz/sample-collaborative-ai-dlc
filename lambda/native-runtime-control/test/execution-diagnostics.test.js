@@ -162,7 +162,12 @@ describe('native controller diagnostic privacy boundary', () => {
     'reports the harness output failure code native_execution_output_%s',
     (suffix) => {
       const s = sinks();
-      s.diagnostics({ phase: 'status', stage: 'report', code: 'REPORT_OBSERVED', runtimeCode: `native_execution_output_${suffix}` });
+      s.diagnostics({
+        phase: 'status',
+        stage: 'report',
+        code: 'REPORT_OBSERVED',
+        runtimeCode: `native_execution_output_${suffix}`,
+      });
       expect(s.events()[0]).toMatchObject({ runtimeCode: `native_execution_output_${suffix}` });
     },
   );

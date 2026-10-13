@@ -3,6 +3,9 @@
 This guide covers contributor-facing integration tests that are intentionally
 separate from the managed installation documentation.
 
+For collaboration transport, DynamoDB ownership transactions, and deployed
+workload measurements, see [Yjs operations](yjs-operations.md#reproducible-validation).
+
 ## Managed build environment deployed-stack test
 
 Use a disposable AWS account or logical environment for this test. Managed
@@ -145,6 +148,9 @@ After those resources are removed, destroy the logical deployment:
 ./scripts/destroy.sh "$AIDLC_TEST_ENV"
 unset AIDLC_TEST_ENV
 ```
+
+The script refuses production environments and performs the required deletion-protection update for non-production data stores.
+A bare `terraform destroy` remains blocked by those protections.
 
 ## Enterprise SSO integration test
 

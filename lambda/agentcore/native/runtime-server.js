@@ -162,7 +162,13 @@ export const createNativeRuntimeServer = ({
         starting
           ? payload.schemaVersion !== 1
           : Object.keys(payload).some(
-              (key) => !['command', 'writerGeneration', ...(payload.command === 'native-activity' ? ['after'] : []), ...IDENTITY].includes(key),
+              (key) =>
+                ![
+                  'command',
+                  'writerGeneration',
+                  ...(payload.command === 'native-activity' ? ['after'] : []),
+                  ...IDENTITY,
+                ].includes(key),
             )
       )
         return send(400, { ok: false, code: 'native_execution_request_invalid' });
@@ -183,7 +189,9 @@ export const createNativeRuntimeServer = ({
               : 'continue'
           : payload.command === 'native-status'
             ? 'status'
-            : payload.command === 'native-activity' ? 'activity' : 'cancel';
+            : payload.command === 'native-activity'
+              ? 'activity'
+              : 'cancel';
         if (typeof active[method] !== 'function')
           return send(409, { ok: false, code: 'native_execution_recovery_failed' });
         return send(200, await active[method](payload));

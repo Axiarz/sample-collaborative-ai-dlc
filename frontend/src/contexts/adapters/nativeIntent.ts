@@ -24,7 +24,12 @@ export const labels = {
   READY: 'Workspace ready',
   FAILED: 'Preparation failed',
 };
-export const harnesses = { claude: 'Claude Code', codex: 'Codex', kiro: 'Kiro', opencode: 'OpenCode' };
+export const harnesses = {
+  claude: 'Claude Code',
+  codex: 'Codex',
+  kiro: 'Kiro',
+  opencode: 'OpenCode',
+};
 export const executionLabels: Record<NativeExecution['status'], string> = {
   REQUESTED: 'Start requested',
   UPGRADING: 'Preparing agent execution',
@@ -65,7 +70,8 @@ export const recoveryMessages: Record<NativeRecovery['reason'], string> = {
   DELIVERY_UNCERTAIN:
     'The last agent turn could not be verified. Recovery needs review before continuing.',
 };
-export const imageBlocked = (intent: NativeIntent) => ['revoked','unapproved','unavailable'].includes(intent.execution?.imageStatus ?? '');
+export const imageBlocked = (intent: NativeIntent) =>
+  ['revoked', 'unapproved', 'unavailable'].includes(intent.execution?.imageStatus ?? '');
 export const canRecover = (intent: NativeIntent) =>
   !imageBlocked(intent) &&
   intent.executionAvailable === true &&
@@ -165,7 +171,10 @@ function acceptDetail(
       if (nextRevision === undefined || nextRevision < previousRevision) return previous;
       if (nextRevision === previousRevision) {
         return {
-          value: { ...next, execution: { ...previous.value.execution, imageStatus: next.execution?.imageStatus } },
+          value: {
+            ...next,
+            execution: { ...previous.value.execution, imageStatus: next.execution?.imageStatus },
+          },
           accessRevision,
         };
       }
@@ -407,6 +416,17 @@ export function useNativeIntentAdapter(projectId: string, intentId: string) {
     [projectId, handleFailure],
   );
 
-  return { projectId, intentId, intent, error, preparing, acting, prepare, execute, refresh, publicationFailure };
+  return {
+    projectId,
+    intentId,
+    intent,
+    error,
+    preparing,
+    acting,
+    prepare,
+    execute,
+    refresh,
+    publicationFailure,
+  };
 }
 export type NativeIntentAdapter = ReturnType<typeof useNativeIntentAdapter>;

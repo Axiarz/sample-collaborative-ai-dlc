@@ -29,7 +29,10 @@ const api = vi.hoisted(() => ({
 }));
 // Shared drafts: in-memory Yjs relay + textarea stand-in (see test/collaborationFakes).
 vi.mock('@/hooks/useYjsDocument', async () => await import('@/test/collaborationFakes'));
-vi.mock('@/components/CollaborativeTextarea', async () => await import('@/test/collaborationFakes'));
+vi.mock(
+  '@/components/CollaborativeTextarea',
+  async () => await import('@/test/collaborationFakes'),
+);
 vi.mock('@/services/nativeIntents', () => ({ nativeIntentsService: api }));
 // Native content must work without either platform provider, including markdown.
 vi.mock('@/contexts/IntentContext', () => ({
@@ -473,12 +476,7 @@ it('reloads committed files and graph and navigates from the graph into the nati
   expect(api.start).not.toHaveBeenCalled();
   expect(api.prepare).not.toHaveBeenCalled();
   expect(screen.getByText(/Current committed revision 1/)).toBeInTheDocument();
-  for (const name of [
-    'Start agent',
-    'Edit artifacts',
-    'Create unit PR',
-    'Delete intent',
-  ])
+  for (const name of ['Start agent', 'Edit artifacts', 'Create unit PR', 'Delete intent'])
     expect(screen.getByRole('button', { name })).toBeDisabled();
   first.unmount();
   renderPage();

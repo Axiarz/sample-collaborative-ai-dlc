@@ -1706,9 +1706,9 @@ describe('intent-scoped discussions', () => {
       .commandCalls(GetCommand)
       .find(
         (entry) =>
-          entry.args[0].input.TableName === PROCESS_TABLE && !entry.args[0].input.ConsistentRead,
+          entry.args[0].input.TableName === PROCESS_TABLE && entry.args[0].input.ConsistentRead,
       );
-    expect(executionRead.args[0].input).not.toHaveProperty('ConsistentRead');
+    expect(executionRead.args[0].input).toHaveProperty('ConsistentRead', true);
     const payload = JSON.parse(Buffer.from(invoke.payload).toString('utf8'));
     expect(payload).toMatchObject({
       command: 'discussion-assist-start',
@@ -1831,6 +1831,7 @@ describe('intent-scoped discussions', () => {
       response: { transformToString: async () => JSON.stringify({ ok: true, accepted: true }) },
     });
     const { projectId, intentId } = await seedIntent();
+    processStore.set(`EXEC#${intentId}`, { projectId, executionBackend: 'platform' });
     const created = json(
       await call('POST', intentPath('/discussions'), {
         pathParameters: { projectId, intentId },
@@ -1865,6 +1866,7 @@ describe('intent-scoped discussions', () => {
   it('marks the Quorum message failed when AgentCore invoke fails', async () => {
     agentcoreMock.on(InvokeAgentRuntimeCommand).rejects(new Error('runtime unavailable'));
     const { projectId, intentId } = await seedIntent();
+    processStore.set(`EXEC#${intentId}`, { projectId, executionBackend: 'platform' });
     const created = json(
       await call('POST', intentPath('/discussions'), {
         pathParameters: { projectId, intentId },

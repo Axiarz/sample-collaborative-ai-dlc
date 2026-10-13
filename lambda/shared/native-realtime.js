@@ -8,7 +8,7 @@ export const nativeIntentChannel = ({ projectId, executionId }) => {
   if (!CHANNEL.test(channel)) throw new Error('Invalid native realtime scope');
   return channel;
 };
-export const requiredNativeScopeForChannel = channel =>
+export const requiredNativeScopeForChannel = (channel) =>
   typeof channel === 'string' && CHANNEL.test(channel) ? channel : null;
 
 // Native collaboration documents (task-2). The digest is the protected
@@ -20,9 +20,12 @@ const SHA = /^[a-f0-9]{64}$/;
 const DISCUSSION = /^disc-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const nativeCollaborationDigest = (identity) => {
   nativeIntentChannel(identity);
-  return createHash('sha256').update(JSON.stringify([identity.projectId, identity.executionId])).digest('hex');
+  return createHash('sha256')
+    .update(JSON.stringify([identity.projectId, identity.executionId]))
+    .digest('hex');
 };
-export const nativeCollaborationScope = (identity) => `native-collab:${nativeCollaborationDigest(identity)}`;
+export const nativeCollaborationScope = (identity) =>
+  `native-collab:${nativeCollaborationDigest(identity)}`;
 export const nativeDiscussionDocument = (identity, discussionId) => {
   if (!DISCUSSION.test(discussionId ?? '')) throw new Error('Invalid native discussion');
   return `native-discussion-${nativeCollaborationDigest(identity)}-${discussionId}`;

@@ -40,8 +40,7 @@ export const mapDiscussion = (v, messageCount = undefined) => ({
   entityType: getVal(v, 'entity_type'),
   entityId: getVal(v, 'entity_id'),
   entityTitle: getVal(v, 'entity_title'),
-  sprintId:
-    getVal(v, 'sprint_id') || getVal(v, 'intent_id') || getVal(v, 'native_discussion_root'),
+  sprintId: getVal(v, 'sprint_id') || getVal(v, 'intent_id') || getVal(v, 'native_discussion_root'),
   status: getVal(v, 'status') || 'open',
   resolvedBy: getVal(v, 'resolved_by') || undefined,
   resolvedByName: getVal(v, 'resolved_by_name') || undefined,
@@ -86,8 +85,7 @@ export const mapMessage = (v) => ({
   createdAt: getVal(v, 'created_at'),
   updatedAt: getVal(v, 'updated_at'),
   discussionId: getVal(v, 'discussion_id'),
-  sprintId:
-    getVal(v, 'sprint_id') || getVal(v, 'intent_id') || getVal(v, 'native_discussion_root'),
+  sprintId: getVal(v, 'sprint_id') || getVal(v, 'intent_id') || getVal(v, 'native_discussion_root'),
 });
 
 // One total order everywhere: display order (createdAt, id),

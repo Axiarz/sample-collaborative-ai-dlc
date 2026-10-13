@@ -18,6 +18,18 @@ variable "powertools_log_level" {
   type        = string
 }
 
+variable "kms_key_arn" {
+  description = "Customer-managed KMS key ARN for the v2 execution table. Empty uses the AWS-owned service default."
+  type        = string
+  default     = ""
+}
+
+variable "deletion_protection" {
+  description = "Protect the durable v2 execution table from deletion"
+  type        = bool
+  default     = true
+}
+
 variable "aws_region" {
   description = "AWS region"
   type        = string
@@ -105,6 +117,11 @@ variable "aidlc_repo_ref" {
 
 variable "bedrock_model" {
   description = "Default Bedrock inference profile id for stage agents"
+  type        = string
+}
+
+variable "bedrock_region" {
+  description = "AWS region the agent CLIs send Bedrock inference to (BEDROCK_REGION)"
   type        = string
 }
 

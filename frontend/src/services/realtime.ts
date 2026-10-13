@@ -22,7 +22,8 @@ interface ConnectionRequest {
 
 const targetKey = (target: RealtimeScopeTarget): string => {
   if ('sprintId' in target) return `sprint:${target.sprintId}`;
-  if ('intentId' in target) return `${target.executionBackend ?? 'platform'}:intent:${target.intentId}:${target.projectId}`;
+  if ('intentId' in target)
+    return `${target.executionBackend ?? 'platform'}:intent:${target.intentId}:${target.projectId}`;
   return `project:${target.projectId}`;
 };
 

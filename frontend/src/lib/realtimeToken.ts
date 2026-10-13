@@ -86,7 +86,10 @@ export function scopeTargetForYjsDoc(docName: string): RealtimeScopeTarget | nul
  * explicit `{ intentId, projectId }` target rather than relying on this.
  */
 export function scopeTargetForChannel(documentId: string): RealtimeScopeTarget | null {
-  const native = /^native-intent:([A-Za-z0-9][A-Za-z0-9_.-]{0,255}):([A-Za-z0-9][A-Za-z0-9_.-]{0,255})$/.exec(documentId);
+  const native =
+    /^native-intent:([A-Za-z0-9][A-Za-z0-9_.-]{0,255}):([A-Za-z0-9][A-Za-z0-9_.-]{0,255})$/.exec(
+      documentId,
+    );
   if (native) return { projectId: native[1], intentId: native[2], executionBackend: 'native' };
   const sprint = SPRINT_CHANNEL_RE.exec(documentId);
   if (sprint) return { sprintId: sprint[1] };

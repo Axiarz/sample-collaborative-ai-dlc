@@ -14,7 +14,7 @@ resource "random_id" "bucket_suffix" {
 # S3 bucket for static website hosting
 resource "aws_s3_bucket" "frontend" {
   bucket        = "${var.project_name}-${var.environment}-frontend-${random_id.bucket_suffix.hex}"
-  force_destroy = true
+  force_destroy = var.environment != "prod"
 }
 
 resource "aws_s3_bucket_public_access_block" "frontend" {
@@ -105,6 +105,9 @@ resource "aws_cloudfront_vpc_origin" "yjs_alb" {
 
 # CloudFront Distribution
 resource "aws_cloudfront_distribution" "frontend" {
+  comment    = "${var.project_name} ${var.environment} application frontend"
+  web_acl_id = var.web_acl_arn != "" ? var.web_acl_arn : null
+
   origin {
     domain_name              = aws_s3_bucket.frontend.bucket_regional_domain_name
     origin_access_control_id = aws_cloudfront_origin_access_control.frontend.id

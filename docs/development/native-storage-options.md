@@ -53,12 +53,12 @@ See [the interaction checkpoint](native-interaction-probe.md).
 
 ## Comparison
 
-| Option | Native hard-link requirement | Capacity | Main implication |
-| --- | --- | --- | --- |
-| Current managed session storage | Unsupported; reproduced live | Fixed 1 GB per session; not adjustable | Does not meet our active native workspace requirements |
-| S3 Files access point | Explicitly unsupported | Larger storage backed by S3 | Suitable for some input/output datasets, not the unmodified native workspace |
-| EFS access point | Supported | Elastic filesystem capacity | Fits current microVM compute, but storage is shared and uses NFS |
-| EBS / Instances | Excluded by user | Not being pursued | Keep AgentCore microVM compute |
+| Option                          | Native hard-link requirement | Capacity                               | Main implication                                                             |
+| ------------------------------- | ---------------------------- | -------------------------------------- | ---------------------------------------------------------------------------- |
+| Current managed session storage | Unsupported; reproduced live | Fixed 1 GB per session; not adjustable | Does not meet our active native workspace requirements                       |
+| S3 Files access point           | Explicitly unsupported       | Larger storage backed by S3            | Suitable for some input/output datasets, not the unmodified native workspace |
+| EFS access point                | Supported                    | Elastic filesystem capacity            | Fits current microVM compute, but storage is shared and uses NFS             |
+| EBS / Instances                 | Excluded by user             | Not being pursued                      | Keep AgentCore microVM compute                                               |
 
 The 1-GB limit is the existing managed **disk** limit, not a RAM setting. AWS
 documents it as non-adjustable. The EFS working directory is a separate storage configuration,
@@ -78,14 +78,14 @@ This distinction preserves the original native-filesystem model.
 
 The proposed native layout is:
 
-| Data | Active location | Persistence behavior |
-| --- | --- | --- |
-| Coding harness binaries | Existing container image / AgentCore local disk | Recreated from the pinned image |
-| Active harness homes, SQLite databases, sockets and process-local caches | Per-execution local directories | Restore required durable state before starting a resumed harness |
-| Native AI-DLC installation/workflow files and project metadata | Per-execution EFS paths | Native commands operate on real files supporting hard links |
-| Git worktree, `.git`, native artifacts, questions, state, audit and memory | EFS working directory | Retained independently of microVM local disk |
-| Large dependency and build-output directories | EFS by default; measured exceptions for host-local scratch | Avoid filling the current 1-GB managed session mount |
-| Validated harness recovery exports | Durable per-execution storage, preferably on EFS alongside the recovery generation | Inactive copies, never databases opened directly by harness processes over NFS |
+| Data                                                                       | Active location                                                                    | Persistence behavior                                                           |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Coding harness binaries                                                    | Existing container image / AgentCore local disk                                    | Recreated from the pinned image                                                |
+| Active harness homes, SQLite databases, sockets and process-local caches   | Per-execution local directories                                                    | Restore required durable state before starting a resumed harness               |
+| Native AI-DLC installation/workflow files and project metadata             | Per-execution EFS paths                                                            | Native commands operate on real files supporting hard links                    |
+| Git worktree, `.git`, native artifacts, questions, state, audit and memory | EFS working directory                                                              | Retained independently of microVM local disk                                   |
+| Large dependency and build-output directories                              | EFS by default; measured exceptions for host-local scratch                         | Avoid filling the current 1-GB managed session mount                           |
+| Validated harness recovery exports                                         | Durable per-execution storage, preferably on EFS alongside the recovery generation | Inactive copies, never databases opened directly by harness processes over NFS |
 
 Use a stable working-directory path when the same execution resumes. Preserve
 native project configuration and relative file layout; configure the harness
@@ -149,12 +149,12 @@ and recovery.
 
 The bounded review of the installed harness versions found:
 
-| Harness | Confirmed state behavior | Consequence |
-| --- | --- | --- |
-| Codex 0.145.0 | Pinned source enables SQLite WAL; database placement can be separated with `sqlite_home` / `CODEX_SQLITE_HOME` | Keep active state local and qualify the existing resumable rollout export for native recovery |
-| OpenCode 1.17.20 | Actual binary and pinned source enable SQLite WAL; `OPENCODE_DB` can override database location | Keep active XDG state local and qualify consistent durable export/restore |
-| Kiro 2.19.2 | Unauthenticated startup created `data.sqlite3` in DELETE mode | The actual v2 conversation store and journal mode remain unverified; do not infer them from the startup settings/auth database |
-| Claude 2.1.246 | Binary contains project/session JSONL paths; our code controls `CLAUDE_CONFIG_DIR` | Keep the native active config home local and qualify required session exports and restart continuity |
+| Harness          | Confirmed state behavior                                                                                       | Consequence                                                                                                                    |
+| ---------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Codex 0.145.0    | Pinned source enables SQLite WAL; database placement can be separated with `sqlite_home` / `CODEX_SQLITE_HOME` | Keep active state local and qualify the existing resumable rollout export for native recovery                                  |
+| OpenCode 1.17.20 | Actual binary and pinned source enable SQLite WAL; `OPENCODE_DB` can override database location                | Keep active XDG state local and qualify consistent durable export/restore                                                      |
+| Kiro 2.19.2      | Unauthenticated startup created `data.sqlite3` in DELETE mode                                                  | The actual v2 conversation store and journal mode remain unverified; do not infer them from the startup settings/auth database |
+| Claude 2.1.246   | Binary contains project/session JSONL paths; our code controls `CLAUDE_CONFIG_DIR`                             | Keep the native active config home local and qualify required session exports and restart continuity                           |
 
 Codex and OpenCode findings were checked against their exact versioned upstream
 implementations and configuration schema. [11][12][13] Kiro and Claude

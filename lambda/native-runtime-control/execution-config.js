@@ -24,7 +24,7 @@ import { workflowSourceIdentity } from '../shared/workflow-source-bindings.js';
 import { describeNativePackagePin } from '../shared/native-package-pin.js';
 import { mergeCliModels } from '../shared/cli-models.js';
 import { mergeTierModels } from '../shared/tier-models.js';
-import { resolveStageModel } from '../agentcore/model-resolver.js';
+import { resolveStageModel } from '../shared/model-resolver.js';
 import { canonicalJson } from '../shared/workflow-checkpoint.js';
 import { nativeExecutionConfiguration } from './execution-store.js';
 import { ID, UUID, UUID_V4, matches, nativeDraftRequest, pinPackageJob } from './store.js';

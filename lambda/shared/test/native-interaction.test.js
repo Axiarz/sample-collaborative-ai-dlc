@@ -304,7 +304,9 @@ describe('task-3 structured pending input (schema v2)', () => {
     const body = await f.interactions.read(identity, receipt);
     expect(body.schemaVersion).toBe(2);
     expect(body.pendingInput).toEqual(pendingInput);
-    expect(body.contentSha256).toBe(hash(canonicalJson({ messages: input().messages, pendingInput })));
+    expect(body.contentSha256).toBe(
+      hash(canonicalJson({ messages: input().messages, pendingInput })),
+    );
     expect(nativeInteractionView(receipt, body).pendingInput).toEqual(pendingInput);
   });
   it('keeps free-text turns byte-compatible with v1', async () => {
@@ -317,7 +319,9 @@ describe('task-3 structured pending input (schema v2)', () => {
   });
   it('refuses a tampered or invalid pending input', async () => {
     const f = fixture();
-    await expect(f.interactions.write({ ...input(), pendingInput: { ...pendingInput, kind: 'vote' } })).rejects.toMatchObject({ code: 'NATIVE_INTERACTION_INVALID' });
+    await expect(
+      f.interactions.write({ ...input(), pendingInput: { ...pendingInput, kind: 'vote' } }),
+    ).rejects.toMatchObject({ code: 'NATIVE_INTERACTION_INVALID' });
     const receipt = await f.interactions.write({ ...input(), pendingInput });
     const key = [...f.objects.keys()][0];
     const stored = JSON.parse(f.objects.get(key).toString());

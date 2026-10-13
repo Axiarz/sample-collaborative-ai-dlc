@@ -1,3 +1,4 @@
+import { runCredentialJob } from '../credential-session.js';
 // compose-plan-start — async composer proposals (Adaptive Workflows).
 //
 // The intents lambda creates a PENDING COMPOSE row and invokes this command
@@ -17,7 +18,12 @@
 import { Logger } from '@aws-lambda-powertools/logger';
 import { mkdir } from 'node:fs/promises';
 import { runOneShotPrompt } from '../cli/one-shot.js';
-import { loadLibrary, loadBlockBody, listMergedBlocks } from '../block-loader.js';
+import {
+  loadLibrary,
+  loadBlockBody,
+  listMergedBlocks,
+  listReleaseBlocks,
+} from '../block-loader.js';
 import { buildExecutionPlan } from '../../shared/v2-execution-plan.js';
 import {
   buildGroundingPack,
@@ -159,6 +165,7 @@ export const createComposePlanStart = ({
   loadLibraryFn = loadLibrary,
   loadBlockBodyFn = loadBlockBody,
   listMergedBlocksFn = listMergedBlocks,
+  listReleaseBlocksFn = listReleaseBlocks,
   mkdirFn = mkdir,
   env = process.env,
   busy = null,
@@ -173,6 +180,12 @@ export const createComposePlanStart = ({
       mode = 'front',
       workflowId,
       workflowVersion,
+      // Immutable AI-DLC release pinned on the intent (issue #482). Present =>
+      // the workflow, library and SCOPE vocabulary the composer is grounded in
+      // all come from that closure, so a proposal is validated against the
+      // methodology the intent will actually run.
+      methodologyRelease = null,
+      methodologyPins = null,
       prompt = '',
       instructions = '',
       repoSignals = null,
@@ -222,10 +235,19 @@ export const createComposePlanStart = ({
       return row;
     };
 
-    const job = (async () => {
+    const job = runCredentialJob(async () => {
       let g;
       try {
-        const { workflow, library } = await loadLibraryFn({ workflowId, workflowVersion });
+        const { workflow, library } = await loadLibraryFn({
+          workflowId,
+          workflowVersion,
+          ...(methodologyRelease
+            ? {
+                methodologyRelease,
+                ...(methodologyPins ? { methodologyPins } : {}),
+              }
+            : {}),
+        });
         if (!workflow || !library) {
           await finish({
             state: 'FAILED',
@@ -233,7 +255,12 @@ export const createComposePlanStart = ({
           });
           return;
         }
-        const scopeBlocks = await listMergedBlocksFn('SCOPE').catch(() => []);
+        // A pinned intent grounds on its release's SCOPE vocabulary. No .catch
+        // here: an unresolvable closure must fail the compose, not silently
+        // ground the composer in an empty scope list.
+        const scopeBlocks = methodologyRelease
+          ? await listReleaseBlocksFn('SCOPE', methodologyRelease, methodologyPins)
+          : await listMergedBlocksFn('SCOPE').catch(() => []);
         const { scopes, summaries, grids, stages, offeredScopeIds } = buildScopeGrounding({
           workflow,
           library,
@@ -243,14 +270,15 @@ export const createComposePlanStart = ({
 
         // Composer persona + methodology knowledge from the block library
         // (fork-shadowing applies — a user's edited composer is honoured).
+        const loadBody = methodologyRelease
+          ? (block) => loadBlockBodyFn(block, { methodologyRelease })
+          : (block) => loadBlockBodyFn(block).catch(() => '');
         const agentBlock = library.agentsById?.[COMPOSER_AGENT_ID] ?? null;
-        const persona = agentBlock ? await loadBlockBodyFn(agentBlock).catch(() => '') : '';
+        const persona = agentBlock ? await loadBody(agentBlock) : '';
         const knowledgeBlocks = Object.values(library.knowledgeById ?? {}).filter(
           (k) => k.agentRef === COMPOSER_AGENT_ID,
         );
-        const knowledgeBodies = await Promise.all(
-          knowledgeBlocks.map((k) => loadBlockBodyFn(k).catch(() => '')),
-        );
+        const knowledgeBodies = await Promise.all(knowledgeBlocks.map(loadBody));
 
         const fullPrompt = buildComposePrompt({
           mode,
@@ -372,7 +400,7 @@ export const createComposePlanStart = ({
         activeJobs.delete(key);
         busy?.leave();
       }
-    })();
+    });
     job.catch((err) => log(`job promise rejected unexpectedly (${key}):`, err?.message));
 
     return { ok: true, accepted: true, composeId, jobKey: key };

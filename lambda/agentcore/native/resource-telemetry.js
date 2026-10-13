@@ -41,7 +41,13 @@ const diskFree = async (statfs) =>
       Object.entries(DISKS).map(async ([name, path]) => {
         try {
           const stat = await statfs(path);
-          return [name, { freeBytes: integer(stat.bavail * stat.bsize), totalBytes: integer(stat.blocks * stat.bsize) }];
+          return [
+            name,
+            {
+              freeBytes: integer(stat.bavail * stat.bsize),
+              totalBytes: integer(stat.blocks * stat.bsize),
+            },
+          ];
         } catch {
           return [name, null];
         }

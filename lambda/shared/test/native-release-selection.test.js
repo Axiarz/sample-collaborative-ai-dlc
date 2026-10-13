@@ -420,6 +420,7 @@ describe('selectNativeRelease', () => {
       [],
       { provider: 'github', repository: 'owner/repo', sourceId: 'f'.repeat(64) },
       { provider: 'unknown', repository: 'owner/repo' },
+      // secretlint-disable-next-line @secretlint/secretlint-rule-basicauth -- synthetic rejection fixture
       { provider: 'github', repository: 'https://user:secret@github.com/owner/repo' },
     ].map((value) => [value]),
   )('rejects invalid selected sources without echoing their data', (selectedSource) => {

@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, afterAll, describe, it, expect, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import gremlin from 'gremlin';
 import { PartitionStrategy } from 'gremlin/lib/process/traversal-strategy.js';
 import { mockClient } from 'aws-sdk-client-mock';
@@ -45,6 +46,15 @@ import {
   methodologyCatalogKey,
 } from '../../shared/methodology-catalog.js';
 import { CORE_FILES } from '../../shared/test/fixtures/repo-files.js';
+import { filesFromCompatibilityFixture } from '../../shared/aidlc-compatibility.js';
+import { buildReleaseBundle } from '../../shared/aidlc-release.js';
+import { legacyReleaseBundle } from '../../shared/test/fixtures/legacy-release.js';
+import {
+  __test as releaseResolverTest,
+  methodologyReleasePinFromManifest,
+} from '../../shared/release-resolver.js';
+
+const RELEASE_PROFILE = 'current-stable';
 
 const { archiveArtifactsSpy, createNativeExportSpy, readCheckpointArtifactVersionsSpy } =
   vi.hoisted(() => ({
@@ -61,6 +71,15 @@ vi.mock('../../shared/artifact-versioning.js', async (importOriginal) => {
     archiveArtifactsForStages: archiveArtifactsSpy,
     readCheckpointArtifactVersions: readCheckpointArtifactVersionsSpy,
   };
+});
+// Passthrough by default; a test may narrow one resolution to a canned result
+// to reach a branch real fixtures cannot produce on their own.
+const planSpy = vi.hoisted(() => ({ loadExecutionPlan: vi.fn(), actual: null }));
+vi.mock('../../shared/v2-workflow-plan.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  planSpy.actual = actual.loadExecutionPlan;
+  planSpy.loadExecutionPlan.mockImplementation(actual.loadExecutionPlan);
+  return { ...actual, loadExecutionPlan: planSpy.loadExecutionPlan };
 });
 vi.mock('../native-export.js', () => ({
   createNativeExport: createNativeExportSpy,
@@ -81,8 +100,10 @@ let sourceControlReviewComments = [];
 let sourceControlValidationResponse = { ready: true, repositories: [] };
 const s3Mock = mockClient(S3Client);
 let attachmentUpdateConflict = null;
+let transactWriteBarrier = null;
 let sourceControlOperationHandler = null;
 let credentialMetadataHandler = null;
+let failResumeMarkerWrites = 0;
 
 const MANAGED_ENVIRONMENT_SNAPSHOT = {
   environmentId: 'polyglot',
@@ -106,7 +127,10 @@ const installDdbFakes = () => {
   ddbMock.reset();
   procStore.clear();
   yjsStore.clear();
+  transactWriteBarrier = null;
+  failResumeMarkerWrites = 0;
   ddbMock.on(GetCommand).callsFake((input) => {
+    if (input.Key.documentId) return { Item: yjsStore.get(input.Key.documentId) };
     const key =
       input.Key.pk !== undefined
         ? keyOf(input.Key.pk, input.Key.sk)
@@ -118,6 +142,10 @@ const installDdbFakes = () => {
   });
   ddbMock.on(PutCommand).callsFake((input) => {
     const item = input.Item;
+    if (item.documentId !== undefined) {
+      yjsStore.set(item.documentId, { ...item });
+      return {};
+    }
     const k = keyOf(item.pk, item.sk);
     if (input.ConditionExpression?.includes('attribute_not_exists') && procStore.has(k)) {
       const e = new Error('cond');
@@ -127,20 +155,45 @@ const installDdbFakes = () => {
     procStore.set(k, { ...item });
     return {};
   });
-  ddbMock.on(TransactWriteCommand).callsFake((input) => {
+  ddbMock.on(TransactWriteCommand).callsFake(async (input) => {
+    await transactWriteBarrier;
     const puts = (input.TransactItems ?? []).map((item) => item.Put).filter(Boolean);
+    const updates = (input.TransactItems ?? []).map((item) => item.Update).filter(Boolean);
     if (
       puts.some(
         (put) =>
           put.ConditionExpression?.includes('attribute_not_exists') &&
           procStore.has(keyOf(put.Item.pk, put.Item.sk)),
-      )
+      ) ||
+      updates.some((update) => {
+        const existing = procStore.get(keyOf(update.Key.pk, update.Key.sk));
+        return (
+          update.ConditionExpression?.includes('#status = :pending') &&
+          existing?.status !== update.ExpressionAttributeValues?.[':pending']
+        );
+      })
     ) {
       const error = new Error('transaction cancelled');
       error.name = 'TransactionCanceledException';
       throw error;
     }
+    for (const update of updates) {
+      const k = keyOf(update.Key.pk, update.Key.sk);
+      const values = update.ExpressionAttributeValues || {};
+      const names = update.ExpressionAttributeNames || {};
+      const next = { ...procStore.get(k) };
+      const setMatch = /SET (.*?)(?: REMOVE |$)/.exec(update.UpdateExpression || '');
+      for (const clause of setMatch?.[1].split(',') ?? []) {
+        const [lhs, rhs] = clause.split('=').map((part) => part.trim());
+        const field = names[lhs] ?? lhs;
+        if (field && rhs in values) next[field] = values[rhs];
+      }
+      procStore.set(k, next);
+    }
     for (const put of puts) procStore.set(keyOf(put.Item.pk, put.Item.sk), { ...put.Item });
+    for (const { Delete } of input.TransactItems ?? []) {
+      if (Delete) procStore.delete(keyOf(Delete.Key.pk, Delete.Key.sk));
+    }
     return {};
   });
   ddbMock.on(QueryCommand).callsFake((input) => {
@@ -180,6 +233,10 @@ const installDdbFakes = () => {
     return { Items: items.map((i) => ({ ...i })) };
   });
   ddbMock.on(ScanCommand).callsFake((input) => {
+    if (input.ProjectionExpression === 'documentId')
+      return {
+        Items: [...yjsStore.entries()].map(([documentId, row]) => ({ documentId, ...row })),
+      };
     const values = input.ExpressionAttributeValues || {};
     let items = [...procStore.values()];
     if ((input.FilterExpression || '').includes('sk = :meta')) {
@@ -187,7 +244,26 @@ const installDdbFakes = () => {
     }
     return { Items: items.map((i) => ({ ...i })) };
   });
-  ddbMock.on(UpdateCommand).callsFake((input) => {
+  ddbMock.on(UpdateCommand).callsFake(async (input) => {
+    if (input.Key.documentId) {
+      const row = { documentId: input.Key.documentId, ...yjsStore.get(input.Key.documentId) };
+      if (input.ExpressionAttributeValues[':deleted']) {
+        row.deletedAt = input.ExpressionAttributeValues[':deleted'];
+        for (const key of ['ownerId', 'ownerAddress', 'leaseToken', 'leaseUntil']) delete row[key];
+      }
+      if (input.ExpressionAttributeValues[':state'])
+        row.cleanupState = input.ExpressionAttributeValues[':state'];
+      yjsStore.set(row.documentId, row);
+      return {};
+    }
+    if (
+      failResumeMarkerWrites > 0 &&
+      input.Key.sk === 'META' &&
+      input.UpdateExpression?.includes('resumeRequired')
+    ) {
+      failResumeMarkerWrites -= 1;
+      throw new Error('resume marker write failed');
+    }
     const k = keyOf(input.Key.pk, input.Key.sk);
     const existing = procStore.get(k);
     const values = input.ExpressionAttributeValues || {};
@@ -202,6 +278,12 @@ const installDdbFakes = () => {
       casFail();
     }
     if (cond.includes('#status = :pending') && (!existing || existing.status !== 'pending')) {
+      casFail();
+    }
+    if (cond.includes('callbackId = :cb') && (!existing || existing.callbackId !== values[':cb'])) {
+      casFail();
+    }
+    if (cond.includes('attribute_not_exists(callbackConsumedAt)') && existing?.callbackConsumedAt) {
       casFail();
     }
     if (cond.includes('#status <> :pending') && (!existing || existing.status === 'pending')) {
@@ -248,6 +330,9 @@ const installDdbFakes = () => {
     ) {
       casFail();
     }
+    if (cond.includes(':ifRrh') && existing?.resumeRequired?.humanTaskId !== values[':ifRrh']) {
+      casFail();
+    }
     if (
       cond.includes(':ifAttachmentRevision') &&
       existing?.attachmentRevision !== undefined &&
@@ -255,6 +340,11 @@ const installDdbFakes = () => {
     ) {
       casFail();
     }
+    if (
+      cond.includes(':ifDraftRevision') &&
+      (existing?.draftRevision ?? 0) !== values[':ifDraftRevision']
+    )
+      casFail();
     if (attachmentUpdateConflict && cond.includes(':ifAttachmentRevision')) {
       const conflict = attachmentUpdateConflict;
       attachmentUpdateConflict = null;
@@ -283,10 +373,12 @@ const installDdbFakes = () => {
         delete next[field];
       }
     }
+    if (input.UpdateExpression?.includes('draftRevision = if_not_exists'))
+      next.draftRevision = (existing?.draftRevision ?? 0) + 1;
     procStore.set(k, next);
     return { Attributes: { ...next } };
   });
-  ddbMock.on(DeleteCommand).callsFake((input) => {
+  ddbMock.on(DeleteCommand).callsFake(async (input) => {
     // Yjs docs are keyed by documentId alone; everything else is pk|sk.
     if (input.Key.documentId !== undefined) yjsStore.delete(input.Key.documentId);
     else procStore.delete(keyOf(input.Key.pk, input.Key.sk));
@@ -409,6 +501,9 @@ beforeEach(() => {
   sourceControlOperationHandler = null;
   credentialMetadataHandler = null;
   ssmMock.reset();
+  ssmMock
+    .on(GetParameterCommand)
+    .rejects(Object.assign(new Error('Parameter not found'), { name: 'ParameterNotFound' }));
   vi.stubEnv('AGENT_SETTINGS_SSM_PREFIX', '/collab/dev');
   ssmMock.on(GetParametersCommand).callsFake((input) => ({
     Parameters: (input.Names ?? [])
@@ -421,6 +516,7 @@ beforeEach(() => {
   attachmentUpdateConflict = null;
   archiveArtifactsSpy.mockClear();
   readCheckpointArtifactVersionsSpy.mockClear();
+  planSpy.loadExecutionPlan.mockImplementation(planSpy.actual);
   createNativeExportSpy.mockReset();
   createNativeExportSpy.mockResolvedValue({
     downloadUrl: 'https://example.test/export.zip',
@@ -800,6 +896,41 @@ describe('POST /projects/{id}/intents', () => {
         .next();
       const explicit = JSON.parse((await createIntent(sub, explicitProject)).body);
       expect(explicit.prStrategy).toBe('intent-pr');
+    } finally {
+      vi.stubEnv('AGENT_SETTINGS_SSM_PREFIX', undefined);
+    }
+  });
+
+  it('refuses PR per unit for a CodeCommit space before creating the intent', async () => {
+    vi.stubEnv('AGENT_SETTINGS_SSM_PREFIX', '/collab/dev');
+    ssmMock
+      .on(GetParameterCommand, { Name: '/collab/dev/pr-strategy' })
+      .resolves({ Parameter: { Value: 'pr-per-unit' } });
+    try {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      // Inherit the platform strategy, with a CodeCommit repository.
+      await g
+        .V()
+        .has('Project', 'id', projectId)
+        .property(gremlin.process.cardinality.single, 'pr_strategy', 'default')
+        .out('HAS_REPO')
+        .property(gremlin.process.cardinality.single, 'provider', 'codecommit')
+        .next();
+      const refused = await createIntent(sub, projectId);
+      expect(refused.statusCode).toBe(409);
+      expect(JSON.parse(refused.body)).toMatchObject({ code: 'PR_STRATEGY_UNSUPPORTED' });
+      const executionsOf = () =>
+        [...procStore.values()].filter((row) => row?.sk === 'META' && row.projectId === projectId);
+      expect(executionsOf()).toHaveLength(0);
+
+      // One PR per intent stays available for the same space.
+      await g
+        .V()
+        .has('Project', 'id', projectId)
+        .property(gremlin.process.cardinality.single, 'pr_strategy', 'intent-pr')
+        .next();
+      expect((await createIntent(sub, projectId)).statusCode).toBe(201);
     } finally {
       vi.stubEnv('AGENT_SETTINGS_SSM_PREFIX', undefined);
     }
@@ -1840,6 +1971,33 @@ describe('unit PR review feedback', () => {
     return { projectId, intent };
   };
 
+  it('refuses a feedback revision on a provider without drafts before any provider call', async () => {
+    const sub = `u-${randomUUID()}`;
+    const { projectId, intent } = await seedActiveReview(sub);
+    const metaKey = keyOf(`EXEC#${intent.id}`, 'META');
+    procStore.set(metaKey, {
+      ...procStore.get(metaKey),
+      repoProviders: { 'owner/repo': 'codecommit' },
+    });
+    lambdaMock.resetHistory();
+    const path = `/projects/${projectId}/intents/${intent.id}/units/1/auth/feedback`;
+    for (const httpMethod of ['GET', 'POST']) {
+      const res = await handler({
+        httpMethod,
+        path,
+        pathParameters: { projectId, intentId: intent.id, sectionIndex: '1', unitSlug: 'auth' },
+        ...(httpMethod === 'POST' ? { body: JSON.stringify({ commentIds: ['101'] }) } : {}),
+        ...claims(sub),
+      });
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body)).toMatchObject({ code: 'PR_STRATEGY_UNSUPPORTED' });
+    }
+    const sourceControlCalls = lambdaMock
+      .commandCalls(InvokeCommand)
+      .filter((call) => call.args[0].input.FunctionName === 'source-control-test');
+    expect(sourceControlCalls).toHaveLength(0);
+  });
+
   it('refetches selectable comments and queues an idempotent versioned batch', async () => {
     sourceControlReviewComments = [
       {
@@ -2038,9 +2196,37 @@ describe('composed grids + DRAFT PATCH', () => {
       httpMethod: 'PATCH',
       path: `/projects/${projectId}/intents/${intentId}`,
       pathParameters: { projectId, intentId },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        ifDraftRevision: procStore.get(keyOf(`EXEC#${intentId}`, 'META'))?.draftRevision ?? 0,
+        ...body,
+      }),
       ...claims(sub),
     });
+
+  it('rejects a delayed draft save, preserves the newer value, and requires preconditions', async () => {
+    const sub = `u-${randomUUID()}`;
+    const { projectId, intent } = await seedEditFixture(sub);
+    procStoreSetStatus(intent.id, 'DRAFT');
+    const first = await patchIntent(sub, projectId, intent.id, {
+      prompt: 'AB',
+      ifDraftRevision: 0,
+    });
+    expect(first.statusCode).toBe(200);
+    const stale = await patchIntent(sub, projectId, intent.id, { prompt: 'A', ifDraftRevision: 0 });
+    expect(stale.statusCode).toBe(409);
+    expect(procStore.get(keyOf(`EXEC#${intent.id}`, 'META')).prompt).toBe('AB');
+    const missing = await patchIntent(sub, projectId, intent.id, {
+      prompt: 'A',
+      ifDraftRevision: undefined,
+    });
+    expect(missing.statusCode).toBe(428);
+    const retry = await patchIntent(sub, projectId, intent.id, {
+      prompt: 'ABC',
+      ifDraftRevision: 1,
+    });
+    expect(retry.statusCode).toBe(200);
+    expect(JSON.parse(retry.body).draftRevision).toBe(2);
+  });
 
   it('creates an intent from a composed grid with a custom scope label', async () => {
     const sub = `u-${randomUUID()}`;
@@ -2456,6 +2642,23 @@ describe('POST /compose — composer sessions', () => {
       const intent = JSON.parse(
         (await createIntent(sub, projectId, { title: 'I', prompt: 'Do something ambiguous' })).body,
       );
+      const methodologyRelease = {
+        releaseId: 'aidlc:release-sha',
+        sourceSha: 'release-sha',
+        importerRevision: 2,
+        closureDigest: 'closure-digest',
+        catalogKey: 'catalog.json',
+        manifestKey: 'manifest.json',
+      };
+      const methodologyPins = {
+        AGENT: { 'aidlc-composer-agent': { tenantId: 'default', version: 7 } },
+      };
+      const metaKey = keyOf(`EXEC#${intent.id}`, 'META');
+      procStore.set(metaKey, {
+        ...procStore.get(metaKey),
+        methodologyRelease,
+        methodologyPins,
+      });
       const res = await composeReq(sub, projectId, intent.id, { instructions: 'be lean' });
       expect(res.statusCode).toBe(202);
       const compose = JSON.parse(res.body);
@@ -2477,9 +2680,43 @@ describe('POST /compose — composer sessions', () => {
         instructions: 'be lean',
         requestedCli: 'kiro',
         credentialBinding: { provider: 'kiro', source: 'platform' },
+        methodologyRelease,
+        methodologyPins,
       });
       expect(typeof payload.agentCredentialGrant).toBe('string');
       expect(payload.prompt).toContain('Do something ambiguous');
+    } finally {
+      delete process.env.AGENTCORE_RUNTIME_ARN;
+    }
+  });
+
+  it('does not forward methodology pins for an intent with no release pin', async () => {
+    process.env.AGENTCORE_RUNTIME_ARN = 'arn:aws:bedrock-agentcore:eu:1:runtime/x';
+    try {
+      agentcoreMock.on(InvokeAgentRuntimeCommand).resolves({
+        response: { transformToString: async () => JSON.stringify({ ok: true, accepted: true }) },
+      });
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      seedComposeFixtures();
+      const intent = JSON.parse(
+        (await createIntent(sub, projectId, { title: 'I', prompt: 'Do something ambiguous' })).body,
+      );
+      const metaKey = keyOf(`EXEC#${intent.id}`, 'META');
+      procStore.set(metaKey, {
+        ...procStore.get(metaKey),
+        methodologyPins: {
+          AGENT: { 'aidlc-composer-agent': { tenantId: 'default', version: 7 } },
+        },
+      });
+
+      const res = await composeReq(sub, projectId, intent.id);
+
+      expect(res.statusCode).toBe(202);
+      const call = agentcoreMock.commandCalls(InvokeAgentRuntimeCommand)[0].args[0].input;
+      const payload = JSON.parse(Buffer.from(call.payload).toString());
+      expect(payload).not.toHaveProperty('methodologyRelease');
+      expect(payload).not.toHaveProperty('methodologyPins');
     } finally {
       delete process.env.AGENTCORE_RUNTIME_ARN;
     }
@@ -2921,6 +3158,144 @@ describe('POST /recompose — in-flight reshape', () => {
 });
 
 describe('POST /start', () => {
+  const start = (sub, projectId, intentId) =>
+    handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intentId}/start`,
+      pathParameters: { projectId, intentId },
+      body: JSON.stringify({ agentCli: 'kiro' }),
+      ...claims(sub),
+    });
+
+  const setProjectMcp = (projectId, servers) =>
+    g
+      .V()
+      .has('Project', 'id', projectId)
+      .property(gremlin.process.cardinality.single, 'custom_mcp_servers', JSON.stringify(servers))
+      .next();
+
+  it.each([
+    ['DRAFT', 'global'],
+    ['DRAFT', 'project'],
+    ['FAILED', 'global'],
+    ['FAILED', 'project'],
+  ])('blocks %s launch with %s HTTP settings before any runtime starts', async (status, tier) => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const servers = { tool: { type: 'http', url: 'http://legacy.example/mcp?token=private' } };
+    if (tier === 'global') {
+      ssmMock.on(GetParameterCommand, { Name: '/collab/dev/custom-mcp-servers' }).resolves({
+        Parameter: { Value: JSON.stringify(servers) },
+      });
+    } else {
+      await setProjectMcp(projectId, servers);
+    }
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    setStatus(intent.id, status);
+    const key = keyOf(`EXEC#${intent.id}`, 'META');
+    const before = { ...procStore.get(key) };
+
+    const res = await start(sub, projectId, intent.id);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toMatchObject({ code: 'mcp_config_error' });
+    expect(JSON.parse(res.body).error).toContain(`${tier} MCP`);
+    expect(JSON.parse(res.body).error).toContain('https://');
+    expect(JSON.parse(res.body).error).toContain(
+      tier === 'global' ? 'Platform Admin settings' : 'Space Settings',
+    );
+    expect(res.body).not.toContain('private');
+    expect(procStore.get(key)).toEqual(before);
+    expect(orchestratorInvokes()).toHaveLength(0);
+    expect(agentcoreMock.calls()).toHaveLength(0);
+  });
+
+  it.each(['DRAFT', 'FAILED'])(
+    'saves corrected settings and starts the same %s intent with a repaired snapshot',
+    async (status) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      await setProjectMcp(projectId, { tool: { type: 'http', url: 'http://legacy.example/mcp' } });
+      const intent = JSON.parse((await createIntent(sub, projectId)).body);
+      setStatus(intent.id, status);
+      expect((await start(sub, projectId, intent.id)).statusCode).toBe(400);
+
+      const corrected = { tool: { type: 'http', url: 'https://legacy.example/mcp' } };
+      const { handler: projectsHandler } = await import('../../projects/index.js');
+      const saved = await projectsHandler({
+        httpMethod: 'PUT',
+        path: `/projects/${projectId}/custom-mcp-servers`,
+        pathParameters: { projectId },
+        body: JSON.stringify({ customMcpServers: JSON.stringify(corrected) }),
+        ...claims(sub),
+      });
+      expect(saved.statusCode).toBe(200);
+      // The settings save alone has not rewritten the snapshot.
+      expect(
+        procStore.get(keyOf(`EXEC#${intent.id}`, 'META')).mcpServersByTier.project.tool.url,
+      ).toBe('http://legacy.example/mcp');
+      expect((await start(sub, projectId, intent.id)).statusCode).toBe(202);
+      expect(procStore.get(keyOf(`EXEC#${intent.id}`, 'META')).mcpServersByTier).toEqual({
+        global: {},
+        project: corrected,
+      });
+      expect(orchestratorInvokes()).toHaveLength(1);
+    },
+  );
+
+  it('repairs legacy snapshots after all servers are removed without reviving the old map', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    Object.assign(procStore.get(keyOf(`EXEC#${intent.id}`, 'META')), {
+      status: 'FAILED',
+      mcpServersByTier: null,
+      customMcpServers: { tool: { type: 'http', url: 'http://legacy.example/mcp' } },
+    });
+
+    expect((await start(sub, projectId, intent.id)).statusCode).toBe(202);
+    const meta = procStore.get(keyOf(`EXEC#${intent.id}`, 'META'));
+    expect(meta.mcpServersByTier).toEqual({ global: {}, project: {} });
+    expect(meta.customMcpServers).toBeUndefined();
+  });
+
+  it('keeps a valid snapshot on retry even if settings have since changed', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const pinned = { tool: { type: 'http', url: 'https://original.example/mcp' } };
+    await setProjectMcp(projectId, pinned);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    setStatus(intent.id, 'FAILED');
+    await setProjectMcp(projectId, { other: { type: 'http', url: 'https://new.example/mcp' } });
+
+    expect((await start(sub, projectId, intent.id)).statusCode).toBe(202);
+    expect(procStore.get(keyOf(`EXEC#${intent.id}`, 'META')).mcpServersByTier.project).toEqual(
+      pinned,
+    );
+  });
+
+  it.each(['unavailable', 'malformed'])(
+    'does not erase a snapshot when global settings are %s',
+    async (failure) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      const intent = JSON.parse((await createIntent(sub, projectId)).body);
+      const key = keyOf(`EXEC#${intent.id}`, 'META');
+      const before = { ...procStore.get(key) };
+      const read = ssmMock.on(GetParameterCommand, { Name: '/collab/dev/custom-mcp-servers' });
+      if (failure === 'unavailable') read.rejects(new Error('AccessDenied'));
+      else read.resolves({ Parameter: { Value: '{invalid-secret' } });
+
+      const res = await start(sub, projectId, intent.id);
+      expect(res.statusCode).toBe(failure === 'unavailable' ? 503 : 400);
+      expect(res.body).not.toContain('invalid-secret');
+      expect(res.body).not.toContain('https://');
+      expect(procStore.get(key)).toEqual(before);
+      expect(orchestratorInvokes()).toHaveLength(0);
+      expect(agentcoreMock.calls()).toHaveLength(0);
+    },
+  );
+
   it('requires an explicit CLI for a fresh DRAFT', async () => {
     const sub = `u-${randomUUID()}`;
     const projectId = await seedV2Project(sub);
@@ -3931,6 +4306,249 @@ describe('POST /start — preconditions', () => {
 });
 
 describe('POST /gates/{humanTaskId}/answer', () => {
+  it('rejects an unknown status without consuming the pending gate', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    seedGate(intent.id, 'h1', { status: 'pending', callbackId: 'cb-h1' });
+
+    const invalid = await answerGate(sub, projectId, intent.id, 'h1', {
+      status: 'banana',
+      answer: { ok: 1 },
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(JSON.parse(invalid.body)).toMatchObject({ code: 'invalid_gate_status' });
+
+    // Validation happens before the answer CAS, so the same gate remains usable.
+    expect((await answerGate(sub, projectId, intent.id, 'h1')).statusCode).toBe(200);
+  });
+
+  it('requires a bounded non-blank reason before recording override-and-approve', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const humanTaskId = 'h-override-reason';
+    const humanKey = keyOf(`EXEC#${intent.id}`, `HUMAN#${humanTaskId}`);
+    seedGate(intent.id, humanTaskId);
+
+    for (const answer of [
+      { decision: 'override-and-approve' },
+      { decision: 'override-and-approve', reason: ' \t ' },
+      { decision: 'override-and-approve', reason: 'r'.repeat(2001) },
+      'override-and-approve',
+    ]) {
+      const invalid = await answerGate(sub, projectId, intent.id, humanTaskId, { answer });
+      expect(invalid.statusCode).toBe(400);
+      expect(JSON.parse(invalid.body).code).toMatch(/^override_reason_/);
+      expect(procStore.get(humanKey).status).toBe('pending');
+    }
+
+    const accepted = await answerGate(sub, projectId, intent.id, humanTaskId, {
+      answer: { decision: 'override-and-approve', reason: '  Accepted on the record.  ' },
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(procStore.get(humanKey).answer.reason).toBe('Accepted on the record.');
+  });
+
+  it('reads the override choice and its reason limit exactly as the orchestrator does', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const humanTaskId = 'h-override-parser';
+    const humanKey = keyOf(`EXEC#${intent.id}`, `HUMAN#${humanTaskId}`);
+    seedGate(intent.id, humanTaskId);
+
+    for (const answer of [
+      { freeText: 'override-and-approve' },
+      { decision: 'override-and-approve', reason: 'r'.repeat(301) },
+    ]) {
+      const invalid = await answerGate(sub, projectId, intent.id, humanTaskId, { answer });
+      expect(invalid.statusCode).toBe(400);
+      expect(JSON.parse(invalid.body).code).toMatch(/^override_reason_/);
+      expect(procStore.get(humanKey).status).toBe('pending');
+    }
+  });
+
+  it('rejects a validation-gate choice the gate did not offer', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const humanTaskId = 'h-blocked-validation';
+    const humanKey = keyOf(`EXEC#${intent.id}`, `HUMAN#${humanTaskId}`);
+    seedGate(intent.id, humanTaskId);
+    procStore.set(humanKey, {
+      ...procStore.get(humanKey),
+      kind: 'validation',
+      options: ['request-changes', 'override-and-approve'],
+    });
+
+    for (const body of [
+      { answer: { decision: 'approve' } },
+      { status: 'approved', answer: { ok: 1 } },
+    ]) {
+      const invalid = await answerGate(sub, projectId, intent.id, humanTaskId, body);
+      expect(invalid.statusCode).toBe(400);
+      expect(JSON.parse(invalid.body).code).toBe('gate_choice_not_offered');
+      expect(procStore.get(humanKey).status).toBe('pending');
+    }
+
+    const accepted = await answerGate(sub, projectId, intent.id, humanTaskId, {
+      status: 'rejected',
+      answer: { decision: 'request-changes', feedback: 'fix it' },
+    });
+    expect(accepted.statusCode).toBe(200);
+  });
+
+  // The reason, the outcome and its explanation are only on the gate row; the stage
+  // row's recommendation is cleared as soon as the gate opens. A DTO that drops
+  // them leaves the reviewer with a generic sentence when the option is offered and
+  // with nothing at all when it is not.
+  it('maps the loop-back reason, status and note onto the gate DTO', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const seed = (humanTaskId, fields) => {
+      const humanKey = keyOf(`EXEC#${intent.id}`, `HUMAN#${humanTaskId}`);
+      seedGate(intent.id, humanTaskId);
+      procStore.set(humanKey, {
+        ...procStore.get(humanKey),
+        kind: 'validation',
+        options: ['approve', 'request-changes'],
+        ...fields,
+      });
+    };
+    seed('h-offered', {
+      options: ['approve', 'request-changes', 'loop-back'],
+      loopBackTarget: 'code-generation',
+      loopBackReason: 'integration tests fail',
+      loopBackStatus: 'offered',
+      loopBackNote: 'Choose loop-back to send this work back to code-generation.',
+    });
+    seed('h-at-cap', {
+      loopBackReason: 'integration tests fail',
+      loopBackStatus: 'at-cap',
+      loopBackNote: 'This intent has already used all 3 loop-backs.',
+    });
+    seed('h-none', {});
+
+    const res = await handler({
+      httpMethod: 'GET',
+      path: `/projects/${projectId}/intents/${intent.id}`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+
+    const gates = JSON.parse(res.body).gates;
+    const byId = (id) => gates.find((row) => row.humanTaskId === id);
+    expect(byId('h-offered')).toMatchObject({
+      loopBackTarget: 'code-generation',
+      loopBackReason: 'integration tests fail',
+      loopBackStatus: 'offered',
+      loopBackNote: 'Choose loop-back to send this work back to code-generation.',
+    });
+    expect(byId('h-at-cap')).toMatchObject({
+      loopBackReason: 'integration tests fail',
+      loopBackStatus: 'at-cap',
+      loopBackNote: 'This intent has already used all 3 loop-backs.',
+    });
+    expect(byId('h-at-cap')).not.toHaveProperty('loopBackTarget');
+    // Absent, not null: a gate with no recommendation says nothing about one.
+    expect(byId('h-none')).not.toHaveProperty('loopBackReason');
+    expect(byId('h-none')).not.toHaveProperty('loopBackStatus');
+    expect(byId('h-none')).not.toHaveProperty('loopBackNote');
+  });
+
+  it('accepts loop-back only where offered, and only recorded as rejected', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    // `awaitEngineGate` writes `loopBackTarget` in the SAME call that puts
+    // `loop-back` in the options, so a gate offering the option always names the
+    // target it would rewind to.
+    const seedValidation = (humanTaskId, options) => {
+      const humanKey = keyOf(`EXEC#${intent.id}`, `HUMAN#${humanTaskId}`);
+      seedGate(intent.id, humanTaskId);
+      procStore.set(humanKey, {
+        ...procStore.get(humanKey),
+        kind: 'validation',
+        options,
+        ...(options.includes('loop-back') ? { loopBackTarget: 'code-generation' } : {}),
+      });
+      return humanKey;
+    };
+    const loopBack = { decision: 'loop-back', feedback: 'check the refund path' };
+
+    const plainKey = seedValidation('h-no-loop-back', ['approve', 'request-changes']);
+    const notOffered = await answerGate(sub, projectId, intent.id, 'h-no-loop-back', {
+      status: 'rejected',
+      answer: loopBack,
+    });
+    expect(notOffered.statusCode).toBe(400);
+    expect(JSON.parse(notOffered.body).code).toBe('gate_choice_not_offered');
+    expect(procStore.get(plainKey).status).toBe('pending');
+
+    // Code that predates the loop-back reads a rejected answer as request-changes,
+    // so any other status would be misread by it.
+    const offeredKey = seedValidation('h-loop-back', ['approve', 'request-changes', 'loop-back']);
+    const approved = await answerGate(sub, projectId, intent.id, 'h-loop-back', {
+      status: 'approved',
+      answer: loopBack,
+    });
+    expect(approved.statusCode).toBe(400);
+    expect(JSON.parse(approved.body).code).toBe('loop_back_status_invalid');
+    expect(procStore.get(offeredKey).status).toBe('pending');
+
+    const accepted = await answerGate(sub, projectId, intent.id, 'h-loop-back', {
+      status: 'rejected',
+      answer: loopBack,
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(procStore.get(offeredKey).answer).toEqual(loopBack);
+  });
+
+  // The engine's offer, not the human's text, is what makes an answer a loop-back:
+  // `parseChoice` reads `freeText` too, and the stage runner uses the same parser to
+  // decide a stage may re-enter with no parked session. A gate that never offered
+  // the jump carries no `loopBackTarget`, and the answer is refused whatever its
+  // kind and whatever option list it stored.
+  it('refuses a loop-back on any gate the engine never offered it on', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+
+    const refusals = [];
+    for (const [humanTaskId, row, answer] of [
+      // A `question` gate: no `kind: 'validation'`, no options, so the guarded
+      // branch above never ran. `freeText` is the field the agent's own questions
+      // are answered in.
+      ['h-question-freetext', { kind: 'question' }, { freeText: 'loop-back' }],
+      ['h-question-decision', { kind: 'question' }, { decision: 'loop-back' }],
+      // A validation gate whose option list was never stored.
+      ['h-validation-no-options', { kind: 'validation' }, { decision: 'loop-back' }],
+      // And one that stored an empty list.
+      ['h-validation-empty-options', { kind: 'validation', options: [] }, { mode: 'loop-back' }],
+    ]) {
+      const humanKey = keyOf(`EXEC#${intent.id}`, `HUMAN#${humanTaskId}`);
+      seedGate(intent.id, humanTaskId);
+      procStore.set(humanKey, { ...procStore.get(humanKey), ...row });
+      const refused = await answerGate(sub, projectId, intent.id, humanTaskId, {
+        status: 'rejected',
+        answer,
+      });
+      refusals.push([humanTaskId, refused.statusCode, JSON.parse(refused.body).code]);
+      // Nothing was recorded, so no orchestrator or stage runner ever reads it.
+      expect(procStore.get(humanKey).status).toBe('pending');
+      expect(procStore.get(humanKey).answer ?? null).toBeNull();
+    }
+
+    expect(refusals).toEqual([
+      ['h-question-freetext', 400, 'loop_back_not_offered'],
+      ['h-question-decision', 400, 'loop_back_not_offered'],
+      ['h-validation-no-options', 400, 'loop_back_not_offered'],
+      ['h-validation-empty-options', 400, 'loop_back_not_offered'],
+    ]);
+  });
+
   it('answers a pending gate (CAS) and resumes the durable callback when bound', async () => {
     const sub = `u-${randomUUID()}`;
     const projectId = await seedV2Project(sub);
@@ -4485,6 +5103,38 @@ const seedIntentAnchor = (intentId) =>
   g.addV('Intent').property('id', intentId).property('title', 'Intent').next();
 
 describe('POST /gates/{id}/answer with steering', () => {
+  it('does not expose the answer or resume its callback before attached steering commits', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    seedGate(intent.id, 'h1', { status: 'pending', callbackId: 'cb-h1' });
+
+    let releaseTransaction;
+    transactWriteBarrier = new Promise((resolve) => {
+      releaseTransaction = resolve;
+    });
+    const answerPromise = answerGate(sub, projectId, intent.id, 'h1', {
+      answer: { ok: 1 },
+      steering: 'Use the event bus.',
+    });
+
+    await vi.waitFor(() => {
+      expect(ddbMock.commandCalls(TransactWriteCommand)).toHaveLength(1);
+    });
+    const humanKey = keyOf(`EXEC#${intent.id}`, 'HUMAN#h1');
+    expect(procStore.get(humanKey).status).toBe('pending');
+    expect([...procStore.keys()].some((key) => key.includes('|STEER#'))).toBe(false);
+    expect(lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand)).toHaveLength(0);
+
+    releaseTransaction();
+    const res = await answerPromise;
+
+    expect(res.statusCode).toBe(200);
+    expect(procStore.get(humanKey).status).toBe('answered');
+    expect([...procStore.keys()].some((key) => key.includes('|STEER#'))).toBe(true);
+    expect(lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand)).toHaveLength(1);
+  });
+
   it('records a gate-steer STEER row + Steering vertex and still resumes the callback', async () => {
     const sub = `u-${randomUUID()}`;
     const projectId = await seedV2Project(sub);
@@ -4744,6 +5394,20 @@ describe('DELETE /projects/{id}/intents/{intentId}', () => {
     expect(again.statusCode).toBe(404);
   });
 
+  it('keeps the intent and reports a retryable conflict while collaboration cleanup is pending', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    ddbMock
+      .on(ScanCommand)
+      .rejects(Object.assign(new Error('scan budget exhausted'), { code: 'YJS_CLEANUP_PENDING' }));
+    const res = await del(sub, projectId, intent.id);
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).code).toBe('deletion_pending');
+    expect(procStore.has(keyOf(`EXEC#${intent.id}`, 'META'))).toBe(true);
+    expect(yjsStore.get(`scope#intent:${intent.id}`)?.deletedAt).toBeTruthy();
+  });
+
   it('cascades the Neptune subgraph, drains the DDB partition and removes the Yjs docs', async () => {
     const sub = `u-${randomUUID()}`;
     const projectId = await seedV2Project(sub);
@@ -4803,7 +5467,8 @@ describe('DELETE /projects/{id}/intents/{intentId}', () => {
     const leftover = [...procStore.keys()].filter((k) => k.startsWith(`EXEC#${intentId}|`));
     expect(leftover).toEqual([]);
     // Yjs: only the intent-scoped docs are removed.
-    expect([...yjsStore.keys()]).toEqual(['unrelated-doc']);
+    expect([...yjsStore.keys()]).toEqual(['unrelated-doc', `scope#intent:${intentId}`]);
+    expect(yjsStore.get(`scope#intent:${intentId}`).deletedAt).toEqual(expect.any(Number));
   });
 
   it('purges every version of the intent native workspace exports from S3', async () => {
@@ -5148,6 +5813,41 @@ describe('POST /rewind', () => {
       body: JSON.stringify(body),
       ...claims(sub),
     });
+
+  it('rejects HTTP before stopping a parked runtime or resetting work, then accepts corrected settings', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedPlan();
+    const servers = { tool: { type: 'http', url: 'http://legacy.example/mcp' } };
+    ssmMock.on(GetParameterCommand, { Name: '/collab/dev/custom-mcp-servers' }).resolves({
+      Parameter: { Value: JSON.stringify(servers) },
+    });
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    setStatus(intent.id, { status: 'WAITING' });
+    seedStageRow(intent.id, 'design');
+    seedStageRow(intent.id, 'implement', 'WAITING_FOR_HUMAN');
+    const key = keyOf(`EXEC#${intent.id}`, 'META');
+    const before = { ...procStore.get(key) };
+
+    const blocked = await rewind(sub, projectId, intent.id, { fromStageId: 'implement' });
+    expect(blocked.statusCode).toBe(400);
+    expect(JSON.parse(blocked.body).code).toBe('mcp_config_error');
+    expect(procStore.get(key)).toEqual(before);
+    expect(procStore.get(keyOf(`EXEC#${intent.id}`, `STAGE#${siOf('implement')}`)).attempt).toBe(0);
+    expect(archiveArtifactsSpy).not.toHaveBeenCalled();
+    expect(agentcoreMock.calls()).toHaveLength(0);
+    expect(orchestratorInvokes()).toHaveLength(0);
+
+    const corrected = { tool: { type: 'http', url: 'https://legacy.example/mcp' } };
+    ssmMock.on(GetParameterCommand, { Name: '/collab/dev/custom-mcp-servers' }).resolves({
+      Parameter: { Value: JSON.stringify(corrected) },
+    });
+    expect((await rewind(sub, projectId, intent.id, { fromStageId: 'implement' })).statusCode).toBe(
+      202,
+    );
+    expect(procStore.get(key).mcpServersByTier).toEqual({ global: corrected, project: {} });
+    expect(orchestratorInvokes()).toHaveLength(1);
+  });
 
   it('resets the target stage + downstream, supersedes their artifacts, relaunches at the stage', async () => {
     const sub = `u-${randomUUID()}`;
@@ -6426,16 +7126,61 @@ describe('GET /artifacts/{id}/impact', () => {
   });
 });
 
-const putContent = (sub, projectId, intentId, artifactId, content) =>
+const putContent = (sub, projectId, intentId, artifactId, content, extra = {}) =>
   handler({
     httpMethod: 'PUT',
     path: `/projects/${projectId}/intents/${intentId}/artifacts/${artifactId}/content`,
     pathParameters: { projectId, intentId, artifactId },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, collaborationEpoch: null, ifEditRevision: null, ...extra }),
     ...claims(sub),
   });
 
 describe('PUT /artifacts/{id}/content (simple edit)', () => {
+  it('rejects a delayed older projection and accepts a retry with the current revision', async () => {
+    const sub = `u-${randomUUID()}`;
+    const { projectId, intent } = await seedEditFixture(sub);
+    const newer = await putContent(sub, projectId, intent.id, 'mr', 'AB');
+    expect(newer.statusCode).toBe(200);
+    const stale = await putContent(sub, projectId, intent.id, 'mr', 'A');
+    expect(stale.statusCode).toBe(409);
+    expect(JSON.parse(stale.body).code).toBe('edit_conflict');
+    const state = await handler({
+      httpMethod: 'GET',
+      pathParameters: { projectId, intentId: intent.id },
+      queryStringParameters: { editState: 'mr' },
+      ...claims(sub),
+    });
+    const revision = JSON.parse(state.body);
+    expect(revision.editRevision).toBeTruthy();
+    const retry = await putContent(sub, projectId, intent.id, 'mr', 'ABC', {
+      ifEditRevision: revision.editRevision,
+    });
+    expect(retry.statusCode).toBe(200);
+    const missing = await putContent(sub, projectId, intent.id, 'mr', 'unversioned', {
+      ifEditRevision: undefined,
+    });
+    expect(missing.statusCode).toBe(428);
+  });
+
+  it('refuses a stale collaboration epoch after the content was replaced', async () => {
+    const sub = `u-${randomUUID()}`;
+    const { projectId, intent } = await seedEditFixture(sub);
+    await g
+      .V()
+      .has('Artifact', 'id', 'mr')
+      .has('intent_id', intent.id)
+      .property('collaboration_epoch', 'replacement')
+      .next();
+    const stale = await putContent(sub, projectId, intent.id, 'mr', 'stale draft', {
+      collaborationEpoch: null,
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(JSON.parse(stale.body).code).toBe('artifact_replaced');
+    const current = await putContent(sub, projectId, intent.id, 'mr', 'current draft', {
+      collaborationEpoch: 'replacement',
+    });
+    expect(current.statusCode).toBe(200);
+  });
   it('writes content + human provenance, marks the closure stale, records the event', async () => {
     const sub = `u-${randomUUID()}`;
     const { projectId, intent } = await seedEditFixture(sub);
@@ -7030,5 +7775,1955 @@ describe('stage skipping — start-time override (DRAFT screen)', () => {
     // A plain restart still works.
     const retry = await startIntent(sub, projectId, intent.id, {});
     expect(retry.statusCode).toBe(202);
+  });
+});
+
+// Release-pinned intents must resolve their methodology
+// from the published immutable closure, not from the reseedable SYSTEM rows.
+describe('AI-DLC release pinning', () => {
+  const releaseBundle = buildReleaseBundle({
+    profileId: RELEASE_PROFILE,
+    files: filesFromCompatibilityFixture({
+      profileId: RELEASE_PROFILE,
+      fixture: JSON.parse(
+        readFileSync(
+          new URL(
+            `../../shared/test/fixtures/aidlc-compatibility/${RELEASE_PROFILE}.json`,
+            import.meta.url,
+          ),
+          'utf8',
+        ),
+      ),
+    }),
+  });
+  const releasePin = methodologyReleasePinFromManifest(releaseBundle.manifest);
+  const releaseSha = releaseBundle.manifest.sourceSha;
+  const releaseStore = new Map();
+
+  const seedSelectableRelease = () => {
+    procStore.set(keyOf(`AIDLC_RELEASE#${releasePin.releaseId}`, 'META'), {
+      pk: `AIDLC_RELEASE#${releasePin.releaseId}`,
+      sk: 'META',
+      type: 'AidlcRelease',
+      ...releasePin,
+      profileId: RELEASE_PROFILE,
+      upstreamVersion: '2.3.3',
+      trustTier: 'T1',
+      supportState: 'selectable',
+      structurallyValid: true,
+      fidelityGaps: [],
+      visible: true,
+      runnable: true,
+      revision: 1,
+      GSI1PK: 'AIDLC_RELEASES',
+    });
+  };
+
+  // The published release, plus only the release, is readable from S3.
+  const installReleaseObjects = ({ withManifest = true, withCatalog = true } = {}) => {
+    releaseStore.clear();
+    if (withManifest) {
+      releaseStore.set(releasePin.manifestKey, JSON.stringify(releaseBundle.manifest, null, 2));
+    }
+    if (withCatalog) {
+      releaseStore.set(releasePin.catalogKey, JSON.stringify(releaseBundle.catalog, null, 2));
+    }
+    s3Mock.on(GetObjectCommand).callsFake((input) => {
+      if (!releaseStore.has(input.Key)) {
+        const error = new Error('missing');
+        error.name = 'NoSuchKey';
+        error.$metadata = { httpStatusCode: 404 };
+        throw error;
+      }
+      return { Body: Buffer.from(releaseStore.get(input.Key)) };
+    });
+  };
+
+  // The workflow/stage the create path resolves, attributed to the release SHA
+  // so `aidlcRepoRef` lands on exactly the SHA a release was published for.
+  const seedReleaseAttributedPlan = () => {
+    procStore.set(keyOf('WF#default#aidlc-v2', 'V#4#META'), {
+      pk: 'WF#default#aidlc-v2',
+      sk: 'V#4#META',
+      sourceRef: releaseSha,
+    });
+    procStore.set(keyOf('WF#default#aidlc-v2', 'V#4#PLACEMENT#intent-capture'), {
+      pk: 'WF#default#aidlc-v2',
+      sk: 'V#4#PLACEMENT#intent-capture',
+      stageId: 'intent-capture',
+      order: 0,
+      scopeMembership: { feature: 'EXECUTE' },
+    });
+    procStore.set(keyOf('BLOCK#SYSTEM#STAGE#intent-capture', 'V#latest'), {
+      pk: 'BLOCK#SYSTEM#STAGE#intent-capture',
+      sk: 'V#latest',
+      GSI1PK: 'TENANT#SYSTEM#STAGE',
+      GSI1SK: 'intent-capture',
+      id: 'intent-capture',
+      blockId: 'intent-capture',
+      tenantId: 'SYSTEM',
+      version: 1,
+      phase: 'inception',
+      mode: 'inline',
+      leadAgent: 'orchestrator',
+      produces: [],
+      consumes: [],
+      sensors: [],
+      humanValidation: 'none',
+      sourceRef: releaseSha,
+    });
+  };
+
+  const getObjectKeys = () =>
+    s3Mock.commandCalls(GetObjectCommand).map((call) => call.args[0].input.Key);
+
+  const repinToRelease = (intentId, overrides = {}) => {
+    const metaKey = keyOf(`EXEC#${intentId}`, 'META');
+    const meta = {
+      ...procStore.get(metaKey),
+      workflowVersion: 1,
+      scope: 'bugfix',
+      methodologyPins: null,
+      methodologyRelease: releasePin,
+      ...overrides,
+    };
+    procStore.set(metaKey, meta);
+    return meta;
+  };
+
+  beforeEach(() => {
+    vi.stubEnv('AIDLC_RELEASE_PINNING', 'off');
+    // A resolved closure is immutable, so the resolver caches it for the life of
+    // the process. Each test must therefore start from a cold cache.
+    releaseResolverTest.releaseClosureCache.clear();
+  });
+
+  it('stamps the release pin on create only when the write flag is on', async () => {
+    vi.stubEnv('AIDLC_RELEASE_PINNING', 'on');
+    installReleaseObjects();
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedReleaseAttributedPlan();
+    seedSelectableRelease();
+
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+
+    const meta = procStore.get(keyOf(`EXEC#${intent.id}`, 'META'));
+    expect(meta.aidlcRepoRef).toBe(releaseSha);
+    expect(meta.methodologyRelease).toEqual(releasePin);
+  });
+
+  it('leaves the intent unpinned while the write flag is off', async () => {
+    installReleaseObjects();
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedReleaseAttributedPlan();
+
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+
+    const meta = procStore.get(keyOf(`EXEC#${intent.id}`, 'META'));
+    expect(meta.aidlcRepoRef).toBe(releaseSha);
+    expect(meta.methodologyRelease ?? null).toBeNull();
+    expect(getObjectKeys()).not.toContain(releasePin.manifestKey);
+  });
+
+  it('creates the intent unpinned when the resolved ref has no published release', async () => {
+    vi.stubEnv('AIDLC_RELEASE_PINNING', 'on');
+    installReleaseObjects({ withManifest: false });
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedReleaseAttributedPlan();
+
+    const res = await createIntent(sub, projectId);
+
+    expect(res.statusCode).toBe(201);
+    const intent = JSON.parse(res.body);
+    const meta = procStore.get(keyOf(`EXEC#${intent.id}`, 'META'));
+    expect(meta.methodologyRelease ?? null).toBeNull();
+    expect(getObjectKeys()).not.toContain(releasePin.manifestKey);
+  });
+
+  it('forwards the pin so a start resolves its plan from the release closure', async () => {
+    installReleaseObjects();
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedReleaseAttributedPlan();
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    repinToRelease(intent.id);
+    s3Mock.resetHistory();
+
+    const res = await handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intent.id}/start`,
+      pathParameters: { projectId, intentId: intent.id },
+      // `skipStageIds: []` clears the create-time overlay, which is what makes
+      // start re-resolve the pinned plan before launching.
+      body: JSON.stringify({ agentCli: 'kiro', skipStageIds: [] }),
+      ...claims(sub),
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect(getObjectKeys()).toEqual(
+      expect.arrayContaining([releasePin.manifestKey, releasePin.catalogKey]),
+    );
+  });
+
+  it('builds the native export plan from the release closure, never the legacy catalog', async () => {
+    installReleaseObjects();
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedReleaseAttributedPlan();
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    repinToRelease(intent.id, { status: 'WAITING', startedAt: '2026-08-14T10:00:00.000Z' });
+    s3Mock.resetHistory();
+
+    const res = await handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intent.id}/export`,
+      pathParameters: { projectId, intentId: intent.id },
+      body: JSON.stringify({ harness: 'codex' }),
+      ...claims(sub),
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(getObjectKeys()).toEqual(
+      expect.arrayContaining([releasePin.manifestKey, releasePin.catalogKey]),
+    );
+    expect(getObjectKeys()).not.toContain(methodologyCatalogKey(releaseSha));
+  });
+
+  it('refuses to start when the pinned release cannot be resolved', async () => {
+    installReleaseObjects({ withCatalog: false });
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedReleaseAttributedPlan();
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    repinToRelease(intent.id);
+
+    const res = await handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intent.id}/start`,
+      pathParameters: { projectId, intentId: intent.id },
+      body: JSON.stringify({ agentCli: 'kiro', skipStageIds: [] }),
+      ...claims(sub),
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).errors.map((error) => error.code)).toContain(
+      'release_closure_mismatch',
+    );
+    expect(orchestratorInvokes()).toHaveLength(0);
+  });
+});
+
+// Per-intent release selection at create time.
+//
+// The property under test: an explicitly selected release decides the intent's
+// ref AND the vocabulary its plan is validated against. Release B is picked
+// while the DynamoDB deployment workflow is attributed to release A, so a scope
+// that only B offers must be accepted and a scope that only the deployment
+// workflow offers must be rejected — proving the validation moved to B rather
+// than merely stamping a different pin.
+describe('AI-DLC per-intent release selection', () => {
+  const bundleFor = (profileId) =>
+    buildReleaseBundle({
+      profileId,
+      files: filesFromCompatibilityFixture({
+        profileId,
+        fixture: JSON.parse(
+          readFileSync(
+            new URL(
+              `../../shared/test/fixtures/aidlc-compatibility/${profileId}.json`,
+              import.meta.url,
+            ),
+            'utf8',
+          ),
+        ),
+      }),
+    });
+
+  const bundleA = bundleFor('current-stable');
+  const bundleB = bundleFor('v2.9.0');
+  const pinA = methodologyReleasePinFromManifest(bundleA.manifest);
+  const pinB = methodologyReleasePinFromManifest(bundleB.manifest);
+  const shaA = bundleA.manifest.sourceSha;
+  const shaB = bundleB.manifest.sourceSha;
+  // `express` exists only in v2.9.0; `legacy-only` only in the DynamoDB
+  // deployment workflow seeded below. Neither release offers the other's scope.
+  const SCOPE_ONLY_IN_B = 'express';
+  const SCOPE_ONLY_IN_DEPLOYMENT = 'legacy-only';
+
+  const releaseStore = new Map();
+
+  const installReleaseObjects = () => {
+    releaseStore.clear();
+    for (const bundle of [bundleA, bundleB]) {
+      const pin = methodologyReleasePinFromManifest(bundle.manifest);
+      releaseStore.set(pin.manifestKey, JSON.stringify(bundle.manifest, null, 2));
+      releaseStore.set(pin.catalogKey, JSON.stringify(bundle.catalog, null, 2));
+    }
+    s3Mock.on(GetObjectCommand).callsFake((input) => {
+      if (!releaseStore.has(input.Key)) {
+        const error = new Error('missing');
+        error.name = 'NoSuchKey';
+        error.$metadata = { httpStatusCode: 404 };
+        throw error;
+      }
+      return { Body: Buffer.from(releaseStore.get(input.Key)) };
+    });
+  };
+
+  // The workflow the platform would resolve WITHOUT a selection: version 1 (so a
+  // release selection resolves the catalog workflow rather than a user fork),
+  // attributed to release A, and offering only a scope no release knows about.
+  const seedDeploymentWorkflowAtV1 = (scopeId = SCOPE_ONLY_IN_DEPLOYMENT, sourceSha = shaA) => {
+    procStore.set(keyOf('WF#default#aidlc-v2', 'META'), {
+      pk: 'WF#default#aidlc-v2',
+      sk: 'META',
+      version: 1,
+    });
+    procStore.set(keyOf('WF#default#aidlc-v2', 'V#1#META'), {
+      pk: 'WF#default#aidlc-v2',
+      sk: 'V#1#META',
+      sourceRef: sourceSha,
+    });
+    procStore.set(keyOf('WF#default#aidlc-v2', `V#1#SCOPEREF#${scopeId}`), {
+      pk: 'WF#default#aidlc-v2',
+      sk: `V#1#SCOPEREF#${scopeId}`,
+      scopeId,
+    });
+    procStore.set(keyOf('WF#default#aidlc-v2', 'V#1#PLACEMENT#intent-capture'), {
+      pk: 'WF#default#aidlc-v2',
+      sk: 'V#1#PLACEMENT#intent-capture',
+      stageId: 'intent-capture',
+      order: 0,
+      scopeMembership: { [scopeId]: 'EXECUTE' },
+    });
+    procStore.set(keyOf('BLOCK#SYSTEM#STAGE#intent-capture', 'V#latest'), {
+      pk: 'BLOCK#SYSTEM#STAGE#intent-capture',
+      sk: 'V#latest',
+      GSI1PK: 'TENANT#SYSTEM#STAGE',
+      GSI1SK: 'intent-capture',
+      id: 'intent-capture',
+      blockId: 'intent-capture',
+      tenantId: 'SYSTEM',
+      version: 1,
+      phase: 'inception',
+      mode: 'inline',
+      leadAgent: 'orchestrator',
+      produces: [],
+      consumes: [],
+      sensors: [],
+      humanValidation: 'none',
+      sourceRef: sourceSha,
+    });
+  };
+
+  const seedRegistryRecord = (bundle, profileId, overrides = {}) => {
+    const pin = methodologyReleasePinFromManifest(bundle.manifest);
+    procStore.set(keyOf(`AIDLC_RELEASE#${pin.releaseId}`, 'META'), {
+      pk: `AIDLC_RELEASE#${pin.releaseId}`,
+      sk: 'META',
+      type: 'AidlcRelease',
+      ...pin,
+      profileId,
+      upstreamVersion: profileId === 'current-stable' ? '2.3.3' : '2.9.0',
+      upstreamChannel: 'stable',
+      trustTier: 'T1',
+      supportState: 'selectable',
+      fidelityGaps: [],
+      structurallyValid: true,
+      visible: true,
+      runnable: true,
+      notes: null,
+      revision: 1,
+      GSI1PK: 'AIDLC_RELEASES',
+      ...overrides,
+    });
+  };
+
+  const seedDefaultAgentOverride = (bundle, agentId = 'aidlc-architect-agent', version = 7) => {
+    const baseAgent = bundle.catalog.blocks.AGENT.find((block) => block.id === agentId);
+    const pk = `BLOCK#default#AGENT#${agentId}`;
+    const userAgent = {
+      ...baseAgent,
+      pk,
+      sk: `V#${version}`,
+      tenantId: 'default',
+      version,
+    };
+    procStore.set(keyOf(pk, `V#${version}`), userAgent);
+    procStore.set(keyOf(pk, 'V#latest'), {
+      ...userAgent,
+      sk: 'V#latest',
+      GSI1PK: 'TENANT#default#AGENT',
+      GSI1SK: agentId,
+    });
+  };
+
+  const USER_METHODOLOGY_OVERRIDES = [
+    ['AGENT', 'aidlc-architect-agent'],
+    ['RULE', 'aidlc-org'],
+    ['SENSOR', 'linter'],
+    ['KNOWLEDGE', 'architect-agent-adr-template'],
+  ];
+
+  const seedDefaultMethodologyOverrides = (bundle, version = 7) => {
+    for (const [type, blockId] of USER_METHODOLOGY_OVERRIDES) {
+      const baseBlock = bundle.catalog.blocks[type].find((block) => block.id === blockId);
+      if (!baseBlock) throw new Error(`missing ${type} fixture block ${blockId}`);
+      const pk = `BLOCK#default#${type}#${blockId}`;
+      const block = { ...baseBlock, pk, sk: `V#${version}`, tenantId: 'default', version };
+      procStore.set(keyOf(pk, `V#${version}`), block);
+      procStore.set(keyOf(pk, 'V#latest'), {
+        ...block,
+        sk: 'V#latest',
+        GSI1PK: `TENANT#default#${type}`,
+        GSI1SK: blockId,
+      });
+    }
+  };
+
+  const expectMethodologyOverridesPinned = (methodologyPins) => {
+    for (const [type, blockId] of USER_METHODOLOGY_OVERRIDES) {
+      expect(methodologyPins[type][blockId]).toEqual({ tenantId: 'default', version: 7 });
+    }
+  };
+
+  const expectMethodologyOverridesReplayed = () => {
+    const fetchedKeys = ddbMock.commandCalls(GetCommand).map((call) => call.args[0].input.Key);
+    expect(fetchedKeys).toEqual(
+      expect.arrayContaining(
+        USER_METHODOLOGY_OVERRIDES.map(([type, blockId]) => ({
+          pk: `BLOCK#default#${type}#${blockId}`,
+          sk: 'V#7',
+        })),
+      ),
+    );
+  };
+
+  const seedStableChannel = (releaseId) => {
+    procStore.set(keyOf('AIDLC_RELEASE_CHANNEL#stable', 'META'), {
+      pk: 'AIDLC_RELEASE_CHANNEL#stable',
+      sk: 'META',
+      type: 'AidlcReleaseChannel',
+      channel: 'stable',
+      releaseId,
+      revision: 1,
+    });
+  };
+
+  const metaFor = (intentId) => procStore.get(keyOf(`EXEC#${intentId}`, 'META'));
+
+  beforeEach(() => {
+    vi.stubEnv('AIDLC_RELEASE_PINNING', 'on');
+    releaseResolverTest.releaseClosureCache.clear();
+    installReleaseObjects();
+  });
+
+  it('pins to the requested release B and validates the plan against B, not the deployment', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0');
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_B,
+      methodologyReleaseId: pinB.releaseId,
+    });
+
+    expect(res.statusCode).toBe(201);
+    const intent = JSON.parse(res.body);
+    expect(intent.methodologyRelease).toEqual({ ...pinB, upstreamVersion: '2.9.0' });
+    const meta = metaFor(intent.id);
+    // The deployment workflow is attributed to A; the selection wins.
+    expect(meta.aidlcRepoRef).toBe(shaB);
+    expect(meta.aidlcRepoRef).not.toBe(shaA);
+    expect(meta.methodologyRelease).toEqual(pinB);
+    expect(meta.scope).toBe(SCOPE_ONLY_IN_B);
+  });
+
+  it('pins the closure workflow version when the current workflow version has no user fork', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    // Keep the project's mutable V4 default, but leave no V4 snapshot that
+    // release mode could mistake for a user-authored workflow fork.
+    procStore.delete(keyOf('WF#default#aidlc-v2', 'V#4#SCOPEREF#feature'));
+    seedRegistryRecord(bundleA, 'current-stable');
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      methodologyReleaseId: pinA.releaseId,
+    });
+
+    expect(res.statusCode).toBe(201);
+    const intent = JSON.parse(res.body);
+    expect(intent.workflowVersion).toBe(1);
+    expect(intent.methodologyRelease.releaseId).toBe(pinA.releaseId);
+    expect(metaFor(intent.id)).toMatchObject({
+      workflowVersion: 1,
+      methodologyRelease: pinA,
+    });
+  });
+
+  it('snapshots a default-tenant agent override into a selected release intent', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    procStore.delete(keyOf('WF#default#aidlc-v2', 'V#4#SCOPEREF#feature'));
+    seedDeploymentWorkflowAtV1();
+    seedDefaultAgentOverride(bundleB);
+    seedRegistryRecord(bundleB, 'v2.9.0');
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_B,
+      methodologyReleaseId: pinB.releaseId,
+    });
+
+    expect(res.statusCode).toBe(201);
+    const meta = metaFor(JSON.parse(res.body).id);
+    expect(meta.methodologyRelease).toEqual(pinB);
+    expect(meta.methodologyPins.AGENT['aidlc-architect-agent']).toEqual({
+      tenantId: 'default',
+      version: 7,
+    });
+    expect(ddbMock.commandCalls(GetCommand).map((call) => call.args[0].input.Key)).toContainEqual({
+      pk: 'BLOCK#default#AGENT#aidlc-architect-agent',
+      sk: 'V#7',
+    });
+  });
+
+  it.each([
+    ['selected', bundleB, 'v2.9.0', SCOPE_ONLY_IN_B, true],
+    ['auto-pinned', bundleA, 'current-stable', 'feature', false],
+  ])(
+    'captures and replays default-tenant RULE, SENSOR, and KNOWLEDGE overrides through %s release creation',
+    async (_label, bundle, profileId, scope, explicitlySelected) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      if (explicitlySelected)
+        procStore.delete(keyOf('WF#default#aidlc-v2', 'V#4#SCOPEREF#feature'));
+      seedDeploymentWorkflowAtV1(explicitlySelected ? undefined : 'feature');
+      seedDefaultMethodologyOverrides(bundle);
+      seedRegistryRecord(bundle, profileId);
+
+      const res = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        scope,
+        ...(explicitlySelected ? { methodologyReleaseId: pinB.releaseId } : {}),
+      });
+
+      expect(res.statusCode).toBe(201);
+      const intent = JSON.parse(res.body);
+      const meta = metaFor(intent.id);
+      expect(meta.methodologyRelease).toEqual(explicitlySelected ? pinB : pinA);
+      expectMethodologyOverridesPinned(meta.methodologyPins);
+
+      ddbMock.resetHistory();
+      const started = await handler({
+        httpMethod: 'POST',
+        path: `/projects/${projectId}/intents/${intent.id}/start`,
+        pathParameters: { projectId, intentId: intent.id },
+        body: JSON.stringify({ agentCli: 'kiro', skipStageIds: [] }),
+        ...claims(sub),
+      });
+
+      expect(started.statusCode).toBe(202);
+      expectMethodologyOverridesReplayed();
+    },
+  );
+
+  it('rejects a scope that only the DynamoDB deployment workflow offers', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0');
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_DEPLOYMENT,
+      methodologyReleaseId: pinB.releaseId,
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain(SCOPE_ONLY_IN_DEPLOYMENT);
+  });
+
+  it('leaves that same deployment-only scope unpinned rather than auto-pinning a release that cannot run it', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_DEPLOYMENT,
+    });
+
+    expect(res.statusCode).toBe(201);
+    const meta = metaFor(JSON.parse(res.body).id);
+    expect(meta.aidlcRepoRef).toBe(shaA);
+    // The auto-pin candidate is release A, whose closure does not offer this
+    // scope. Stamping it anyway would 201 here and then fail every run with a
+    // permanent plan_invalid, so the intent stays on the legacy DynamoDB path.
+    expect(meta.methodologyRelease ?? null).toBeNull();
+    expect(meta.scope).toBe(SCOPE_ONLY_IN_DEPLOYMENT);
+  });
+
+  it('rejects a release that is registered but not selectable', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0', { visible: false });
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_B,
+      methodologyReleaseId: pinB.releaseId,
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).code).toBe('release_not_selectable');
+    expect(procStore.has(keyOf(`EXEC#${JSON.parse(res.body).intentId ?? 'none'}`, 'META'))).toBe(
+      false,
+    );
+  });
+
+  it('rejects an unregistered release id instead of substituting the stable one', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleA, 'current-stable');
+    seedStableChannel(pinA.releaseId);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+      methodologyReleaseId: 'aidlc:not-registered',
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).code).toBe('release_not_found');
+  });
+
+  it('rejects a selection outright while the write flag is off', async () => {
+    vi.stubEnv('AIDLC_RELEASE_PINNING', 'off');
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0');
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_B,
+      methodologyReleaseId: pinB.releaseId,
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).code).toBe('release_selection_disabled');
+  });
+
+  it('falls back to the stable channel when no id is requested', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0');
+    seedStableChannel(pinB.releaseId);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_B,
+    });
+
+    expect(res.statusCode).toBe(201);
+    const meta = metaFor(JSON.parse(res.body).id);
+    expect(meta.methodologyRelease).toEqual(pinB);
+    expect(meta.aidlcRepoRef).toBe(shaB);
+  });
+
+  it('leaves the no-selection path unpinned when no stable channel is set and the release cannot run the scope', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0');
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_DEPLOYMENT,
+    });
+
+    expect(res.statusCode).toBe(201);
+    const meta = metaFor(JSON.parse(res.body).id);
+    // Derived from the resolved deployment ref when no release is selected.
+    expect(meta.aidlcRepoRef).toBe(shaA);
+    // A1: release A does not offer this deployment-only scope, so the auto-pin is
+    // abandoned rather than stamped onto an intent that could never run it.
+    expect(meta.methodologyRelease ?? null).toBeNull();
+  });
+
+  it.each([
+    ['unregistered', null],
+    ['hidden', { visible: false }],
+    ['existing-only', { supportState: 'existing-only' }],
+    ['unpromoted 2.9.0', { supportState: 'structurally-valid' }],
+    [
+      'unhonoured capability',
+      {
+        supportState: 'selectable',
+        fidelityGaps: [{ blockType: 'STAGE', field: 'mode', value: 'agent-team' }],
+      },
+    ],
+  ])(
+    'does not auto-pin the deployment-ref release without eligibility: %s',
+    async (_label, registryOverrides) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      seedDeploymentWorkflowAtV1('feature', shaB);
+      if (registryOverrides) {
+        seedRegistryRecord(bundleB, 'v2.9.0', registryOverrides);
+      }
+
+      const res = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        scope: 'feature',
+      });
+
+      expect(res.statusCode).toBe(201);
+      const meta = metaFor(JSON.parse(res.body).id);
+      expect(meta.aidlcRepoRef).toBe(shaB);
+      expect(meta.methodologyRelease ?? null).toBeNull();
+    },
+  );
+
+  it('exposes methodologyRelease on the intent detail projection', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0');
+    const intentId = JSON.parse(
+      (
+        await createIntent(sub, projectId, {
+          title: 'I',
+          prompt: 'Build X',
+          scope: SCOPE_ONLY_IN_B,
+          methodologyReleaseId: pinB.releaseId,
+        })
+      ).body,
+    ).id;
+
+    const res = await handler({
+      httpMethod: 'GET',
+      path: `/projects/${projectId}/intents/${intentId}`,
+      pathParameters: { projectId, intentId },
+      ...claims(sub),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).intent.methodologyRelease).toEqual({
+      ...pinB,
+      upstreamVersion: '2.9.0',
+    });
+  });
+
+  // ── Review round 1, findings A1/A2/A10 ──
+
+  it.each([
+    ['a number', 7],
+    ['an object', { releaseId: 'aidlc:x' }],
+    ['an array', ['aidlc:x']],
+    ['a boolean', true],
+  ])(
+    '400s a non-string methodologyReleaseId (%s) instead of ignoring it',
+    async (_label, value) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      seedDeploymentWorkflowAtV1();
+      seedRegistryRecord(bundleB, 'v2.9.0');
+      seedStableChannel(pinB.releaseId);
+
+      const res = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        methodologyReleaseId: value,
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).code).toBe('release_selection_invalid');
+    },
+  );
+
+  it('treats an explicit null methodologyReleaseId as no selection', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0');
+    seedStableChannel(pinB.releaseId);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      methodologyReleaseId: null,
+    });
+
+    // Falls through to the stable channel, which is the documented no-id path.
+    expect(res.statusCode).toBe(201);
+    expect(metaFor(JSON.parse(res.body).id).methodologyRelease).toEqual(pinB);
+  });
+
+  it('auto-pins when the release CAN reproduce the plan, and persists no SYSTEM pins', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    // The deployment workflow offers `feature`, which release A also offers, so
+    // the release-mode re-validation reproduces the plan and the pin is stamped.
+    seedDeploymentWorkflowAtV1('feature');
+    seedRegistryRecord(bundleA, 'current-stable');
+    seedDefaultAgentOverride(bundleA);
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+    });
+
+    expect(res.statusCode).toBe(201);
+    const meta = metaFor(JSON.parse(res.body).id);
+    expect(meta.methodologyRelease).toEqual(pinA);
+    expect(meta.methodologyPins.AGENT['aidlc-architect-agent']).toEqual({
+      tenantId: 'default',
+      version: 7,
+    });
+    // A2: every closure block is (SYSTEM, V#1) — exactly the coordinates a reseed
+    // rewrites — so none of them may be persisted as a pin.
+    for (const pins of Object.values(meta.methodologyPins ?? {})) {
+      for (const pin of Object.values(pins ?? {})) {
+        expect(pin.tenantId).not.toBe('SYSTEM');
+      }
+    }
+  });
+
+  it('persists no SYSTEM pins for an explicitly selected release either', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0');
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_B,
+      methodologyReleaseId: pinB.releaseId,
+    });
+
+    expect(res.statusCode).toBe(201);
+    const meta = metaFor(JSON.parse(res.body).id);
+    const pinnedTenants = Object.values(meta.methodologyPins ?? {}).flatMap((pins) =>
+      Object.values(pins ?? {}).map((pin) => pin.tenantId),
+    );
+    expect(pinnedTenants).not.toContain('SYSTEM');
+  });
+
+  it('stays unpinned rather than auto-pinning when the closure is unreadable', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    // The manifest is published but its catalog is gone: the pin would resolve to
+    // a release whose plan can never be built.
+    releaseStore.delete(pinA.catalogKey);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(metaFor(JSON.parse(res.body).id).methodologyRelease ?? null).toBeNull();
+  });
+
+  it("matches the intent's own SCOPE keywords in the deterministic compose pre-pass", async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    seedRegistryRecord(bundleA, 'current-stable');
+    const pk = 'BLOCK#default#SCOPE#feature';
+    const scope = {
+      ...bundleA.catalog.blocks.SCOPE.find((block) => block.id === 'feature'),
+      pk,
+      sk: 'V#7',
+      id: 'feature',
+      blockId: 'feature',
+      tenantId: 'default',
+      version: 7,
+      keywords: ['isolated-fork-keyword'],
+    };
+    procStore.set(keyOf(pk, 'V#7'), scope);
+    procStore.set(keyOf(pk, 'V#latest'), {
+      ...scope,
+      sk: 'V#latest',
+      GSI1PK: 'TENANT#default#SCOPE',
+      GSI1SK: 'feature',
+    });
+    const created = await createIntent(sub, projectId, {
+      title: 'isolated-fork-keyword',
+      prompt: 'An isolated keyword',
+      scope: 'feature',
+      methodologyReleaseId: pinA.releaseId,
+    });
+    expect(created.statusCode).toBe(201);
+    const intentId = JSON.parse(created.body).id;
+    // A later edit to the live row must not reach this already-created intent.
+    procStore.set(keyOf(pk, 'V#latest'), { ...scope, keywords: ['later-keyword'] });
+
+    const res = await handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intentId}/compose`,
+      pathParameters: { projectId, intentId },
+      body: JSON.stringify({ mode: 'front', agentCli: 'kiro' }),
+      ...claims(sub),
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(JSON.parse(res.body)).toMatchObject({
+      source: 'match',
+      proposal: { scope: 'feature' },
+    });
+    expect(agentcoreMock.commandCalls(InvokeAgentRuntimeCommand)).toHaveLength(0);
+  });
+
+  it.each(['manifest access denied', 'corrupt manifest', 'registry throttled'])(
+    'refuses the create when the auto-pin lookup cannot complete: %s',
+    async (failure) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      seedDeploymentWorkflowAtV1('feature');
+      seedRegistryRecord(bundleA, 'current-stable');
+      const before = structuredClone([...procStore]);
+      if (failure === 'manifest access denied') {
+        s3Mock
+          .on(GetObjectCommand, { Bucket: 'artifacts-test', Key: pinA.manifestKey })
+          .rejects(Object.assign(new Error('denied'), { name: 'AccessDenied' }));
+      } else if (failure === 'corrupt manifest') {
+        releaseStore.set(pinA.manifestKey, '{');
+      } else {
+        ddbMock
+          .on(GetCommand, {
+            TableName: 'blocks-test',
+            Key: { pk: `AIDLC_RELEASE#${pinA.releaseId}`, sk: 'META' },
+          })
+          .rejects(Object.assign(new Error('throttled'), { name: 'ThrottlingException' }));
+      }
+
+      const res = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        scope: 'feature',
+      });
+
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body).code).toBe('release_resolution_failed');
+      expect([...procStore]).toEqual(before);
+      expect(orchestratorInvokes()).toHaveLength(0);
+    },
+  );
+
+  // Without s3:ListBucket, S3 answers a GET for an absent key with 403
+  // AccessDenied, so an unimported deployment ref looks exactly like a denied
+  // read. Only the registry can tell the two apart.
+  it.each([
+    ['no registry row stays unpinned without reading the manifest', false],
+    ['a registry row refuses the create', true],
+  ])('a masked 403 on the deployment-ref manifest with %s', async (_label, registered) => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    if (registered) seedRegistryRecord(bundleA, 'current-stable');
+    s3Mock.on(GetObjectCommand, { Bucket: 'artifacts-test', Key: pinA.manifestKey }).rejects(
+      Object.assign(new Error('Access Denied'), {
+        name: 'AccessDenied',
+        $metadata: { httpStatusCode: 403 },
+      }),
+    );
+    const before = structuredClone([...procStore]);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+    });
+
+    const manifestReads = s3Mock
+      .commandCalls(GetObjectCommand)
+      .filter((call) => call.args[0].input.Key === pinA.manifestKey);
+    if (registered) {
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body).code).toBe('release_resolution_failed');
+      expect([...procStore]).toEqual(before);
+    } else {
+      expect(res.statusCode).toBe(201);
+      expect(metaFor(JSON.parse(res.body).id).methodologyRelease ?? null).toBeNull();
+      expect(manifestReads).toHaveLength(0);
+    }
+  });
+
+  it('stays unpinned when the published closure no longer matches its registry row', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    // A re-import is mid-flight: the registry row still describes the closure
+    // the previous importer revision produced.
+    seedRegistryRecord(bundleA, 'current-stable', { closureDigest: `sha256:${'0'.repeat(64)}` });
+    const logs = [];
+    const capture = (chunk) => {
+      logs.push(String(chunk));
+      return true;
+    };
+    const spies = [
+      vi.spyOn(process.stdout, 'write').mockImplementation(capture),
+      vi.spyOn(process.stderr, 'write').mockImplementation(capture),
+    ];
+
+    let res;
+    try {
+      res = await createIntent(sub, projectId, { title: 'I', prompt: 'Build X', scope: 'feature' });
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+
+    expect(res.statusCode).toBe(201);
+    expect(metaFor(JSON.parse(res.body).id).methodologyRelease ?? null).toBeNull();
+    const warned = logs
+      .flatMap((line) => line.split('\n'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((entry) => entry?.level === 'WARN' && entry.code === 'release_registry_skew');
+    expect(warned).toMatchObject({ releaseId: pinA.releaseId });
+  });
+
+  // After an importer-revision bump the runtime addresses closures at the new
+  // revision, but an eligible row still points at the previous one until the
+  // release is re-imported. Without s3:ListBucket the missing new-revision
+  // manifest reads as 403, so the row's own revision must be compared first.
+  it.each([
+    ['a row at the previous importer revision stays unpinned without reading the manifest', 1],
+    ['a row at the current importer revision pins as before', 2],
+  ])('%s', async (_label, rowRevision) => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    seedRegistryRecord(bundleA, 'current-stable', { importerRevision: rowRevision });
+    if (rowRevision !== 2) {
+      s3Mock.on(GetObjectCommand, { Bucket: 'artifacts-test', Key: pinA.manifestKey }).rejects(
+        Object.assign(new Error('Access Denied'), {
+          name: 'AccessDenied',
+          $metadata: { httpStatusCode: 403 },
+        }),
+      );
+    }
+    const logs = [];
+    const capture = (chunk) => {
+      logs.push(String(chunk));
+      return true;
+    };
+    const spies = [
+      vi.spyOn(process.stdout, 'write').mockImplementation(capture),
+      vi.spyOn(process.stderr, 'write').mockImplementation(capture),
+    ];
+
+    let res;
+    try {
+      res = await createIntent(sub, projectId, { title: 'I', prompt: 'Build X', scope: 'feature' });
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+
+    expect(res.statusCode).toBe(201);
+    const pin = metaFor(JSON.parse(res.body).id).methodologyRelease ?? null;
+    const manifestReads = s3Mock
+      .commandCalls(GetObjectCommand)
+      .filter((call) => call.args[0].input.Key === pinA.manifestKey);
+    const warned = logs
+      .flatMap((line) => line.split('\n'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((entry) => entry?.level === 'WARN' && entry.code === 'release_registry_skew');
+    if (rowRevision === 2) {
+      expect(pin).toMatchObject({ releaseId: pinA.releaseId, importerRevision: 2 });
+      expect(manifestReads.length).toBeGreaterThan(0);
+      expect(warned).toBeUndefined();
+    } else {
+      expect(pin).toBeNull();
+      expect(manifestReads).toHaveLength(0);
+      expect(warned).toMatchObject({
+        releaseId: pinA.releaseId,
+        fields: ['importerRevision'],
+        registeredImporterRevision: 1,
+        currentImporterRevision: 2,
+      });
+    }
+  });
+
+  it('refuses the create when an eligible release closure is unreadable', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    seedRegistryRecord(bundleA, 'current-stable');
+    const before = structuredClone([...procStore]);
+    releaseStore.delete(pinA.catalogKey);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+    });
+
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body).code).toBe('release_resolution_failed');
+    expect([...procStore]).toEqual(before);
+    expect(orchestratorInvokes()).toHaveLength(0);
+  });
+
+  it.each([false, true])(
+    'an overlay the stable release cannot apply: explicit selection=%s stays strict',
+    async (explicit) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      seedDeploymentWorkflowAtV1('feature');
+      seedRegistryRecord(bundleA, 'current-stable');
+      seedStableChannel(pinA.releaseId);
+      seedDefaultAgentOverride(bundleA);
+      // The live user row still resolves on the legacy path, but the immutable
+      // snapshot the release overlay needs is gone.
+      procStore.delete(keyOf('BLOCK#default#AGENT#aidlc-architect-agent', 'V#7'));
+      const before = structuredClone([...procStore]);
+
+      const res = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        scope: 'feature',
+        ...(explicit ? { methodologyReleaseId: pinA.releaseId } : {}),
+      });
+
+      if (explicit) {
+        expect(res.statusCode).toBe(400);
+        expect(JSON.parse(res.body).errors).toEqual(
+          expect.arrayContaining([expect.objectContaining({ code: 'user_block_missing' })]),
+        );
+        expect([...procStore]).toEqual(before);
+      } else {
+        expect(res.statusCode).toBe(201);
+        expect(metaFor(JSON.parse(res.body).id).methodologyRelease ?? null).toBeNull();
+      }
+    },
+  );
+
+  it('reports a stable-channel overlay fallback that auto-pins the deployment-ref release', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    seedRegistryRecord(bundleA, 'current-stable');
+    seedRegistryRecord(bundleB, 'v2.9.0');
+    seedStableChannel(pinB.releaseId);
+    seedDefaultAgentOverride(bundleA);
+    planSpy.loadExecutionPlan.mockImplementation(async (args) =>
+      args.methodologyRelease?.releaseId === pinB.releaseId && args.methodologyPins
+        ? { valid: false, errors: [{ code: 'user_block_missing' }] }
+        : planSpy.actual(args),
+    );
+    const lines = [];
+    const capture = (chunk) => {
+      lines.push(...String(chunk).split('\n'));
+      return true;
+    };
+    const spies = [
+      vi.spyOn(process.stdout, 'write').mockImplementation(capture),
+      vi.spyOn(process.stderr, 'write').mockImplementation(capture),
+    ];
+
+    let res;
+    try {
+      res = await createIntent(sub, projectId, { title: 'I', prompt: 'Build X', scope: 'feature' });
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+
+    expect(res.statusCode).toBe(201);
+    expect(metaFor(JSON.parse(res.body).id).methodologyRelease).toEqual(pinA);
+    const logged = lines
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    expect(logged.map((entry) => entry.message).join('\n')).not.toMatch(/stays unpinned/);
+    expect(logged).toContainEqual(
+      expect.objectContaining({
+        level: 'INFO',
+        releaseId: pinA.releaseId,
+        skippedReleaseId: pinB.releaseId,
+      }),
+    );
+  });
+
+  it('refuses the create when the deployment-ref release capabilities cannot be verified', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    // No recorded gaps, so the capability check has to read the closure.
+    seedRegistryRecord(bundleA, 'current-stable', { fidelityGaps: undefined });
+    s3Mock
+      .on(GetObjectCommand, { Bucket: 'artifacts-test', Key: pinA.manifestKey })
+      .rejects(Object.assign(new Error('denied'), { name: 'AccessDenied' }));
+    const before = structuredClone([...procStore]);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+    });
+
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body).code).toBe('release_resolution_failed');
+    expect([...procStore]).toEqual(before);
+  });
+
+  it('refuses the create when the deployment-ref release plan fails with a release error', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    seedRegistryRecord(bundleA, 'current-stable');
+    planSpy.loadExecutionPlan.mockImplementation(async (args) =>
+      args.methodologyRelease
+        ? { valid: false, errors: [{ code: 'release_closure_mismatch' }] }
+        : planSpy.actual(args),
+    );
+    const before = structuredClone([...procStore]);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+    });
+
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body).code).toBe('release_resolution_failed');
+    expect([...procStore]).toEqual(before);
+  });
+
+  it('keeps the overlay error when the stable release is invalid without the overlay too', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    seedRegistryRecord(bundleA, 'current-stable');
+    seedStableChannel(pinA.releaseId);
+    seedDefaultAgentOverride(bundleA);
+    planSpy.loadExecutionPlan.mockImplementation(async (args) => {
+      if (!args.methodologyRelease) return planSpy.actual(args);
+      return args.methodologyPins
+        ? { valid: false, errors: [{ code: 'user_block_missing' }] }
+        : { valid: false, errors: [{ code: 'stage_not_found' }] };
+    });
+    const before = structuredClone([...procStore]);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).errors).toEqual([{ code: 'user_block_missing' }]);
+    expect([...procStore]).toEqual(before);
+  });
+
+  it('hands the compose pre-pass to the composer agent when the pinned closure is unreadable', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+    seedRegistryRecord(bundleA, 'current-stable');
+    const created = await createIntent(sub, projectId, {
+      title: 'feature',
+      prompt: 'Add a new feature',
+      scope: 'feature',
+      methodologyReleaseId: pinA.releaseId,
+    });
+    expect(created.statusCode).toBe(201);
+    const intentId = JSON.parse(created.body).id;
+    releaseStore.delete(pinA.catalogKey);
+    releaseResolverTest.releaseClosureCache.clear();
+    process.env.AGENTCORE_RUNTIME_ARN = 'arn:aws:bedrock-agentcore:eu:1:runtime/x';
+    agentcoreMock.on(InvokeAgentRuntimeCommand).resolves({
+      response: { transformToString: async () => JSON.stringify({ ok: true, accepted: true }) },
+    });
+
+    let res;
+    try {
+      res = await handler({
+        httpMethod: 'POST',
+        path: `/projects/${projectId}/intents/${intentId}/compose`,
+        pathParameters: { projectId, intentId },
+        body: JSON.stringify({ mode: 'front', agentCli: 'kiro' }),
+        ...claims(sub),
+      });
+    } finally {
+      delete process.env.AGENTCORE_RUNTIME_ARN;
+    }
+
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).source).toBe('llm');
+    const composeRows = [...procStore.values()].filter(
+      (row) => row.pk === `EXEC#${intentId}` && String(row.sk).startsWith('COMPOSE#'),
+    );
+    expect(composeRows.map((row) => row.source)).not.toContain('match');
+    expect(agentcoreMock.commandCalls(InvokeAgentRuntimeCommand).length).toBeGreaterThan(0);
+  });
+
+  it('never auto-pins while the flag is off', async () => {
+    vi.stubEnv('AIDLC_RELEASE_PINNING', 'off');
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1('feature');
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(metaFor(JSON.parse(res.body).id).methodologyRelease ?? null).toBeNull();
+  });
+
+  it('degrades to unpinned when the stable channel names a demoted release', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0', { supportState: 'existing-only' });
+    seedStableChannel(pinB.releaseId);
+
+    // A3: a stranded stable pointer must not block intent creation platform-wide.
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_DEPLOYMENT,
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(metaFor(JSON.parse(res.body).id).methodologyRelease ?? null).toBeNull();
+  });
+
+  // Closure upgrade (issue #482): the registry record moves from the i1 closure
+  // an older importer produced to the corrected i2 closure of the same SHA.
+  it('pins new intents to the upgraded closure while an existing intent keeps its i1 pin', async () => {
+    const legacyB = legacyReleaseBundle(bundleB);
+    const legacyPinB = methodologyReleasePinFromManifest(legacyB.manifest);
+    releaseStore.set(legacyPinB.manifestKey, JSON.stringify(legacyB.manifest, null, 2));
+    releaseStore.set(legacyPinB.catalogKey, JSON.stringify(legacyB.catalog, null, 2));
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+
+    // Before the upgrade: the record points at the i1 closure. Selecting it is
+    // allowed (the record is stale, not broken).
+    seedRegistryRecord(bundleB, 'v2.9.0', {
+      importerRevision: legacyPinB.importerRevision,
+      closureDigest: legacyPinB.closureDigest,
+      catalogKey: legacyPinB.catalogKey,
+      manifestKey: legacyPinB.manifestKey,
+    });
+    const before = await createIntent(sub, projectId, {
+      title: 'Before',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_B,
+      methodologyReleaseId: pinB.releaseId,
+    });
+    expect(before.statusCode).toBe(201);
+    const existingId = JSON.parse(before.body).id;
+    expect(metaFor(existingId).methodologyRelease).toEqual(legacyPinB);
+
+    // After the upgrade: the record points at i2 and audits the i1 pointer.
+    seedRegistryRecord(bundleB, 'v2.9.0', {
+      revision: 2,
+      importerHistory: [
+        {
+          from: {
+            importerRevision: legacyPinB.importerRevision,
+            closureDigest: legacyPinB.closureDigest,
+            manifestKey: legacyPinB.manifestKey,
+            catalogKey: legacyPinB.catalogKey,
+          },
+          to: {
+            importerRevision: pinB.importerRevision,
+            closureDigest: pinB.closureDigest,
+            manifestKey: pinB.manifestKey,
+            catalogKey: pinB.catalogKey,
+          },
+          upgradedAt: '2026-09-24T00:00:00.000Z',
+          upgradedBy: 'admin-1',
+        },
+      ],
+    });
+    const after = await createIntent(sub, projectId, {
+      title: 'After',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_B,
+      methodologyReleaseId: pinB.releaseId,
+    });
+
+    expect(after.statusCode).toBe(201);
+    expect(metaFor(JSON.parse(after.body).id).methodologyRelease).toEqual(pinB);
+    expect(pinB.importerRevision).toBe(2);
+    // The existing intent's persisted pin is untouched by the registry move.
+    expect(metaFor(existingId).methodologyRelease).toEqual(legacyPinB);
+    expect(legacyPinB.importerRevision).toBe(1);
+  });
+});
+
+// Anti-stuck recovery. The gate answer is already
+// durable when `resumeDurableCallback` fails, so the only thing missing is the
+// record that the run STILL NEEDS RESUMING — without it the intent sits WAITING
+// with no pending gate and nothing able to wake it. Each case below must end in
+// a running run or a recoverable FAILED, never an indefinite wait.
+describe('gate resume recovery — POST /projects/{p}/intents/{i}/resume', () => {
+  const resume = (sub, projectId, intentId) =>
+    handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intentId}/resume`,
+      pathParameters: { projectId, intentId },
+      body: null,
+      ...claims(sub),
+    });
+
+  const parkedOnGate = async (sub, projectId) => {
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const metaKey = keyOf(`EXEC#${intent.id}`, 'META');
+    procStore.set(metaKey, {
+      ...procStore.get(metaKey),
+      status: 'WAITING',
+      pendingHumanTaskId: 'h1',
+      orchestratorRunId: 'run-old',
+    });
+    seedGate(intent.id, 'h1', { status: 'pending', callbackId: 'cb-h1' });
+    return { intent, metaKey };
+  };
+
+  it('records resumeRequired on a non-timeout resume failure and recovers on resume', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await parkedOnGate(sub, projectId);
+    lambdaMock
+      .on(SendDurableExecutionCallbackSuccessCommand)
+      .rejectsOnce(Object.assign(new Error('throttled'), { name: 'TooManyRequestsException' }));
+
+    const answered = await answerGate(sub, projectId, intent.id, 'h1');
+    expect(answered.statusCode).toBe(503);
+    // The answer is durable and so is the need to resume.
+    expect(procStore.get(metaKey)).toMatchObject({
+      status: 'WAITING',
+      resumeRequired: { humanTaskId: 'h1', callbackId: 'cb-h1' },
+    });
+    expect(procStore.get(keyOf(`EXEC#${intent.id}`, 'HUMAN#h1')).status).toBe('answered');
+
+    const res = await resume(sub, projectId, intent.id);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ resumed: true });
+    expect(procStore.get(metaKey)).not.toHaveProperty('resumeRequired');
+    // The recorded answer is re-sent verbatim — the human is not asked again.
+    const sent = lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand).at(-1);
+    expect(sent.args[0].input.CallbackId).toBe('cb-h1');
+    expect(JSON.parse(Buffer.from(sent.args[0].input.Result).toString())).toEqual({
+      answer: { ok: 1 },
+    });
+    expect(
+      [...procStore.values()].some(
+        (row) => row.type === 'Event' && row.eventType === 'v2.gate.resumed',
+      ),
+    ).toBe(true);
+  });
+
+  it('recovers from an answered gate when the resume marker write fails', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await parkedOnGate(sub, projectId);
+    failResumeMarkerWrites = 1;
+    lambdaMock
+      .on(SendDurableExecutionCallbackSuccessCommand)
+      .rejectsOnce(Object.assign(new Error('throttled'), { name: 'TooManyRequestsException' }));
+
+    const answered = await answerGate(sub, projectId, intent.id, 'h1');
+    expect(answered.statusCode).toBe(503);
+    expect(procStore.get(keyOf(`EXEC#${intent.id}`, 'HUMAN#h1'))).toMatchObject({
+      status: 'answered',
+      callbackId: 'cb-h1',
+    });
+    expect(procStore.get(metaKey).resumeRequired ?? null).toBeNull();
+
+    const resumed = await resume(sub, projectId, intent.id);
+    expect(resumed.statusCode).toBe(200);
+    expect(JSON.parse(resumed.body)).toMatchObject({ resumed: true });
+    expect(lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand)).toHaveLength(2);
+  });
+
+  it.each(['approved', 'rejected'])(
+    'recovers markerless validation gates with %s status',
+    async (status) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      const { intent } = await parkedOnGate(sub, projectId);
+      const gateKey = keyOf(`EXEC#${intent.id}`, 'HUMAN#h1');
+      procStore.set(gateKey, {
+        ...procStore.get(gateKey),
+        status,
+        answer: { decision: status === 'approved' ? 'approve' : 'request-changes' },
+      });
+
+      const resumed = await resume(sub, projectId, intent.id);
+
+      expect(resumed.statusCode).toBe(200);
+      expect(JSON.parse(resumed.body)).toMatchObject({ resumed: true });
+      expect(lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand)).toHaveLength(1);
+    },
+  );
+
+  it.each(['approved', 'rejected'])(
+    'marks an unconsumed %s gate as resumeAvailable',
+    async (status) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      const { intent } = await parkedOnGate(sub, projectId);
+
+      const answered = await answerGate(sub, projectId, intent.id, 'h1', {
+        status,
+        answer: { decision: status === 'approved' ? 'approve' : 'request-changes' },
+      });
+
+      expect(answered.statusCode).toBe(200);
+      expect(JSON.parse(answered.body)).toMatchObject({ status, resumeAvailable: true });
+    },
+  );
+
+  it('surfaces resumeRequired on the intent DTO so the UI can offer the action', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await parkedOnGate(sub, projectId);
+    lambdaMock
+      .on(SendDurableExecutionCallbackSuccessCommand)
+      .rejectsOnce(Object.assign(new Error('throttled'), { name: 'TooManyRequestsException' }));
+    await answerGate(sub, projectId, intent.id, 'h1');
+
+    const detail = await handler({
+      httpMethod: 'GET',
+      path: `/projects/${projectId}/intents/${intent.id}`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+    expect(JSON.parse(detail.body).intent.resumeRequired).toMatchObject({
+      humanTaskId: 'h1',
+      callbackId: 'cb-h1',
+    });
+    expect(procStore.get(metaKey).resumeRequired).not.toBeNull();
+  });
+
+  it('is idempotent: nothing to resume is a 200, and a second resume is harmless', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent } = await parkedOnGate(sub, projectId);
+
+    const first = await resume(sub, projectId, intent.id);
+    expect(first.statusCode).toBe(200);
+    expect(JSON.parse(first.body)).toMatchObject({ resumed: false });
+    expect(lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand)).toHaveLength(0);
+
+    lambdaMock
+      .on(SendDurableExecutionCallbackSuccessCommand)
+      .rejectsOnce(Object.assign(new Error('throttled'), { name: 'TooManyRequestsException' }));
+    await answerGate(sub, projectId, intent.id, 'h1');
+    expect((await resume(sub, projectId, intent.id)).statusCode).toBe(200);
+    const second = await resume(sub, projectId, intent.id);
+    expect(second.statusCode).toBe(200);
+    expect(JSON.parse(second.body)).toMatchObject({ resumed: false });
+  });
+
+  it('fails the intent (rewind-recoverable) when the callback has expired', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await parkedOnGate(sub, projectId);
+    // Attempt 1 fails transiently (setting the marker); by the time the human
+    // clicks Resume the durable execution has aged out entirely.
+    let attempt = 0;
+    lambdaMock.on(SendDurableExecutionCallbackSuccessCommand).callsFake(() => {
+      attempt += 1;
+      throw attempt === 1
+        ? Object.assign(new Error('throttled'), { name: 'TooManyRequestsException' })
+        : Object.assign(new Error('callback timed out'), { name: 'CallbackTimeoutException' });
+    });
+    await answerGate(sub, projectId, intent.id, 'h1');
+
+    const res = await resume(sub, projectId, intent.id);
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body)).toMatchObject({ code: 'durable_execution_expired' });
+    // FAILED is the documented, rewindable state — never an indefinite WAITING.
+    expect(procStore.get(metaKey)).toMatchObject({
+      status: 'FAILED',
+      failureReason: 'durable_callback_expired',
+      pendingHumanTaskId: null,
+    });
+    // The marker is cleared: a button that can no longer work is not offered.
+    expect(procStore.get(metaKey)).not.toHaveProperty('resumeRequired');
+  });
+
+  it('returns 503 and keeps the marker when the retry itself fails transiently', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await parkedOnGate(sub, projectId);
+    lambdaMock.on(SendDurableExecutionCallbackSuccessCommand).callsFake(() => {
+      throw Object.assign(new Error('throttled'), { name: 'TooManyRequestsException' });
+    });
+    await answerGate(sub, projectId, intent.id, 'h1');
+
+    const res = await resume(sub, projectId, intent.id);
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body)).toMatchObject({
+      code: 'durable_callback_resume_failed',
+      retryable: true,
+    });
+    expect(procStore.get(metaKey).resumeRequired).toMatchObject({ callbackId: 'cb-h1' });
+  });
+
+  it('404s an intent from another project', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const other = await seedV2Project(sub);
+    const { intent } = await parkedOnGate(sub, projectId);
+    expect((await resume(sub, other, intent.id)).statusCode).toBe(404);
+  });
+
+  const stuckMarker = async (sub, projectId) => {
+    const { intent, metaKey } = await parkedOnGate(sub, projectId);
+    lambdaMock
+      .on(SendDurableExecutionCallbackSuccessCommand)
+      .rejectsOnce(Object.assign(new Error('throttled'), { name: 'TooManyRequestsException' }));
+    const answered = await answerGate(sub, projectId, intent.id, 'h1');
+    expect(answered.statusCode).toBe(503);
+    expect(procStore.get(metaKey).resumeRequired).toMatchObject({ callbackId: 'cb-h1' });
+    return { intent, metaKey };
+  };
+
+  it('clears the marker when the intent is cancelled instead of resumed', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await stuckMarker(sub, projectId);
+
+    const cancelled = await handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intent.id}/cancel`,
+      pathParameters: { projectId, intentId: intent.id },
+      body: null,
+      ...claims(sub),
+    });
+
+    expect(cancelled.statusCode).toBe(200);
+    expect(procStore.get(metaKey)).not.toHaveProperty('resumeRequired');
+  });
+
+  it('treats a callback that already completed as resumed and clears the marker', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await stuckMarker(sub, projectId);
+    lambdaMock.on(SendDurableExecutionCallbackSuccessCommand).rejects(
+      Object.assign(new Error('callback already completed'), {
+        name: 'InvalidParameterValueException',
+      }),
+    );
+
+    const res = await resume(sub, projectId, intent.id);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ resumed: false });
+    expect(procStore.get(metaKey)).not.toHaveProperty('resumeRequired');
+    expect(procStore.get(keyOf(`EXEC#${intent.id}`, 'HUMAN#h1')).callbackConsumedAt).toBeTruthy();
+  });
+
+  it('does not re-send a stale marker once the intent is no longer waiting', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await stuckMarker(sub, projectId);
+    procStore.set(metaKey, { ...procStore.get(metaKey), status: 'FAILED' });
+    const sendsBefore = lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand).length;
+
+    const res = await resume(sub, projectId, intent.id);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ resumed: false });
+    expect(lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand)).toHaveLength(
+      sendsBefore,
+    );
+    expect(procStore.get(metaKey)).not.toHaveProperty('resumeRequired');
+  });
+
+  it('does not re-send a marker whose gate callback was already consumed', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await stuckMarker(sub, projectId);
+    const gateKey = keyOf(`EXEC#${intent.id}`, 'HUMAN#h1');
+    procStore.set(gateKey, { ...procStore.get(gateKey), callbackConsumedAt: 'T' });
+    const sendsBefore = lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand).length;
+
+    const res = await resume(sub, projectId, intent.id);
+
+    expect(JSON.parse(res.body)).toMatchObject({ resumed: false });
+    expect(lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand)).toHaveLength(
+      sendsBefore,
+    );
+    expect(procStore.get(metaKey)).not.toHaveProperty('resumeRequired');
+  });
+
+  // A unit-lane question parks only its STAGE row: META stays RUNNING because
+  // sibling lanes keep going, and the single META pointer is not the lane's.
+  const laneParkedOnGate = async (sub, projectId) => {
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const metaKey = keyOf(`EXEC#${intent.id}`, 'META');
+    procStore.set(metaKey, {
+      ...procStore.get(metaKey),
+      status: 'RUNNING',
+      pendingHumanTaskId: null,
+      orchestratorRunId: 'run-old',
+    });
+    seedGate(intent.id, 'h-lane', {
+      status: 'pending',
+      callbackId: 'cb-lane',
+      stageInstanceId: 'si-lane',
+    });
+    const stageKey = keyOf(`EXEC#${intent.id}`, 'STAGE#si-lane');
+    procStore.set(stageKey, {
+      pk: `EXEC#${intent.id}`,
+      sk: 'STAGE#si-lane',
+      type: 'Stage',
+      executionId: intent.id,
+      stageInstanceId: 'si-lane',
+      stageId: 'code-generation',
+      unitSlug: 'billing',
+      sectionIndex: 1,
+      state: 'WAITING_FOR_HUMAN',
+      pendingHumanTaskId: 'h-lane',
+    });
+    lambdaMock
+      .on(SendDurableExecutionCallbackSuccessCommand)
+      .rejectsOnce(Object.assign(new Error('throttled'), { name: 'TooManyRequestsException' }));
+    const answered = await answerGate(sub, projectId, intent.id, 'h-lane');
+    expect(answered.statusCode).toBe(503);
+    expect(procStore.get(metaKey).resumeRequired).toMatchObject({ callbackId: 'cb-lane' });
+    return { intent, metaKey, stageKey };
+  };
+
+  // A second unit lane of the same intent, parked on its own answered question
+  // whose first callback send failed too.
+  const addParkedLane = async (sub, projectId, intent, n) => {
+    seedGate(intent.id, `h-lane-${n}`, {
+      status: 'pending',
+      callbackId: `cb-lane-${n}`,
+      stageInstanceId: `si-lane-${n}`,
+    });
+    procStore.set(keyOf(`EXEC#${intent.id}`, `STAGE#si-lane-${n}`), {
+      pk: `EXEC#${intent.id}`,
+      sk: `STAGE#si-lane-${n}`,
+      type: 'Stage',
+      executionId: intent.id,
+      stageInstanceId: `si-lane-${n}`,
+      stageId: 'code-generation',
+      unitSlug: `unit-${n}`,
+      sectionIndex: 1,
+      state: 'WAITING_FOR_HUMAN',
+      pendingHumanTaskId: `h-lane-${n}`,
+    });
+    lambdaMock
+      .on(SendDurableExecutionCallbackSuccessCommand)
+      .rejects(Object.assign(new Error('throttled'), { name: 'TooManyRequestsException' }));
+    const answered = await answerGate(sub, projectId, intent.id, `h-lane-${n}`);
+    expect(answered.statusCode).toBe(503);
+    lambdaMock.on(SendDurableExecutionCallbackSuccessCommand).resolves({});
+  };
+  const sentCallbackIds = () =>
+    lambdaMock
+      .commandCalls(SendDurableExecutionCallbackSuccessCommand)
+      .map((call) => call.args[0].input.CallbackId);
+
+  it('re-sends every owed lane answer in one call, whichever the marker names', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await laneParkedOnGate(sub, projectId);
+    await addParkedLane(sub, projectId, intent, 2);
+    expect(procStore.get(metaKey).resumeRequired).toMatchObject({ humanTaskId: 'h-lane-2' });
+    const sentBefore = sentCallbackIds().length;
+
+    const res = await resume(sub, projectId, intent.id);
+
+    expect(JSON.parse(res.body)).toMatchObject({ resumed: true });
+    expect(sentCallbackIds().slice(sentBefore).toSorted()).toEqual(['cb-lane', 'cb-lane-2']);
+    expect(
+      procStore.get(keyOf(`EXEC#${intent.id}`, 'HUMAN#h-lane')).callbackConsumedAt,
+    ).toBeTruthy();
+    expect(
+      procStore.get(keyOf(`EXEC#${intent.id}`, 'HUMAN#h-lane-2')).callbackConsumedAt,
+    ).toBeTruthy();
+    expect(procStore.get(metaKey)).not.toHaveProperty('resumeRequired');
+  });
+
+  it('re-sends an owed lane answer even when its marker could not be written', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await laneParkedOnGate(sub, projectId);
+    failResumeMarkerWrites = 1;
+    await addParkedLane(sub, projectId, intent, 3);
+    const marker = procStore.get(metaKey).resumeRequired;
+    expect(marker?.humanTaskId).not.toBe('h-lane-3');
+    const sentBefore = sentCallbackIds().length;
+
+    const res = await resume(sub, projectId, intent.id);
+
+    expect(JSON.parse(res.body)).toMatchObject({ resumed: true });
+    expect(sentCallbackIds().slice(sentBefore)).toContain('cb-lane-3');
+  });
+
+  it('resumes the owed gate when the marker names one that is no longer owed', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await laneParkedOnGate(sub, projectId);
+    procStore.set(metaKey, {
+      ...procStore.get(metaKey),
+      resumeRequired: { humanTaskId: 'h-gone', callbackId: 'cb-gone', answeredAt: null },
+    });
+    const sentBefore = sentCallbackIds().length;
+
+    const res = await resume(sub, projectId, intent.id);
+
+    expect(JSON.parse(res.body)).toMatchObject({ resumed: true });
+    expect(sentCallbackIds().slice(sentBefore)).toEqual(['cb-lane']);
+    expect(procStore.get(metaKey)).not.toHaveProperty('resumeRequired');
+  });
+
+  it('resumes an answered lane question while the intent keeps running', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey } = await laneParkedOnGate(sub, projectId);
+
+    const res = await resume(sub, projectId, intent.id);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ resumed: true });
+    const sent = lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand).at(-1);
+    expect(sent.args[0].input.CallbackId).toBe('cb-lane');
+    expect(procStore.get(metaKey)).not.toHaveProperty('resumeRequired');
+  });
+
+  it('offers the resume on the parked lane gate in the intent detail', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent } = await laneParkedOnGate(sub, projectId);
+
+    const res = await handler({
+      httpMethod: 'GET',
+      path: `/projects/${projectId}/intents/${intent.id}`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+
+    const gate = JSON.parse(res.body).gates.find((row) => row.humanTaskId === 'h-lane');
+    expect(gate.resumeAvailable).toBe(true);
+  });
+
+  it('clears the marker once the stage resumed on that gate', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, metaKey, stageKey } = await laneParkedOnGate(sub, projectId);
+    procStore.set(stageKey, {
+      ...procStore.get(stageKey),
+      state: 'RUNNING',
+      pendingHumanTaskId: null,
+    });
+    const sendsBefore = lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand).length;
+
+    const res = await resume(sub, projectId, intent.id);
+
+    expect(JSON.parse(res.body)).toMatchObject({ resumed: false });
+    expect(lambdaMock.commandCalls(SendDurableExecutionCallbackSuccessCommand)).toHaveLength(
+      sendsBefore,
+    );
+    expect(procStore.get(metaKey)).not.toHaveProperty('resumeRequired');
+  });
+
+  it('does not offer the resume of a lane gate whose stage already resumed', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { intent, stageKey } = await laneParkedOnGate(sub, projectId);
+    procStore.set(stageKey, {
+      ...procStore.get(stageKey),
+      state: 'RUNNING',
+      pendingHumanTaskId: null,
+    });
+
+    const res = await handler({
+      httpMethod: 'GET',
+      path: `/projects/${projectId}/intents/${intent.id}`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+
+    const gate = JSON.parse(res.body).gates.find((row) => row.humanTaskId === 'h-lane');
+    expect(gate.resumeAvailable).toBe(false);
+  });
+});
+
+describe('GET intent — timeline event fields', () => {
+  it('forwards only the dissent counters from the event detail', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    procStore.set(keyOf(`EXEC#${intent.id}`, 'EVENT#T#e1'), {
+      pk: `EXEC#${intent.id}`,
+      sk: 'EVENT#T#e1',
+      type: 'Event',
+      executionId: intent.id,
+      eventId: 'e1',
+      eventType: 'v2.review.dissent',
+      actor: 'reviewer',
+      summary: 'Maintained dissent',
+      timestamp: 'T2',
+      detail: { round: 1, maxRounds: 2, findings: 'verbatim agent text' },
+    });
+
+    const res = await handler({
+      httpMethod: 'GET',
+      path: `/projects/${projectId}/intents/${intent.id}`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+
+    const event = JSON.parse(res.body).events.find((row) => row.eventId === 'e1');
+    expect(event).toBeDefined();
+    expect(event.detail).toEqual({ round: 1, maxRounds: 2 });
   });
 });

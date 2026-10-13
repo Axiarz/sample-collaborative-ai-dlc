@@ -56,10 +56,18 @@ vi.mock('../../shared/workflow-source-membership.js', async () => {
   return {
     fetchWorkflowSourceMembership: async (graph, projectId, userId) => {
       const rows = await graph
-        .V().has('Project', 'id', projectId)
+        .V()
+        .has('Project', 'id', projectId)
         .project('projectIdentity', 'memberships')
         .by(T.id)
-        .by(__.outE('HAS_MEMBER').where(__.inV().has('User', 'id', userId)).project('membershipId', 'role').by(T.id).by('role').fold())
+        .by(
+          __.outE('HAS_MEMBER')
+            .where(__.inV().has('User', 'id', userId))
+            .project('membershipId', 'role')
+            .by(T.id)
+            .by('role')
+            .fold(),
+        )
         .toList();
       const memberships = rows[0]?.get('memberships') ?? [];
       if (memberships.length !== 1) return null;
@@ -83,21 +91,24 @@ const nativeRows = new Map();
 const objects = new Map();
 let connectionQueries = [];
 
-const condFail = () => Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
+const condFail = () =>
+  Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
 const installFakes = () => {
-  ddbMock.on(PutCommand).callsFake(async ({ TableName, Item, ConditionExpression, ExpressionAttributeValues }) => {
-    if (TableName !== LOCKS_TABLE) return {};
-    const existing = locks.get(Item.lockId);
-    if (ConditionExpression && existing) {
-      const now = ExpressionAttributeValues?.[':now'];
-      const ok = ConditionExpression.includes('guardState = :pending')
-        ? existing.guardState === 'pending' && existing.expiresAt < now
-        : existing.expiresAt < now;
-      if (!ok) throw condFail();
-    }
-    locks.set(Item.lockId, { ...Item });
-    return {};
-  });
+  ddbMock
+    .on(PutCommand)
+    .callsFake(async ({ TableName, Item, ConditionExpression, ExpressionAttributeValues }) => {
+      if (TableName !== LOCKS_TABLE) return {};
+      const existing = locks.get(Item.lockId);
+      if (ConditionExpression && existing) {
+        const now = ExpressionAttributeValues?.[':now'];
+        const ok = ConditionExpression.includes('guardState = :pending')
+          ? existing.guardState === 'pending' && existing.expiresAt < now
+          : existing.expiresAt < now;
+        if (!ok) throw condFail();
+      }
+      locks.set(Item.lockId, { ...Item });
+      return {};
+    });
   ddbMock.on(GetCommand).callsFake(async ({ TableName, Key }) => {
     if (TableName === NATIVE_TABLE) {
       const item = nativeRows.get(`${Key.pk}|${Key.sk}`);
@@ -107,7 +118,8 @@ const installFakes = () => {
       const item = locks.get(Key.lockId);
       return item ? { Item: { ...item } } : {};
     }
-    if (TableName === PROCESS_TABLE) throw new Error('native threads must never read platform META');
+    if (TableName === PROCESS_TABLE)
+      throw new Error('native threads must never read platform META');
     return {};
   });
   ddbMock.on(UpdateCommand).callsFake(async ({ TableName, Key, ExpressionAttributeValues }) => {
@@ -124,7 +136,9 @@ const installFakes = () => {
   });
   ddbMock.on(QueryCommand).callsFake(async (input) => {
     if (input.TableName === CONNECTIONS_TABLE) {
-      connectionQueries.push(input.ExpressionAttributeValues[':docId'] ?? input.ExpressionAttributeValues[':uid']);
+      connectionQueries.push(
+        input.ExpressionAttributeValues[':docId'] ?? input.ExpressionAttributeValues[':uid'],
+      );
       return { Items: [{ connectionId: 'c1', tokenExp: Date.now() / 1000 + 600 }] };
     }
     return { Items: [] };
@@ -160,7 +174,11 @@ beforeAll(async () => {
   g = gremlin.process.AnonymousTraversalSource.traversal()
     .withRemote(conn)
     .withStrategies(
-      new PartitionStrategy({ partitionKey: '_partition', writePartition: PARTITION, readPartitions: [PARTITION] }),
+      new PartitionStrategy({
+        partitionKey: '_partition',
+        writePartition: PARTITION,
+        readPartitions: [PARTITION],
+      }),
     );
 });
 
@@ -221,9 +239,16 @@ const seedProject = async (projectId, members) => {
     const exists = await g.V().has('User', 'id', sub).hasNext();
     if (!exists) await g.addV('User').property('id', sub).next();
     await g
-      .V().has('Project', 'id', projectId).as('p')
-      .V().has('User', 'id', sub).as('u')
-      .addE('HAS_MEMBER').property('role', 'member').from_('p').to('u')
+      .V()
+      .has('Project', 'id', projectId)
+      .as('p')
+      .V()
+      .has('User', 'id', sub)
+      .as('u')
+      .addE('HAS_MEMBER')
+      .property('role', 'member')
+      .from_('p')
+      .to('u')
       .next();
   }
   return String((await g.V().has('Project', 'id', projectId).id().next()).value);
@@ -231,7 +256,12 @@ const seedProject = async (projectId, members) => {
 
 const s3 = new S3Client({});
 const publications = () =>
-  createNativePublications({ s3, bucket: BUCKET, accountId: ACCOUNT, now: () => NOW.toISOString() });
+  createNativePublications({
+    s3,
+    bucket: BUCKET,
+    accountId: ACCOUNT,
+    now: () => NOW.toISOString(),
+  });
 
 // One native execution with its protected RUNTIME/EXECUTION rows and two
 // sequential publications; `docs/plan.md` changes between them.
@@ -254,7 +284,13 @@ const seedNativeExecution = async ({ projectId, executionId = randomUUID(), proj
     });
   const first = await write(1, '# Plan v1\nGravity 9.8\n');
   const second = await write(2, '# Plan v2\nAdd moving pipes\n');
-  nativeRows.set(`${key.pk}|RUNTIME`, { ...key, projectId, executionId, bindingId: 'binding-1', projectIdentity });
+  nativeRows.set(`${key.pk}|RUNTIME`, {
+    ...key,
+    projectId,
+    executionId,
+    bindingId: 'binding-1',
+    projectIdentity,
+  });
   const execution = {
     ...key,
     sk: 'EXECUTION',
@@ -269,15 +305,24 @@ const seedNativeExecution = async ({ projectId, executionId = randomUUID(), proj
   };
   nativeRows.set(`${key.pk}|EXECUTION`, execution);
   nativeRows.set(`${key.pk}|PUBLICATION#${'1'.padStart(16, '0')}`, {
-    scope, bindingId: 'binding-1', attemptId, epoch: 1, publication: first,
+    scope,
+    bindingId: 'binding-1',
+    attemptId,
+    epoch: 1,
+    publication: first,
   });
-  const read = async (receipt, epoch) => publications().read({ ...scope, attemptId, epoch }, receipt);
+  const read = async (receipt, epoch) =>
+    publications().read({ ...scope, attemptId, epoch }, receipt);
   const firstPlan = (await read(first, 1)).files.find((f) => f.path === 'docs/plan.md');
   const secondPlan = (await read(second, 2)).files.find((f) => f.path === 'docs/plan.md');
   return { scope, key, execution, first, second, firstPlan, secondPlan };
 };
 
-const call = (method, suffix, { projectId, intentId, discussionId, body, sub = MEMBER, platform = false } = {}) =>
+const call = (
+  method,
+  suffix,
+  { projectId, intentId, discussionId, body, sub = MEMBER, platform = false } = {},
+) =>
   handler({
     httpMethod: method,
     resource: `/api/projects/{projectId}/${platform ? 'intents' : 'native-intents'}/{intentId}${suffix}`,
@@ -296,7 +341,12 @@ const setup = async () => {
   const createArtifactThread = (file, publication, extra = {}) =>
     call('POST', '/discussions', {
       ...at,
-      body: { entityType: 'artifact', entityId: revisionId(file), publicationId: publication.id, ...extra },
+      body: {
+        entityType: 'artifact',
+        entityId: revisionId(file),
+        publicationId: publication.id,
+        ...extra,
+      },
     });
   return { ...native, projectId, projectIdentity, at, createArtifactThread };
 };
@@ -321,7 +371,19 @@ describe('native discussion threads', () => {
     });
     // The second member reaches the same thread, not a duplicate.
     const again = await f.createArtifactThread(f.secondPlan, f.second, {});
-    expect(json(await call('POST', '/discussions', { ...f.at, sub: SECOND, body: { entityType: 'artifact', entityId: revisionId(f.secondPlan), publicationId: f.second.id } })).id).toBe(thread.id);
+    expect(
+      json(
+        await call('POST', '/discussions', {
+          ...f.at,
+          sub: SECOND,
+          body: {
+            entityType: 'artifact',
+            entityId: revisionId(f.secondPlan),
+            publicationId: f.second.id,
+          },
+        }),
+      ).id,
+    ).toBe(thread.id);
     expect(json(again).id).toBe(thread.id);
 
     const posted = await call('POST', '/discussions/{discussionId}/messages', {
@@ -334,7 +396,11 @@ describe('native discussion threads', () => {
     expect(connectionQueries).toContain(nativeIntentChannel(f.scope));
     expect(connectionQueries.some((c) => String(c).startsWith('intent:'))).toBe(false);
     const seen = json(
-      await call('GET', '/discussions/{discussionId}/messages', { ...f.at, sub: SECOND, discussionId: thread.id }),
+      await call('GET', '/discussions/{discussionId}/messages', {
+        ...f.at,
+        sub: SECOND,
+        discussionId: thread.id,
+      }),
     );
     expect(seen.messages.map((m) => m.content)).toEqual(['Should pipes speed up over time?']);
     const listed = json(await call('GET', '/discussions', { ...f.at, sub: SECOND }));
@@ -346,10 +412,16 @@ describe('native discussion threads', () => {
     // An older hash can never be attached to the newer publication.
     const forged = await call('POST', '/discussions', {
       ...f.at,
-      body: { entityType: 'artifact', entityId: revisionId(f.firstPlan), publicationId: f.second.id },
+      body: {
+        entityType: 'artifact',
+        entityId: revisionId(f.firstPlan),
+        publicationId: f.second.id,
+      },
     });
     expect(forged.statusCode).toBe(404);
-    const older = json(await f.createArtifactThread(f.firstPlan, f.first, { publicationSequence: 1 }));
+    const older = json(
+      await f.createArtifactThread(f.firstPlan, f.first, { publicationSequence: 1 }),
+    );
     const newer = json(await f.createArtifactThread(f.secondPlan, f.second));
     expect(older.id).not.toBe(newer.id);
     expect(older.revision).toMatchObject({ sha256: f.firstPlan.sha256, publicationSequence: 1 });
@@ -358,14 +430,32 @@ describe('native discussion threads', () => {
   it('rejects unverified or malformed artifact anchors without creating a thread', async () => {
     const f = await setup();
     for (const body of [
-      { entityType: 'artifact', entityId: `${f.secondPlan.id}:${'0'.repeat(64)}`, publicationId: f.second.id },
+      {
+        entityType: 'artifact',
+        entityId: `${f.secondPlan.id}:${'0'.repeat(64)}`,
+        publicationId: f.second.id,
+      },
       { entityType: 'artifact', entityId: revisionId(f.secondPlan), publicationId: 'f'.repeat(64) },
       { entityType: 'artifact', entityId: revisionId(f.firstPlan), publicationId: f.first.id },
     ]) {
       expect((await call('POST', '/discussions', { ...f.at, body })).statusCode).toBe(404);
     }
-    expect((await call('POST', '/discussions', { ...f.at, body: { entityType: 'artifact', entityId: 'docs/plan.md' } })).statusCode).toBe(400);
-    expect((await call('POST', '/discussions', { ...f.at, body: { entityType: 'question', entityId: 'q1' } })).statusCode).toBe(400);
+    expect(
+      (
+        await call('POST', '/discussions', {
+          ...f.at,
+          body: { entityType: 'artifact', entityId: 'docs/plan.md' },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await call('POST', '/discussions', {
+          ...f.at,
+          body: { entityType: 'question', entityId: 'q1' },
+        })
+      ).statusCode,
+    ).toBe(400);
     expect(json(await call('GET', '/discussions', f.at))).toEqual([]);
   });
 
@@ -380,8 +470,16 @@ describe('native discussion threads', () => {
     };
     const results = await Promise.all([
       create({ entityType: 'intent' }),
-      create({ entityType: 'artifact', entityId: revisionId(f.secondPlan), publicationId: f.second.id }),
-      create({ entityType: 'artifact', entityId: revisionId(f.secondPlan), publicationId: f.second.id }),
+      create({
+        entityType: 'artifact',
+        entityId: revisionId(f.secondPlan),
+        publicationId: f.second.id,
+      }),
+      create({
+        entityType: 'artifact',
+        entityId: revisionId(f.secondPlan),
+        publicationId: f.second.id,
+      }),
     ]);
     expect(results.map((r) => r.statusCode)).toEqual([200, 200, 200]);
     expect(json(results[1]).id).toBe(json(results[2]).id);
@@ -393,14 +491,34 @@ describe('native discussion threads', () => {
     const f = await setup();
     const thread = json(await f.createArtifactThread(f.secondPlan, f.second));
     expect((await call('GET', '/discussions', { ...f.at, sub: OUTSIDER })).statusCode).toBe(403);
-    await g.V().has('Project', 'id', f.projectId).outE('HAS_MEMBER').where(gremlin.process.statics.inV().has('User', 'id', SECOND)).drop().next();
-    expect((await call('GET', '/discussions/{discussionId}/messages', { ...f.at, sub: SECOND, discussionId: thread.id })).statusCode).toBe(403);
+    await g
+      .V()
+      .has('Project', 'id', f.projectId)
+      .outE('HAS_MEMBER')
+      .where(gremlin.process.statics.inV().has('User', 'id', SECOND))
+      .drop()
+      .next();
+    expect(
+      (
+        await call('GET', '/discussions/{discussionId}/messages', {
+          ...f.at,
+          sub: SECOND,
+          discussionId: thread.id,
+        })
+      ).statusCode,
+    ).toBe(403);
     // Another project the member also belongs to, reusing the same execution ID.
     const otherProject = randomUUID();
     await seedProject(otherProject, [MEMBER]);
-    expect((await call('GET', '/discussions', { projectId: otherProject, intentId: f.at.intentId })).statusCode).toBe(404);
+    expect(
+      (await call('GET', '/discussions', { projectId: otherProject, intentId: f.at.intentId }))
+        .statusCode,
+    ).toBe(404);
     // A deleted and recreated project gets a new graph identity.
-    nativeRows.set(`${f.key.pk}|RUNTIME`, { ...nativeRows.get(`${f.key.pk}|RUNTIME`), projectIdentity: 'vertex-from-old-project' });
+    nativeRows.set(`${f.key.pk}|RUNTIME`, {
+      ...nativeRows.get(`${f.key.pk}|RUNTIME`),
+      projectIdentity: 'vertex-from-old-project',
+    });
     expect((await call('GET', '/discussions', f.at)).statusCode).toBe(403);
   });
 
@@ -408,17 +526,27 @@ describe('native discussion threads', () => {
     const f = await setup();
     const otherProject = randomUUID();
     const identity = await seedProject(otherProject, [MEMBER]);
-    await seedNativeExecution({ projectId: otherProject, executionId: f.at.intentId, projectIdentity: identity });
+    await seedNativeExecution({
+      projectId: otherProject,
+      executionId: f.at.intentId,
+      projectIdentity: identity,
+    });
     await call('POST', '/discussions', { ...f.at, body: { entityType: 'intent' } });
-    expect(json(await call('GET', '/discussions', { projectId: otherProject, intentId: f.at.intentId }))).toEqual([]);
-    expect(nativeCollaborationDigest({ projectId: otherProject, executionId: f.at.intentId })).not.toBe(
-      nativeCollaborationDigest(f.scope),
-    );
+    expect(
+      json(await call('GET', '/discussions', { projectId: otherProject, intentId: f.at.intentId })),
+    ).toEqual([]);
+    expect(
+      nativeCollaborationDigest({ projectId: otherProject, executionId: f.at.intentId }),
+    ).not.toBe(nativeCollaborationDigest(f.scope));
   });
 
   it('never serves a protected native execution through the platform intent routes', async () => {
     const f = await setup();
-    const res = await call('POST', '/discussions', { ...f.at, platform: true, body: { entityType: 'intent' } });
+    const res = await call('POST', '/discussions', {
+      ...f.at,
+      platform: true,
+      body: { entityType: 'intent' },
+    });
     expect(res.statusCode).toBe(404);
     expect((await call('GET', '/discussions', { ...f.at, platform: true })).statusCode).toBe(404);
   });
@@ -435,7 +563,9 @@ describe('native Quorum assistance', () => {
 
   it('sends only the selected verified revision to the shared advisory runtime', async () => {
     const f = await setup();
-    const older = json(await f.createArtifactThread(f.firstPlan, f.first, { publicationSequence: 1 }));
+    const older = json(
+      await f.createArtifactThread(f.firstPlan, f.first, { publicationSequence: 1 }),
+    );
     const res = await assist(f, older.id, { instructions: 'What changed?' });
     expect(res.statusCode).toBe(202);
     const [invocation] = agentcoreMock.commandCalls(InvokeAgentRuntimeCommand);
@@ -471,12 +601,18 @@ describe('native Quorum assistance', () => {
     expect(JSON.stringify(payload)).not.toContain('moving pipes');
     // The credential grant is bound to the native root, never a platform META ID.
     const grant = verifyAgentCredentialGrant(payload.agentCredentialGrant, GRANT_SECRET);
-    expect(grant).toMatchObject({ purpose: 'discussion', projectId: f.projectId, executionId: rootId });
+    expect(grant).toMatchObject({
+      purpose: 'discussion',
+      projectId: f.projectId,
+      executionId: rootId,
+    });
   });
 
   it('requires an explicitly selected CLI because native threads have no pinned platform CLI', async () => {
     const f = await setup();
-    const thread = json(await call('POST', '/discussions', { ...f.at, body: { entityType: 'intent' } }));
+    const thread = json(
+      await call('POST', '/discussions', { ...f.at, body: { entityType: 'intent' } }),
+    );
     const res = await assist(f, thread.id, { agentCli: undefined });
     expect(res.statusCode).toBe(400);
     expect(json(res).code).toBe('agent_cli_required');
@@ -485,7 +621,9 @@ describe('native Quorum assistance', () => {
 
   it('fails visibly instead of substituting other bytes when the revision cannot be verified', async () => {
     const f = await setup();
-    const older = json(await f.createArtifactThread(f.firstPlan, f.first, { publicationSequence: 1 }));
+    const older = json(
+      await f.createArtifactThread(f.firstPlan, f.first, { publicationSequence: 1 }),
+    );
     nativeRows.delete(`${f.key.pk}|PUBLICATION#${'1'.padStart(16, '0')}`);
     resetRevisions();
     const res = await assist(f, older.id);
@@ -498,7 +636,13 @@ describe('native Quorum assistance', () => {
   it('denies Quorum to a revoked member', async () => {
     const f = await setup();
     const thread = json(await f.createArtifactThread(f.secondPlan, f.second));
-    await g.V().has('Project', 'id', f.projectId).outE('HAS_MEMBER').where(gremlin.process.statics.inV().has('User', 'id', SECOND)).drop().next();
+    await g
+      .V()
+      .has('Project', 'id', f.projectId)
+      .outE('HAS_MEMBER')
+      .where(gremlin.process.statics.inV().has('User', 'id', SECOND))
+      .drop()
+      .next();
     expect((await assist(f, thread.id, {}, SECOND)).statusCode).toBe(403);
     expect(agentcoreMock.commandCalls(InvokeAgentRuntimeCommand)).toHaveLength(0);
   });

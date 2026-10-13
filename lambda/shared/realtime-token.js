@@ -173,7 +173,8 @@ const INTENT_CHANNEL_RE = new RegExp(`^intent:(${UUID_PATTERN})$`);
 // project. A discussion doc needs the execution-wide `native-collab:` scope. A
 // reply draft needs its exact revision scope, minted only for the interaction
 // and turn that are currently awaiting a reply. See lambda/shared/native-realtime.js.
-const NATIVE_DISCUSSION_DOC_RE = /^native-discussion-([a-f0-9]{64})-disc-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const NATIVE_DISCUSSION_DOC_RE =
+  /^native-discussion-([a-f0-9]{64})-disc-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const NATIVE_REPLY_DOC_RE = /^native-reply-([a-f0-9]{64})-([a-f0-9]{64})-([1-9][0-9]{0,15})$/;
 // Task-3 structured answer draft (QuestionEditor) for the same awaited turn.
 const NATIVE_ANSWER_DOC_RE = /^native-answer-([a-f0-9]{64})-([a-f0-9]{64})-([1-9][0-9]{0,15})$/;

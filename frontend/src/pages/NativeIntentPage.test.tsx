@@ -14,7 +14,10 @@ const prepare = vi.fn();
 const list = vi.fn();
 // Shared drafts: in-memory Yjs relay + textarea stand-in (see test/collaborationFakes).
 vi.mock('@/hooks/useYjsDocument', async () => await import('@/test/collaborationFakes'));
-vi.mock('@/components/CollaborativeTextarea', async () => await import('@/test/collaborationFakes'));
+vi.mock(
+  '@/components/CollaborativeTextarea',
+  async () => await import('@/test/collaborationFakes'),
+);
 vi.mock('@/services/nativeIntents', () => ({
   nativeIntentsService: {
     get: (...a: unknown[]) => get(...a),
@@ -191,11 +194,7 @@ it('prepares only on an explicit action and keeps all execution controls disable
   renderPage();
   await screen.findByRole('status');
   expect(prepare).not.toHaveBeenCalled();
-  for (const name of [
-    'Start agent',
-    'Edit artifacts',
-    'Create unit PR',
-  ]) {
+  for (const name of ['Start agent', 'Edit artifacts', 'Create unit PR']) {
     expect(screen.getByRole('button', { name })).toBeDisabled();
   }
   await user.click(screen.getByRole('button', { name: 'Prepare workspace' }));

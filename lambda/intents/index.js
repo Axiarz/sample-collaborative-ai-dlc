@@ -1,3 +1,4 @@
+import { reconcileYjsDeletion } from '../shared/yjs-revocation.js';
 import gremlin from 'gremlin';
 import { PartitionStrategy } from 'gremlin/lib/process/traversal-strategy.js';
 import { createHash, randomUUID, randomBytes } from 'node:crypto';
@@ -43,6 +44,7 @@ import {
   executionRequestError,
   isPlatformExecution,
 } from '../shared/execution-backend.js';
+import { isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
 import { deleteIntentCascade, IntentRunningError } from '../shared/intent-deletion.js';
 import { buildResponse } from '../shared/response.js';
 import { logSafeEventIfEnabled } from '../shared/safe-event-logger.js';
@@ -74,14 +76,22 @@ const nativeReplyRevisionRequest = (target) =>
   target.document.sequence >= 1;
 import { parseCliModels, mergeCliModels } from '../shared/cli-models.js';
 import { parseTierModels, mergeTierModels } from '../shared/tier-models.js';
+import { validateMcpServers, validateMcpServersJson } from '../shared/mcp-validator.js';
 import {
   loadWorkflowScopes,
   loadExecutionPlan,
   listMergedBlocks,
 } from '../shared/v2-workflow-plan.js';
 import { stageInstanceId as planStageInstanceId } from '../shared/v2-execution-plan.js';
+import { createIntentMethodologyLoader } from '../shared/intent-methodology.js';
 import { effectiveStageSkipping, normalizeSkipStageIds } from '../shared/stage-skip.js';
-import { effectivePrStrategy, normalizePlatformPrStrategy } from '../shared/pr-strategy.js';
+import {
+  assertPrStrategySupported,
+  draftlessProviders,
+  effectivePrStrategy,
+  normalizePlatformPrStrategy,
+} from '../shared/pr-strategy.js';
+import { repoProvider as sharedRepoProvider } from '../shared/repo-provider.js';
 import { normalizeComposedGrid, pruneSkipsForGrid } from '../shared/composed-grid.js';
 import { matchScopeByKeywords } from '../shared/compose-match.js';
 import { makePriceResolver, costForMetrics } from '../shared/model-pricing.js';
@@ -105,16 +115,37 @@ import {
 import { pinCustomRuleVersions } from '../shared/custom-rule-versions.js';
 import { canonicalJson, checkpointProjection } from '../shared/workflow-checkpoint.js';
 import { resolveAidlcRepoRef } from '../shared/aidlc-ref.js';
-import { assignNativeRepositoryDirectories, repositoryId } from '../shared/native-repositories.js';
+import {
+  assignNativeRepositoryDirectories,
+  repositoryCloneUrl,
+  repositoryId,
+} from '../shared/native-repositories.js';
 import {
   executionPlanFromMethodologyCatalog,
   loadOrCreateMethodologyCatalog,
 } from '../shared/methodology-catalog.js';
+import { AIDLC_RELEASE_IMPORTER_REVISION, readReleaseManifest } from '../shared/aidlc-release.js';
+import { blockPk, versionSk } from '../shared/blocks.js';
+import { profileFor } from '../shared/aidlc-compatibility-profiles.js';
+import {
+  loadReleaseClosure,
+  methodologyReleasePinFromManifest,
+  resolveMethodologyLibrary,
+} from '../shared/release-resolver.js';
+import {
+  ReleaseRegistryError,
+  assertReleaseCapabilitiesHonoured,
+  isReleaseRegistryError,
+  releasePinFromRecord,
+  resolveSelectableRelease,
+} from '../shared/release-registry.js';
 import { parseLambdaPayload } from '../shared/lambda-payload.js';
 import { mapWithConcurrency } from '../shared/concurrency.js';
-import { credentialProviderForCli } from '../shared/agent-credentials.js';
-import { resolveEffectiveCredentialBindingsViaBroker } from '../shared/agent-credential-metadata.js';
-import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js';
+import {
+  resolveSelectedAgentCredential,
+  prepareAgentInvocation,
+} from '../shared/agent-credential-service.js';
+import { credentialBindingDisplay } from '../shared/agent-auth-contracts.js';
 import { SYSTEM_TENANT } from '../shared/tenant.js';
 import { fetchKnowledgeGraph } from './knowledge-graph.js';
 import { buildIntentAudit } from './audit.js';
@@ -135,6 +166,12 @@ import {
   pendingAttachmentDeletions,
   validateAttachmentDescriptor,
 } from '../shared/intent-attachments.js';
+import {
+  GATE_CHOICES,
+  LOOP_BACK_OPTION,
+  OVERRIDE_REASON_MAX,
+  parseChoice,
+} from '../shared/gate-answer.js';
 
 const DriverRemoteConnection = gremlin.driver.DriverRemoteConnection;
 const traversal = gremlin.process.AnonymousTraversalSource.traversal;
@@ -149,6 +186,16 @@ const agentcore = new BedrockAgentCoreClient({});
 const store = createProcessStore({ ddb });
 const logger = new Logger({ persistentKeys: { component: 'intents' } });
 
+// The only registry answers that mean "this deployment ref has no release a new
+// intent may auto-pin". A capability record that could not be verified is not
+// one of them: it is a failed lookup, not a negative answer.
+const isAutoPinIneligible = (error) =>
+  isReleaseRegistryError(error) &&
+  error.details?.verificationError !== true &&
+  ['release_not_found', 'release_not_selectable', 'release_capability_unhandled'].includes(
+    error.code,
+  );
+
 const BLOCKS_TABLE = () => process.env.BLOCKS_TABLE;
 const ORCHESTRATOR_FN = () => process.env.V2_ORCHESTRATOR_FUNCTION;
 const DURABLE_EXECUTION_TIMEOUT_SECONDS = () =>
@@ -161,6 +208,11 @@ const SOURCE_CONTROL_FN = () => process.env.SOURCE_CONTROL_FUNCTION || '';
 // compose dispatch. Key shape: compose-reports/<intentId>/<uuid>.json.
 const ARTIFACTS_BUCKET = () => process.env.ARTIFACTS_BUCKET || '';
 const AIDLC_REPO_REF = () => process.env.AIDLC_REPO_REF || '';
+// Write switch for issue #482 release pinning. Off by default: new intents keep
+// resolving methodology from the SYSTEM rows until an operator opts in. Reading
+// an already-stamped intent is NOT gated — an existing pin must stay honoured
+// even if the switch is turned back off.
+const AIDLC_RELEASE_PINNING = () => process.env.AIDLC_RELEASE_PINNING || 'off';
 const attachmentCleanup = createAttachmentCleanupService({
   s3,
   store,
@@ -169,59 +221,9 @@ const attachmentCleanup = createAttachmentCleanupService({
 const attachmentEventKey = /^intent-attachments\/staging\/([^/]+)\/([^.]+)(\.[a-z0-9]+)$/i;
 const ATTACHMENT_PROMOTION_CAS_ATTEMPTS = 4;
 
-const resolveSelectedAgentCredential = async ({ projectId, userId, agentCli }) => {
-  const provider = credentialProviderForCli(agentCli);
-  if (!provider) {
-    return {
-      error: {
-        statusCode: 400,
-        body: {
-          error: `Unsupported agent CLI "${agentCli || ''}"`,
-          code: 'unsupported_agent_cli',
-        },
-      },
-    };
-  }
-  const bindings = await resolveEffectiveCredentialBindingsViaBroker({
-    projectId,
-    userId,
-  });
-  const credentialBinding = bindings[provider];
-  if (!credentialBinding) {
-    return {
-      error: {
-        statusCode: 409,
-        body: {
-          error: `No ${provider === 'kiro' ? 'Kiro' : 'Bedrock'} credential is available for this CLI`,
-          code: 'agent_credential_required',
-          provider,
-        },
-      },
-    };
-  }
-  return { provider, credentialBinding };
-};
-
-const issueInvocationAgentCredentialGrant = async ({
-  purpose,
-  projectId,
-  executionId,
-  credentialBinding = null,
-  agentCli = null,
-}) => {
-  const binding =
-    credentialBinding ??
-    (credentialProviderForCli(agentCli)
-      ? { provider: credentialProviderForCli(agentCli), source: 'platform' }
-      : null);
-  if (!binding) return null;
-  return issueAgentCredentialGrant(ssm, {
-    purpose,
-    projectId,
-    executionId,
-    bindings: [binding],
-  });
-};
+const issueInvocationAgentCredentialGrant = async (request) =>
+  (await prepareAgentInvocation({ ...request, legacyExecution: true }, { ssm }))
+    .agentCredentialGrant;
 
 // Finalizes a browser upload after S3 emits Object Created: verify it against
 // its DynamoDB reservation, copy the exact object version from staging to the
@@ -683,18 +685,85 @@ const fetchGlobalTierModels = async () => {
 
 // Read the Admin global custom MCP servers (raw JSON string) from SSM (written
 // by the agents lambda). Merged UNDER the project's custom MCP servers at
-// intent create (project wins by name). Best-effort: any failure yields '{}'.
-const fetchGlobalCustomMcpServers = async () => {
+// intent create (project wins by name). Creation is best-effort; launch preflight
+// fails on read errors so an outage cannot silently remove global servers.
+const fetchGlobalCustomMcpServers = async ({ failOnReadError = false } = {}) => {
   const prefix = AGENT_SETTINGS_SSM_PREFIX();
   if (!prefix) return '{}';
   try {
     const res = await ssm.send(
       new GetParameterCommand({ Name: `${prefix}/custom-mcp-servers`, WithDecryption: true }),
     );
+    if (failOnReadError && typeof res?.Parameter?.Value !== 'string') {
+      throw new Error('Global MCP settings response is missing its value');
+    }
     return res.Parameter?.Value || '{}';
-  } catch {
+  } catch (error) {
+    if (failOnReadError && error?.name !== 'ParameterNotFound') throw error;
     return '{}';
   }
+};
+
+// Check before starting/stopping sessions or resetting work. A first start uses
+// current settings; a relaunch keeps its pinned config unless it is no longer
+// valid. Repair an invalid snapshot from current settings so "correct and retry"
+// works for existing intents too. Only the launch CAS persists the replacement.
+const prepareMcpLaunch = async (g, meta) => {
+  const pinned = meta.mcpServersByTier ?? {
+    global: {},
+    project: meta.customMcpServers ?? {},
+  };
+  if (
+    meta.status !== 'DRAFT' &&
+    ['global', 'project'].every((tier) => validateMcpServers(pinned[tier] ?? {}).valid)
+  ) {
+    return { update: {} };
+  }
+  let rawGlobal;
+  let project;
+  try {
+    [rawGlobal, project] = await Promise.all([
+      fetchGlobalCustomMcpServers({ failOnReadError: true }),
+      g.V().has('Project', 'id', meta.projectId).valueMap('custom_mcp_servers').next(),
+    ]);
+    if (project.done) throw new Error('Project not found');
+  } catch (error) {
+    logger.error(error);
+    return {
+      statusCode: 503,
+      error: {
+        code: 'mcp_settings_unavailable',
+        error: 'Cannot start the runtime: MCP settings could not be loaded. Retry later.',
+      },
+    };
+  }
+  const mcpServersByTier = {};
+  for (const [tier, raw] of Object.entries({
+    global: rawGlobal,
+    project: getVal(project.value, 'custom_mcp_servers') || '{}',
+  })) {
+    const validation = validateMcpServersJson(raw);
+    if (!validation.valid) {
+      const fields = validation.issues.map(({ path }) => path || '<root>').join(', ');
+      const httpsHint = validation.issues.some(({ code }) => code === 'https_required')
+        ? ' Remote MCP URLs must use https://.'
+        : '';
+      const settings = tier === 'global' ? 'Platform Admin settings' : 'Space Settings';
+      return {
+        statusCode: 400,
+        error: {
+          code: 'mcp_config_error',
+          error:
+            `Cannot start the runtime: invalid ${tier} MCP configuration at ${fields}.${httpsHint} ` +
+            `Correct your MCP servers in ${settings}, then retry.`,
+        },
+      };
+    }
+    mcpServersByTier[tier] = JSON.parse(raw);
+  }
+  // Keep explicit empty maps: null would reactivate legacy customMcpServers in
+  // the orchestrator when the user removed every server to repair the intent.
+  return { update: { mcpServersByTier } };
 };
 
 // Read the Admin derive-time graph enrichment mode ('off'|'llm') from SSM
@@ -928,6 +997,8 @@ const mapArtifactHead = (row, legacyVersionCount = 0) => ({
   repository: row.repository || null,
   stageAttempt: Number(row.stage_attempt) || 0,
   generation: Math.max(1, Number(row.generation) || 1),
+  collaborationEpoch: row.collaboration_epoch ?? null,
+  editRevision: row.edit_revision ?? null,
   versionCount: Math.max(0, Number(row.version_count) || 0) + legacyVersionCount,
   aliases: artifactAliases(row),
   createdAt: row.created_at ?? null,
@@ -995,6 +1066,8 @@ const fetchArtifactRow = async (g, intentId, artifactId) => {
     artifactType: row.artifact_type ?? null,
     title: row.title ?? null,
     supersededAt: row.superseded_at ?? null,
+    collaborationEpoch: row.collaboration_epoch ?? null,
+    editRevision: row.edit_revision ?? null,
   };
 };
 
@@ -1177,6 +1250,21 @@ const mirrorSteeringVertex = async ({ g, intentId, steer }) => {
   }
 };
 
+// The only `detail` fields a durable timeline event forwards to the browser.
+// Numeric round counters, nothing else: the rest of `detail` is verbatim agent
+// text, authorization ids and sensor internals that the feed must not leak.
+const TIMELINE_DETAIL_NUMBERS = ['round', 'maxRounds'];
+
+const timelineEventDetail = (detail) => {
+  if (!detail || typeof detail !== 'object') return {};
+  const picked = {};
+  for (const key of TIMELINE_DETAIL_NUMBERS) {
+    const value = Number(detail[key]);
+    if (Number.isFinite(value)) picked[key] = value;
+  }
+  return Object.keys(picked).length > 0 ? { detail: picked } : {};
+};
+
 const buildGateAnswerEvents = async (g, gates) => {
   const answered = gates.filter((gate) => gate.kind === 'question' && gate.answeredAt);
   const events = [];
@@ -1272,6 +1360,7 @@ const mapIntent = (meta) => ({
   projectId: meta.projectId,
   title: meta.title ?? null,
   prompt: meta.prompt ?? null,
+  draftRevision: meta.draftRevision ?? 0,
   status: meta.status,
   branch: meta.branch ?? null,
   baseBranch: meta.baseBranch ?? null,
@@ -1282,6 +1371,13 @@ const mapIntent = (meta) => ({
   workflowId: meta.workflowId,
   workflowVersion: meta.workflowVersion ?? null,
   aidlcRepoRef: meta.aidlcRepoRef ?? null,
+  methodologyRelease: meta.methodologyRelease
+    ? {
+        ...meta.methodologyRelease,
+        // Display-only label from the allowlist; never persisted in the pin.
+        upstreamVersion: profileFor(meta.methodologyRelease.sourceSha)?.upstreamVersion ?? null,
+      }
+    : null,
   scope: meta.scope ?? null,
   currentPhase: meta.currentPhase ?? null,
   currentStage: meta.currentStage ?? null,
@@ -1289,8 +1385,15 @@ const mapIntent = (meta) => ({
   failureReason: meta.failureReason ?? null,
   failure: mapExecutionFailure(meta),
   rewindFromStageId: meta.rewindFromStageId ?? null,
+  // Set only while a recorded gate answer still needs its durable callback
+  // completed — the frontend renders the Resume run action off this.
+  resumeRequired: meta.resumeRequired ?? null,
   agentCli: meta.agentCli ?? null,
   credentialSource: meta.credentialBinding?.source ?? null,
+  credentialConnection:
+    meta.status === 'DRAFT' && !meta.credentialBinding
+      ? null
+      : credentialBindingDisplay(meta.credentialBinding, meta.agentCli),
   cliModels: meta.cliModels ?? null,
   tierModels: meta.tierModels ?? null,
   environment: meta.environment ?? null,
@@ -1356,14 +1459,6 @@ const isGloballyParkedForExport = (records) => {
     );
 };
 
-const repositoryCloneUrl = (repository, provider) => {
-  const value = String(repository ?? '');
-  if (/^(?:https?|ssh):\/\//.test(value) || value.startsWith('git@')) return value;
-  if (provider === 'gitlab') return `git@gitlab.com:${value}.git`;
-  if (provider === 'bitbucket') return `git@bitbucket.org:${value}.git`;
-  return `git@github.com:${value}.git`;
-};
-
 const exportRepositories = (meta) =>
   assignNativeRepositoryDirectories(
     (meta.repos ?? []).map((repository) => {
@@ -1397,7 +1492,67 @@ const exportSnapshotToken = (projection) =>
     )
     .digest('hex');
 
-const findNativeIncompatibleBlocks = async (plan) => {
+/**
+ * Which blocks in a resolved plan are user-edited methodology that native export
+ * cannot reproduce.
+ *
+ * The library to classify against is whatever the intent actually resolves. For
+ * a RELEASE-pinned intent that is the closure plus its explicit user-tenant
+ * overlay pins — `listMergedBlocks` would instead read the live SYSTEM+default
+ * catalogs, which the intent never touches. That mismatch is not cosmetic in
+ * either direction: a user block in the live catalog that the release does not
+ * use would be reported as a blocker for an export that is perfectly fine, and a
+ * genuine overlay pin would be missed whenever the live `default` row was since
+ * deleted.
+ */
+const loadClassificationBlocks = async (meta, types) => {
+  if (!meta?.methodologyRelease) {
+    return Object.fromEntries(
+      await Promise.all(
+        types.map(async (type) => [type, await listMergedBlocks(ddb, BLOCKS_TABLE(), type)]),
+      ),
+    );
+  }
+  const closure = await loadReleaseClosure({
+    s3,
+    bucket: ARTIFACTS_BUCKET(),
+    methodologyRelease: meta.methodologyRelease,
+  });
+  const overlay = meta.methodologyPins ?? {};
+  return Object.fromEntries(
+    await Promise.all(
+      types.map(async (type) => {
+        const pins = Object.entries(overlay[type] ?? {}).filter(
+          ([, pin]) => pin?.tenantId && pin.tenantId !== SYSTEM_TENANT,
+        );
+        const overlayBlocks = await Promise.all(
+          pins.map(async ([blockId, pin]) => {
+            const { Item } = await ddb.send(
+              new GetCommand({
+                TableName: BLOCKS_TABLE(),
+                Key: {
+                  pk: blockPk(pin.tenantId, type, blockId),
+                  sk: versionSk(Number(pin.version)),
+                },
+              }),
+            );
+            // A pinned overlay row that has since been deleted is still
+            // user-edited methodology as far as export compatibility goes, so it
+            // must be reported rather than dropped.
+            return Item ?? { blockId, id: blockId, tenantId: pin.tenantId };
+          }),
+        );
+        const byId = new Map(
+          (closure.blocksByType?.[type] ?? []).map((block) => [block.blockId ?? block.id, block]),
+        );
+        for (const block of overlayBlocks) byId.set(block.blockId ?? block.id, block);
+        return [type, [...byId.values()]];
+      }),
+    ),
+  );
+};
+
+const findNativeIncompatibleBlocks = async (plan, meta = null) => {
   const agentIds = new Set();
   const sensorIds = new Set();
   const ruleIds = new Set();
@@ -1414,12 +1569,12 @@ const findNativeIncompatibleBlocks = async (plan) => {
       ruleIds.add(id);
     }
   }
-  const [agents, sensors, rules, knowledge] = await Promise.all([
-    listMergedBlocks(ddb, BLOCKS_TABLE(), 'AGENT'),
-    listMergedBlocks(ddb, BLOCKS_TABLE(), 'SENSOR'),
-    listMergedBlocks(ddb, BLOCKS_TABLE(), 'RULE'),
-    listMergedBlocks(ddb, BLOCKS_TABLE(), 'KNOWLEDGE'),
-  ]);
+  const {
+    AGENT: agents,
+    SENSOR: sensors,
+    RULE: rules,
+    KNOWLEDGE: knowledge,
+  } = await loadClassificationBlocks(meta, ['AGENT', 'SENSOR', 'RULE', 'KNOWLEDGE']);
   const custom = [
     ...plan.stages
       .filter((stage) => stage.stageTenant && stage.stageTenant !== SYSTEM_TENANT)
@@ -1453,6 +1608,50 @@ const hasNonSystemMethodologyPins = (methodologyPins) =>
     Object.values(pins ?? {}).some((pin) => pin?.tenantId !== SYSTEM_TENANT),
   );
 
+const userMethodologyPins = (methodologyPins) => {
+  const pins = Object.fromEntries(
+    Object.entries(methodologyPins ?? {})
+      .map(([type, blocks]) => [
+        type,
+        Object.fromEntries(
+          Object.entries(blocks ?? {}).filter(
+            ([, pin]) => pin?.tenantId && pin.tenantId !== SYSTEM_TENANT,
+          ),
+        ),
+      ])
+      .filter(([, blocks]) => Object.keys(blocks).length > 0),
+  );
+  return Object.keys(pins).length ? pins : null;
+};
+
+const snapshotUserMethodologyPins = async (methodologyPins) => {
+  const pins = userMethodologyPins(methodologyPins) ?? {};
+  const scopePins = Object.fromEntries(
+    (await listMergedBlocks(ddb, BLOCKS_TABLE(), 'SCOPE'))
+      .filter(
+        (block) =>
+          block?.tenantId &&
+          block.tenantId !== SYSTEM_TENANT &&
+          Number.isInteger(Number(block.version)) &&
+          Number(block.version) > 0,
+      )
+      .map((block) => [
+        block.id ?? block.blockId,
+        { tenantId: block.tenantId, version: Number(block.version) },
+      ]),
+  );
+  if (Object.keys(scopePins).length) pins.SCOPE = scopePins;
+  return Object.keys(pins).length ? pins : null;
+};
+
+// All reads for a created intent derive methodology from its stored snapshot.
+const intentMethodology = createIntentMethodologyLoader({
+  ddb,
+  tableName: BLOCKS_TABLE,
+  s3,
+  bucket: ARTIFACTS_BUCKET,
+});
+
 const methodologyRefsMatch = (planResult, expectedRef) => {
   const refs = planResult?.methodologySourceRefs ?? [];
   return refs.length === 1 && refs[0] === expectedRef;
@@ -1475,6 +1674,12 @@ const loadNativeExportPlan = async (meta) => {
   };
   let currentResult = null;
   let currentError = null;
+  // A release-pinned intent already carries its complete immutable methodology,
+  // so export resolves it directly and never touches the reseedable SYSTEM rows
+  // or the legacy catalog rebuild below.
+  if (meta.methodologyRelease) {
+    return intentMethodology.loadPlan(meta);
+  }
   try {
     currentResult = await loadExecutionPlan({
       ddb,
@@ -1546,10 +1751,17 @@ const authorize = async (g, projectId, sub, response) => {
 };
 
 export const handler = async (event, context) => {
+  const cleanupDeadline = Date.now() + 10_000;
   if (context) logger.addContext(context);
   logger.resetKeys();
   logSafeEventIfEnabled(logger, event);
   const response = buildResponse(event);
+  if (event?.action === 'cleanup-yjs-deletions')
+    return reconcileYjsDeletion({
+      ddb,
+      table: process.env.YJS_DOCUMENTS_TABLE,
+      bucket: ARTIFACTS_BUCKET(),
+    });
   if (event?.source === 'aws.s3') {
     await ingestAttachmentUpload(event);
     return { ok: true };
@@ -1605,21 +1817,30 @@ export const handler = async (event, context) => {
     // a protected read, so it precedes the platform-only mutation/META guard.
     if (intentId && httpMethod === 'POST' && path?.endsWith('/realtime-token')) {
       const target = body ? JSON.parse(body) : {};
-      if (target.executionBackend !== undefined && !['native', 'platform'].includes(target.executionBackend))
+      if (
+        target.executionBackend !== undefined &&
+        !['native', 'platform'].includes(target.executionBackend)
+      )
         return response(400, { error: 'Invalid realtime backend' });
       // A native reply draft is a revision-specific Yjs document. Its scope is
       // minted only while that exact interaction/turn is awaiting a reply.
       const replyDocument = target.document;
       if (replyDocument !== undefined && !nativeReplyRevisionRequest(target))
         return response(400, { error: 'Invalid realtime document' });
-      const meta = target.executionBackend === 'native' ? null : await store.getExecution(intentId, { consistentRead: true });
+      const meta =
+        target.executionBackend === 'native'
+          ? null
+          : await store.getExecution(intentId, { consistentRead: true });
       let owner = meta && isPlatformExecution(meta) ? meta.projectId : null;
       const native = !owner;
       if (!owner && process.env.NATIVE_RUNTIME_BINDINGS_TABLE) {
         try {
           owner = await resolveNativeAwareIntentProject({
-            ddb, nativeTable: process.env.NATIVE_RUNTIME_BINDINGS_TABLE,
-            projectId, intentId, platformProject: async () => null,
+            ddb,
+            nativeTable: process.env.NATIVE_RUNTIME_BINDINGS_TABLE,
+            projectId,
+            intentId,
+            platformProject: async () => null,
           });
         } catch {
           return response(503, { error: 'Realtime ownership is temporarily unavailable' });
@@ -1633,31 +1854,42 @@ export const handler = async (event, context) => {
       if (currentAuth.res) return currentAuth.res;
       const identity = { projectId, executionId: intentId };
       const scopes = native
-        ? [nativeIntentChannel(identity), nativeCollaborationScope(identity), `project:${projectId}`]
+        ? [
+            nativeIntentChannel(identity),
+            nativeCollaborationScope(identity),
+            `project:${projectId}`,
+          ]
         : [`intent:${intentId}`, `project:${projectId}`];
       if (replyDocument !== undefined) {
         if (!native) return response(400, { error: 'Invalid realtime document' });
         let access;
         try {
           access = await resolveNativeCollaborationAccess({
-            ddb, nativeTable: process.env.NATIVE_RUNTIME_BINDINGS_TABLE, ...identity,
+            ddb,
+            nativeTable: process.env.NATIVE_RUNTIME_BINDINGS_TABLE,
+            ...identity,
             membership: () => fetchWorkflowSourceMembership(g, projectId, sub),
           });
         } catch (err) {
-          if (err?.code === 'WORKFLOW_SOURCE_FORBIDDEN') return response(403, { error: 'Forbidden' });
+          if (err?.code === 'WORKFLOW_SOURCE_FORBIDDEN')
+            return response(403, { error: 'Forbidden' });
           return response(503, { error: 'Realtime ownership is temporarily unavailable' });
         }
         if (access.status === 403) return response(403, { error: 'Forbidden' });
         const row = access.execution;
         if (access.status !== 200 || !row) return response(404, { error: 'Intent not found' });
         if (
-          row.status !== 'AWAITING_USER' || row.cancelRequested ||
+          row.status !== 'AWAITING_USER' ||
+          row.cancelRequested ||
           row.interaction?.id !== replyDocument.interactionId ||
           row.interaction?.sequence !== replyDocument.sequence ||
           (row.turnSequence ?? 1) !== replyDocument.sequence
         )
           return response(409, { error: 'Native interaction changed; refresh before replying' });
-        const revision = { interactionId: replyDocument.interactionId, sequence: replyDocument.sequence };
+        const revision = {
+          interactionId: replyDocument.interactionId,
+          sequence: replyDocument.sequence,
+        };
         scopes.push(
           replyDocument.kind === 'answer'
             ? nativeAnswerScope(identity, revision)
@@ -1699,6 +1931,20 @@ export const handler = async (event, context) => {
       }
       if (meta.prStrategy !== 'pr-per-unit') {
         return response(409, { error: 'This intent does not use PR per unit' });
+      }
+      // A feedback revision rewrites the unit branch under a PR that must stay
+      // unmergeable meanwhile (a draft). Refused durably, before any provider
+      // call, for providers that have no drafts.
+      const draftless = draftlessProviders(
+        (meta.repos ?? []).map((repo) =>
+          sharedRepoProvider(repo, meta.gitProvider, meta.repoProviders),
+        ),
+      );
+      if (draftless.length) {
+        return response(409, {
+          error: `Feedback revisions need draft pull requests, which ${draftless.join(', ')} does not support`,
+          code: 'PR_STRATEGY_UNSUPPORTED',
+        });
       }
       const unit = await store.getUnit(intentId, sectionIndex, unitSlug);
       const activeUnitStates = new Set([
@@ -1916,7 +2162,7 @@ export const handler = async (event, context) => {
           errors: planResult.errors ?? [],
         });
       }
-      const incompatibleBlocks = await findNativeIncompatibleBlocks(planResult.plan);
+      const incompatibleBlocks = await findNativeIncompatibleBlocks(planResult.plan, meta);
       if (incompatibleBlocks.length > 0) {
         return response(409, {
           error: 'The workflow uses edited methodology blocks that cannot yet be exported',
@@ -2186,20 +2432,7 @@ export const handler = async (event, context) => {
       // read evidence when it cannot be resolved (never block the warning).
       let plan = null;
       try {
-        const planResult = await loadExecutionPlan({
-          ddb,
-          tableName: BLOCKS_TABLE(),
-          workflowId: records.meta.workflowId,
-          workflowVersion: records.meta.workflowVersion,
-          scope: records.meta.scope,
-          ...(Array.isArray(records.meta.skipStageIds) && records.meta.skipStageIds.length
-            ? { skipStageIds: records.meta.skipStageIds }
-            : {}),
-          ...(records.meta.composedGrid ? { composedGrid: records.meta.composedGrid } : {}),
-          ...(records.meta.methodologyPins
-            ? { methodologyPins: records.meta.methodologyPins }
-            : {}),
-        });
+        const planResult = await intentMethodology.loadPlan(records.meta);
         plan = planResult.valid ? planResult.plan : null;
       } catch {
         plan = null;
@@ -2241,6 +2474,25 @@ export const handler = async (event, context) => {
       if (artifact.supersededAt) {
         return response(409, { error: 'Artifact is superseded — edit its replacement instead' });
       }
+      if (
+        data.collaborationEpoch !== undefined &&
+        data.collaborationEpoch !== artifact.collaborationEpoch
+      ) {
+        return response(409, {
+          error: 'Artifact content was replaced — reload before editing',
+          code: 'artifact_replaced',
+        });
+      }
+      if (
+        !Object.hasOwn(data, 'ifEditRevision') ||
+        (data.ifEditRevision !== null && typeof data.ifEditRevision !== 'string') ||
+        !Object.hasOwn(data, 'collaborationEpoch')
+      ) {
+        return response(428, {
+          error: 'Read the edit state before saving',
+          code: 'edit_precondition_required',
+        });
+      }
       const canonicalArtifactId = artifact.id;
       const responder = getResponder(event);
       // Closure BEFORE the write (root is excluded by construction either way).
@@ -2252,16 +2504,25 @@ export const handler = async (event, context) => {
         logger.error('Downstream closure failed', err);
         return [];
       });
-      const edit = await applyArtifactEdit({
-        g,
-        intentId,
-        artifactId: canonicalArtifactId,
-        content: data.content,
-        editedBy: responder.sub,
-        editedByName: responder.displayName,
-        origin: 'human',
-        editRef: `human:${responder.sub}`,
-      });
+      let edit;
+      try {
+        edit = await applyArtifactEdit({
+          g,
+          intentId,
+          artifactId: canonicalArtifactId,
+          content: data.content,
+          editedBy: responder.sub,
+          editedByName: responder.displayName,
+          origin: 'human',
+          editRef: `human:${responder.sub}`,
+          ifEditRevision: data.ifEditRevision,
+          ifCollaborationEpoch: data.collaborationEpoch,
+        });
+      } catch (error) {
+        if (error.code === 'edit_conflict')
+          return response(409, { error: error.message, code: 'edit_conflict' });
+        throw error;
+      }
       const staleMarked = await markArtifactsStale({
         g,
         intentId,
@@ -2332,6 +2593,7 @@ export const handler = async (event, context) => {
             executionId: intentId,
             credentialBinding: records.meta.credentialBinding,
             agentCli: records.meta.agentCli,
+            runtimeCapabilities: records.meta.environment,
           });
           const res = await agentcore.send(
             new InvokeAgentRuntimeCommand({
@@ -2582,6 +2844,80 @@ export const handler = async (event, context) => {
       if (!meta || meta.projectId !== projectId) {
         return response(404, { error: 'Intent not found' });
       }
+      const answerStatus = data.status ?? 'answered';
+      if (!isHumanTaskAnswerStatus(answerStatus)) {
+        return response(400, {
+          error: 'status must be answered, approved, or rejected',
+          code: 'invalid_gate_status',
+        });
+      }
+      // A validation gate that withheld an option (a blocking finding withholds
+      // `approve`) must not record that option: the engine would re-run the
+      // stage while the gate row and its badge said "approved".
+      const offered =
+        gate.kind === 'validation' && Array.isArray(gate.options) && gate.options.length > 0
+          ? gate.options
+          : null;
+      if (offered) {
+        const choice = parseChoice(data.answer, GATE_CHOICES);
+        const chosen = choice ?? (answerStatus === 'approved' ? 'approve' : null);
+        if (chosen && !offered.includes(chosen)) {
+          return response(400, {
+            error: `This gate offers ${offered.join(', ')}; "${chosen}" is not one of them`,
+            code: 'gate_choice_not_offered',
+          });
+        }
+        // Orchestrator code that predates the loop-back reads a rejected answer
+        // as request-changes; any other status would be misread on a rollback.
+        if (chosen === LOOP_BACK_OPTION && answerStatus !== 'rejected') {
+          return response(400, {
+            error: 'A loop-back answer must be recorded with status "rejected"',
+            code: 'loop_back_status_invalid',
+          });
+        }
+      }
+      // A loop-back is recordable ONLY on the gate the ENGINE offered it on, and
+      // `loopBackTarget` is the only proof of that offer: `awaitEngineGate` writes it
+      // when, and only when, the walk resolved a target. The branch above covers
+      // validation gates with a stored option list; this covers every other gate,
+      // because `loop-back` in a `question` gate's `freeText` is read as the choice
+      // by the same parser the orchestrator and the stage runner use, and would
+      // otherwise re-enter a stage as a fresh run on nothing but typed text.
+      if (
+        parseChoice(data.answer, [LOOP_BACK_OPTION]) === LOOP_BACK_OPTION &&
+        !gate.loopBackTarget
+      ) {
+        return response(400, {
+          error: 'This gate did not offer a loop-back',
+          code: 'loop_back_not_offered',
+        });
+      }
+      // The same parser the orchestrator reads the answer with, so an answer the
+      // engine treats as an override is held to the override's requirements here.
+      const overrideChosen =
+        parseChoice(data.answer, ['override-and-approve']) === 'override-and-approve' ||
+        (Array.isArray(data.answer?.perQuestion) &&
+          data.answer.perQuestion.some(
+            (entry) =>
+              typeof entry?.answer === 'string' &&
+              entry.answer.trim().toLowerCase() === 'override-and-approve',
+          ));
+      if (overrideChosen) {
+        const reason = typeof data.answer?.reason === 'string' ? data.answer.reason.trim() : '';
+        if (!reason) {
+          return response(400, {
+            error: 'A non-blank reason is required to override blocking findings',
+            code: 'override_reason_required',
+          });
+        }
+        if (reason.length > OVERRIDE_REASON_MAX) {
+          return response(400, {
+            error: `Override reason must be at most ${OVERRIDE_REASON_MAX} characters`,
+            code: 'override_reason_too_long',
+          });
+        }
+        data.answer = { ...data.answer, reason };
+      }
       // A live Quorum edit is mutating this intent's artifacts; answering the
       // gate would resume the parked stage RIGHT INTO those writes. The run is
       // already parked — waiting for the edit to finish costs nothing (mirror
@@ -2600,32 +2936,38 @@ export const handler = async (event, context) => {
       // than one pending gate; answer the one addressed by the URL, never blindly
       // META.pendingHumanTaskId.
       const responder = getResponder(event);
-      const answered = await store.answerHumanTask({
+      const steeringMessage = typeof data.steering === 'string' ? data.steering.trim() : '';
+      const answerInput = {
         executionId: intentId,
         humanTaskId,
-        status: data.status || 'answered',
+        status: answerStatus,
         answer: data.answer ?? null,
         answeredBy: responder.sub,
         answeredByName: responder.displayName,
-      });
+      };
+      const answerResult = steeringMessage
+        ? await store.answerHumanTaskWithSteering({
+            ...answerInput,
+            steering: {
+              kind: 'gate-steer',
+              message: steeringMessage,
+              targetGateId: humanTaskId,
+              createdBy: responder.sub,
+              createdByName: responder.displayName,
+            },
+          })
+        : await store.answerHumanTask(answerInput);
+      const answered = steeringMessage
+        ? answerResult && { ...gate, ...answerResult.answered }
+        : answerResult;
       if (!answered) {
         return response(409, { error: 'Gate already answered or not pending' });
       }
       // Optional course correction riding on the answer (docs/v2-steering.md):
-      // record it BEFORE resuming the callback so the resume run-stage — which
-      // reads pending steering at entry — is guaranteed to inject it into the
-      // parked conversation alongside the answer.
-      let steer = null;
-      const steeringMessage = typeof data.steering === 'string' ? data.steering.trim() : '';
+      // its STEER row and HUMAN decision were committed atomically above, so an
+      // early orchestrator recovery cannot observe one without the other.
+      const steer = steeringMessage ? answerResult.steering : null;
       if (steeringMessage) {
-        steer = await store.createSteering({
-          executionId: intentId,
-          kind: 'gate-steer',
-          message: steeringMessage,
-          targetGateId: humanTaskId,
-          createdBy: responder.sub,
-          createdByName: responder.displayName,
-        });
         await store
           .appendEvent({
             executionId: intentId,
@@ -2658,6 +3000,15 @@ export const handler = async (event, context) => {
       if (gate.callbackId) {
         try {
           await resumeDurableCallback(gate.callbackId, answered.answer);
+          await (
+            store.markGateCallbackConsumed?.({
+              executionId: intentId,
+              humanTaskId,
+              callbackId: gate.callbackId,
+            }) ?? Promise.resolve()
+          ).catch((markErr) =>
+            logger.error('Gate callback consumption marker write failed', markErr),
+          );
         } catch (err) {
           if (isCallbackTimeoutError(err)) {
             await repairExpiredDurableExecution({
@@ -2683,9 +3034,22 @@ export const handler = async (event, context) => {
               summary: `Gate answer was recorded, but the durable callback could not be completed: ${err?.message ?? 'unknown error'}`,
             })
             .catch((eventErr) => logger.error('Gate resume failure event append failed', eventErr));
+          // The answer is already durable; this makes the NEED TO RESUME durable
+          // too. Without it the run sits WAITING with no pending gate and no
+          // action able to wake it — the one known indefinite-wait path.
+          await store
+            .updateExecution({
+              executionId: intentId,
+              resumeRequired: {
+                humanTaskId,
+                callbackId: gate.callbackId,
+                answeredAt: answered.answeredAt ?? null,
+              },
+            })
+            .catch((metaErr) => logger.error('Gate resume marker write failed', metaErr));
           return response(503, {
             error:
-              'Gate answer was recorded, but the durable callback could not be completed. Retry after refreshing the intent.',
+              'Gate answer was recorded, but the durable callback could not be completed. Use Resume run to retry.',
             code: 'durable_callback_resume_failed',
             retryable: true,
           });
@@ -2695,6 +3059,127 @@ export const handler = async (event, context) => {
         ...mapHumanTask(answered),
         steering: steer ? mapSteering(steer) : null,
       });
+    }
+
+    // POST /projects/{projectId}/intents/{intentId}/resume
+    // Re-attempt the durable callback for an answer that was recorded but whose
+    // resume failed (META.resumeRequired, set by the answer path above). This is
+    // the one-click recovery for the only known indefinite-WAITING path: the
+    // answer is already durable, so resuming never needs new human input.
+    //
+    // IDEMPOTENT: nothing to resume is a 200, not an error, so a double click or
+    // a retried request is harmless. An expired callback runs the same repair the
+    // answer path runs, which lands the intent in FAILED — recoverable by the
+    // existing rewind API — instead of leaving it parked forever.
+    if (intentId && !humanTaskId && httpMethod === 'POST' && path?.endsWith('/resume')) {
+      const meta = await store.getExecution(intentId);
+      if (!meta || meta.projectId !== projectId) {
+        return response(404, { error: 'Intent not found' });
+      }
+      // Every gate is judged with the rule the intent detail uses for the banner
+      // (resumeOwed), so the button and this route always agree: concurrent
+      // lanes can each owe a resume, and the marker only records the latest one
+      // (or none, when its own write failed).
+      const records = await store.getExecutionRecords(intentId, { includeOutputs: false });
+      const stagesByInstance = new Map(
+        (records.stages ?? []).map((stage) => [stage.stageInstanceId, stage]),
+      );
+      const owed = (records.humanTasks ?? [])
+        .filter((gate) =>
+          resumeOwed({
+            meta,
+            gate,
+            stageRow: stagesByInstance.get(gate.stageInstanceId) ?? null,
+          }),
+        )
+        .toSorted((a, b) => String(a.answeredAt ?? '').localeCompare(String(b.answeredAt ?? '')));
+      const marker = meta.resumeRequired ?? null;
+      const responder = getResponder(event);
+      const markConsumed = (gate) =>
+        (
+          store.markGateCallbackConsumed?.({
+            executionId: intentId,
+            humanTaskId: gate.humanTaskId,
+            callbackId: gate.callbackId,
+          }) ?? Promise.resolve()
+        ).catch((markErr) =>
+          logger.error('Gate callback consumption marker write failed', markErr),
+        );
+      let resumed = 0;
+      let retryable = null;
+      for (const gate of owed) {
+        try {
+          await resumeDurableCallback(gate.callbackId, gate.answer ?? null);
+        } catch (err) {
+          if (isCallbackTimeoutError(err)) {
+            const failed = await repairExpiredDurableExecution({
+              executionId: intentId,
+              projectId,
+              meta,
+              actor: responder.displayName || responder.sub,
+              summary: `${responder.displayName || 'Someone'} retried the resume after the durable execution expired; the run was marked failed and can be rewound`,
+            }).catch((repairErr) => {
+              logger.error('Durable callback expiry repair failed', repairErr);
+              return null;
+            });
+            // The marker is cleared either way: the resume can never succeed now,
+            // and leaving it set would offer the human a button that cannot work.
+            await store
+              .updateExecution({ executionId: intentId, resumeRequired: null })
+              .catch((metaErr) => logger.error('Resume marker clear failed', metaErr));
+            return response(409, {
+              error: 'Durable execution expired before this answer could resume the run',
+              code: 'durable_execution_expired',
+              intent: mapIntent(failed ?? { ...meta, status: 'FAILED' }),
+            });
+          }
+          // The callback is gone or already completed: the first send was
+          // delivered even though it reported an error. Nothing is owed.
+          if (isMissingDurableCallbackError(err)) {
+            await markConsumed(gate);
+            continue;
+          }
+          logger.error('Gate resume retry failed', err);
+          retryable ??= gate;
+          continue;
+        }
+        await markConsumed(gate);
+        resumed += 1;
+        await store
+          .appendEvent({
+            executionId: intentId,
+            type: 'v2.gate.resumed',
+            stageInstanceId: gate.stageInstanceId ?? null,
+            actor: responder.displayName || responder.sub,
+            summary: `${responder.displayName || 'Someone'} resumed the run after a failed gate callback`,
+          })
+          .catch((eventErr) => logger.error('Gate resumed event append failed', eventErr));
+      }
+      // The marker is cleared once nothing it could stand for is still owed;
+      // the conditional write keeps a marker a concurrent answer just set.
+      const current =
+        marker && !retryable
+          ? await store
+              .updateExecution({
+                executionId: intentId,
+                resumeRequired: null,
+                ifResumeRequiredFor: marker.humanTaskId,
+              })
+              .catch((metaErr) => {
+                if (metaErr?.name !== 'ConditionalCheckFailedException') {
+                  logger.error('Resume marker clear failed', metaErr);
+                }
+                return meta;
+              })
+          : meta;
+      if (retryable) {
+        return response(503, {
+          error: 'The durable callback could not be completed. Try again in a moment.',
+          code: 'durable_callback_resume_failed',
+          retryable: true,
+        });
+      }
+      return response(200, { intent: mapIntent(current ?? meta), resumed: resumed > 0 });
     }
 
     // POST /projects/{projectId}/intents/{intentId}/gates/{humanTaskId}/revise
@@ -2808,6 +3293,7 @@ export const handler = async (event, context) => {
           projectId,
           userId: sub,
           agentCli: selectedAgentCli,
+          runtimeCapabilities: meta.environment,
         });
         if (resolved.error) {
           return response(resolved.error.statusCode, resolved.error.body);
@@ -2855,15 +3341,9 @@ export const handler = async (event, context) => {
           effectiveGrid,
         );
         if (effectiveGrid) skipOverride = effectiveSkips;
-        const planCheck = await loadExecutionPlan({
-          ddb,
-          tableName: BLOCKS_TABLE(),
-          workflowId: meta.workflowId,
-          workflowVersion: meta.workflowVersion,
-          scope: meta.scope,
-          ...(effectiveSkips?.length ? { skipStageIds: effectiveSkips } : {}),
-          ...(effectiveGrid ? { composedGrid: effectiveGrid } : {}),
-          ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
+        const planCheck = await intentMethodology.loadPlan(meta, {
+          skipStageIds: effectiveSkips ?? null,
+          composedGrid: effectiveGrid ?? null,
         });
         if (!planCheck.valid) {
           return response(400, {
@@ -2877,6 +3357,8 @@ export const handler = async (event, context) => {
       }
       const sourceControlBlocked = await sourceControlLaunchGuard(meta, response);
       if (sourceControlBlocked) return sourceControlBlocked;
+      const mcpLaunch = await prepareMcpLaunch(g, meta);
+      if (mcpLaunch.error) return response(mcpLaunch.statusCode, mcpLaunch.error);
       // Flip <current> → CREATED (CAS on the observed status) so a double-start
       // can't launch two runs, then hand off to the orchestrator (init-ws + run the
       // plan). If the hand-off throws, roll back to the prior status — otherwise the
@@ -2903,6 +3385,7 @@ export const handler = async (event, context) => {
           startedBy: starter.sub,
           starterName: starter.displayName,
           starterEmail: starter.email,
+          ...mcpLaunch.update,
           ...(priorStatus === 'DRAFT'
             ? {
                 agentCli: selectedAgentCli,
@@ -2979,6 +3462,8 @@ export const handler = async (event, context) => {
         fromStatus: meta.status,
         startedAt: meta.startedAt,
         pendingHumanTaskId: null,
+        // A recorded answer whose callback failed is moot once the run ends.
+        resumeRequired: null,
         completedAt: new Date().toISOString(),
       });
       await store
@@ -3232,6 +3717,7 @@ export const handler = async (event, context) => {
           projectId,
           userId: sub,
           agentCli: requestedCli,
+          runtimeCapabilities: meta.environment,
         });
         if (resolved.error) {
           return response(resolved.error.statusCode, resolved.error.body);
@@ -3263,16 +3749,31 @@ export const handler = async (event, context) => {
       // no steering instructions) resolves without the LLM — unless the Admin
       // switch forces every compose through the composer agent.
       if (mode === 'front' && !instructions && (await fetchComposeLlmBypass()) === 'enabled') {
-        const scopeBlocks = await listMergedBlocks(ddb, BLOCKS_TABLE(), 'SCOPE').catch(() => []);
+        const scopeBlocks = meta.methodologyRelease
+          ? await loadReleaseClosure({
+              s3,
+              bucket: ARTIFACTS_BUCKET(),
+              methodologyRelease: meta.methodologyRelease,
+            })
+              .then((closure) =>
+                resolveMethodologyLibrary({
+                  closure,
+                  ddb,
+                  tableName: BLOCKS_TABLE(),
+                  workflowId: meta.workflowId,
+                  workflowVersion: meta.workflowVersion,
+                  methodologyPins: meta.methodologyPins,
+                }),
+              )
+              .then((resolved) => resolved.blocksByType.SCOPE ?? [])
+              .catch(() => [])
+          : await listMergedBlocks(ddb, BLOCKS_TABLE(), 'SCOPE').catch(() => []);
         const match = matchScopeByKeywords({ text: intentText, scopes: scopeBlocks });
         if (match) {
-          const planCheck = await loadExecutionPlan({
-            ddb,
-            tableName: BLOCKS_TABLE(),
-            workflowId: meta.workflowId,
-            workflowVersion: meta.workflowVersion,
+          const planCheck = await intentMethodology.loadPlan(meta, {
             scope: match.scopeId,
-            ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
+            skipStageIds: null,
+            composedGrid: null,
           });
           if (planCheck.valid) {
             const row = await store.createCompose({
@@ -3387,6 +3888,7 @@ export const handler = async (event, context) => {
           executionId: intentId,
           credentialBinding,
           agentCli: requestedCli,
+          runtimeCapabilities: meta.environment,
         });
         const res = await agentcore.send(
           new InvokeAgentRuntimeCommand({
@@ -3421,6 +3923,10 @@ export const handler = async (event, context) => {
                 ...(reportExcerpt ? { reportExcerpt } : {}),
                 ...(frozenGrid && Object.keys(frozenGrid).length ? { frozenGrid } : {}),
                 ...(progressContext ? { progressContext } : {}),
+                ...(meta.methodologyRelease ? { methodologyRelease: meta.methodologyRelease } : {}),
+                ...(meta.methodologyRelease && meta.methodologyPins
+                  ? { methodologyPins: meta.methodologyPins }
+                  : {}),
               }),
             ),
           }),
@@ -3538,12 +4044,7 @@ export const handler = async (event, context) => {
           patch.skipStageIds = effSkips;
         }
         if (!effGrid) {
-          const scopes = await loadWorkflowScopes({
-            ddb,
-            tableName: BLOCKS_TABLE(),
-            workflowId: meta.workflowId,
-            workflowVersion: meta.workflowVersion,
-          });
+          const scopes = await intentMethodology.loadScopes(meta);
           if (!scopes.includes(effScope)) {
             return response(400, {
               error: `Unknown scope "${effScope}" for workflow "${meta.workflowId}"`,
@@ -3551,15 +4052,10 @@ export const handler = async (event, context) => {
             });
           }
         }
-        const planCheck = await loadExecutionPlan({
-          ddb,
-          tableName: BLOCKS_TABLE(),
-          workflowId: meta.workflowId,
-          workflowVersion: meta.workflowVersion,
+        const planCheck = await intentMethodology.loadPlan(meta, {
           scope: effScope,
-          ...(effSkips?.length ? { skipStageIds: effSkips } : {}),
-          ...(effGrid ? { composedGrid: effGrid } : {}),
-          ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
+          skipStageIds: effSkips ?? null,
+          composedGrid: effGrid ?? null,
         });
         if (!planCheck.valid) {
           return response(400, {
@@ -3569,6 +4065,12 @@ export const handler = async (event, context) => {
         }
         patch.planWarnings = planCheck.warnings?.length ? planCheck.warnings : null;
       }
+      if (!Number.isSafeInteger(data.ifDraftRevision) || data.ifDraftRevision < 0) {
+        return response(428, {
+          error: 'Read the edit state before saving',
+          code: 'edit_precondition_required',
+        });
+      }
       let updated;
       try {
         updated = await store.updateExecution({
@@ -3576,11 +4078,15 @@ export const handler = async (event, context) => {
           // CAS on DRAFT so a concurrent Start can never race a header edit
           // into a launched run.
           fromStatus: 'DRAFT',
+          ifDraftRevision: data.ifDraftRevision,
           ...patch,
         });
       } catch (err) {
         if (err?.name === 'ConditionalCheckFailedException') {
-          return response(409, { error: 'Intent left DRAFT while editing — reload it' });
+          return response(409, {
+            error: 'Draft changed while saving — retry from the current document',
+            code: 'edit_conflict',
+          });
         }
         throw err;
       }
@@ -3602,6 +4108,7 @@ export const handler = async (event, context) => {
       const responder = getResponder(event);
       try {
         await deleteIntentCascade({
+          cleanupDeadline,
           g,
           store,
           ddb,
@@ -3673,6 +4180,7 @@ export const handler = async (event, context) => {
           executionId: intentId,
           credentialBinding: meta.credentialBinding,
           agentCli: meta.agentCli,
+          runtimeCapabilities: meta.environment,
         });
         const res = await agentcore.send(
           new InvokeAgentRuntimeCommand({
@@ -3800,18 +4308,7 @@ export const handler = async (event, context) => {
         return response(409, { error: 'No active lanes are available to repair' });
       }
 
-      const planResult = await loadExecutionPlan({
-        ddb,
-        tableName: BLOCKS_TABLE(),
-        workflowId: meta.workflowId,
-        workflowVersion: meta.workflowVersion,
-        scope: meta.scope,
-        ...(Array.isArray(meta.skipStageIds) && meta.skipStageIds.length
-          ? { skipStageIds: meta.skipStageIds }
-          : {}),
-        ...(meta.composedGrid ? { composedGrid: meta.composedGrid } : {}),
-        ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
-      });
+      const planResult = await intentMethodology.loadPlan(meta);
       if (!planResult.valid || !planResult.plan) {
         return response(409, {
           error: 'Execution plan cannot be resolved for repair',
@@ -3897,6 +4394,8 @@ export const handler = async (event, context) => {
         });
       }
 
+      const mcpLaunch = await prepareMcpLaunch(g, meta);
+      if (mcpLaunch.error) return response(mcpLaunch.statusCode, mcpLaunch.error);
       let priorDurableExecutionArn = meta.durableExecutionArn ?? null;
       if (!priorDurableExecutionArn && meta.durableExecutionName && ORCHESTRATOR_FN()) {
         const listed = await lambdaClient.send(
@@ -3916,6 +4415,7 @@ export const handler = async (event, context) => {
         fromStatus: meta.status,
         startedAt: meta.startedAt,
         pendingHumanTaskId: null,
+        resumeRequired: null,
         failureReason: 'lane_repair_in_progress',
         completedAt: null,
         orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
@@ -4098,6 +4598,7 @@ export const handler = async (event, context) => {
         orchestratorStartedAt: null,
         orchestratorExpiresAt: null,
         pendingHumanTaskId: null,
+        resumeRequired: null,
         failureReason: null,
         failure: null,
         completedAt: null,
@@ -4105,6 +4606,7 @@ export const handler = async (event, context) => {
         startedBy: responder.sub,
         starterName: responder.displayName,
         starterEmail: responder.email,
+        ...mcpLaunch.update,
       });
       try {
         const invoked = await invokeOrchestrator(
@@ -4183,16 +4685,7 @@ export const handler = async (event, context) => {
       const priorSkipIds = Array.isArray(meta.skipStageIds) ? meta.skipStageIds : [];
       const unskipping = priorSkipIds.includes(requestedFromStageId);
       const rewindSkipIds = priorSkipIds.filter((id) => id !== requestedFromStageId);
-      const planResult = await loadExecutionPlan({
-        ddb,
-        tableName: BLOCKS_TABLE(),
-        workflowId: meta.workflowId,
-        workflowVersion: meta.workflowVersion,
-        scope: meta.scope,
-        ...(rewindSkipIds.length ? { skipStageIds: rewindSkipIds } : {}),
-        ...(meta.composedGrid ? { composedGrid: meta.composedGrid } : {}),
-        ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
-      });
+      const planResult = await intentMethodology.loadPlan(meta, { skipStageIds: rewindSkipIds });
       if (!planResult.valid || !planResult.plan) {
         return response(409, {
           error: 'Execution plan cannot be resolved',
@@ -4307,6 +4800,8 @@ export const handler = async (event, context) => {
       const sourceControlBlocked = await sourceControlLaunchGuard(meta, response);
       if (sourceControlBlocked) return sourceControlBlocked;
 
+      const mcpLaunch = await prepareMcpLaunch(g, meta);
+      if (mcpLaunch.error) return response(mcpLaunch.statusCode, mcpLaunch.error);
       // Artifact history is a hard precondition for a restart. Snapshot before
       // META, gates, stage rows, lanes, or sessions are touched; a Neptune
       // failure leaves the run exactly where it was and no relaunch occurs.
@@ -4331,6 +4826,7 @@ export const handler = async (event, context) => {
         fromStatus: priorStatus,
         startedAt: meta.startedAt,
         pendingHumanTaskId: null,
+        resumeRequired: null,
         failureReason: 'rewind_in_progress',
         completedAt: null,
         orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
@@ -4434,6 +4930,7 @@ export const handler = async (event, context) => {
         orchestratorStartedAt: null,
         orchestratorExpiresAt: null,
         pendingHumanTaskId: null,
+        resumeRequired: null,
         failureReason: null,
         failure: null,
         completedAt: null,
@@ -4444,6 +4941,7 @@ export const handler = async (event, context) => {
         // Un-skip: the rewind target leaves the intent's skip overlay so the
         // relaunch (and every later plan recompute) actually runs it.
         ...(unskipping ? { skipStageIds: rewindSkipIds.length ? rewindSkipIds : null } : {}),
+        ...mcpLaunch.update,
       });
       try {
         const invoked = await invokeOrchestrator(
@@ -4569,15 +5067,8 @@ export const handler = async (event, context) => {
       // scheduled state — their membership can only change via rewind.
       const unitPlan = await store.getUnitPlan(intentId).catch(() => null);
       if (unitPlan) {
-        const currentPlanResult = await loadExecutionPlan({
-          ddb,
-          tableName: BLOCKS_TABLE(),
-          workflowId: meta.workflowId,
-          workflowVersion: meta.workflowVersion,
-          scope: meta.scope,
-          ...(priorSkipIds.length ? { skipStageIds: priorSkipIds } : {}),
-          ...(meta.composedGrid ? { composedGrid: meta.composedGrid } : {}),
-          ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
+        const currentPlanResult = await intentMethodology.loadPlan(meta, {
+          skipStageIds: priorSkipIds,
         });
         const currentSectionIds = new Set(
           (currentPlanResult.plan?.stages ?? [])
@@ -4602,15 +5093,10 @@ export const handler = async (event, context) => {
       // Strict resolution of the NEW projection (starved required inputs are
       // hard errors mid-run — a stage must never park waiting for an input
       // nothing will write).
-      const planResult = await loadExecutionPlan({
-        ddb,
-        tableName: BLOCKS_TABLE(),
-        workflowId: meta.workflowId,
-        workflowVersion: meta.workflowVersion,
+      const planResult = await intentMethodology.loadPlan(meta, {
         scope: newScope,
         composedGrid: newGrid,
-        ...(priorSkipIds.length ? { skipStageIds: priorSkipIds } : {}),
-        ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
+        skipStageIds: priorSkipIds,
         strict: true,
       });
       if (!planResult.valid || !planResult.plan) {
@@ -4636,6 +5122,8 @@ export const handler = async (event, context) => {
       const responder = getResponder(event);
       const sourceControlBlocked = await sourceControlLaunchGuard(meta, response);
       if (sourceControlBlocked) return sourceControlBlocked;
+      const mcpLaunch = await prepareMcpLaunch(g, meta);
+      if (mcpLaunch.error) return response(mcpLaunch.statusCode, mcpLaunch.error);
       // Reset the relaunch stage's non-terminal instances (a parked/failed
       // stage re-runs from scratch, attempt+1).
       const resetIds = (rowsByStageId.get(fromStage.stageId) ?? [])
@@ -4698,6 +5186,7 @@ export const handler = async (event, context) => {
         startedBy: responder.sub,
         starterName: responder.displayName,
         starterEmail: responder.email,
+        ...mcpLaunch.update,
       });
       try {
         const invoked = await invokeOrchestrator(
@@ -4731,6 +5220,22 @@ export const handler = async (event, context) => {
     }
 
     if (intentId && httpMethod === 'GET') {
+      // Lightweight preflight for autosaves: no graph projection or workflow reads.
+      // Membership was checked above; an artifact is always looked up within this intent.
+      if (event.queryStringParameters?.editState) {
+        const meta = await store.getExecution(intentId, { consistentRead: true });
+        if (!meta || meta.projectId !== projectId)
+          return response(404, { error: 'Intent not found' });
+        const requested = event.queryStringParameters.editState;
+        if (requested === 'draft')
+          return response(200, { draftRevision: meta.draftRevision ?? 0, status: meta.status });
+        const artifact = await fetchArtifactRow(g, intentId, requested);
+        if (!artifact) return response(404, { error: 'Artifact not found' });
+        return response(200, {
+          editRevision: artifact.editRevision,
+          collaborationEpoch: artifact.collaborationEpoch,
+        });
+      }
       // GET /projects/{projectId}/intents/{intentId}/graph — the intent's
       // Neptune knowledge subgraph (artifacts + typed relations + questions +
       // discussions + the project knowledge corpus) for the KnowledgeGraph
@@ -4802,7 +5307,17 @@ export const handler = async (event, context) => {
       }
       const artifacts = await fetchArtifacts(g, intentId);
       const pullRequests = await fetchPullRequests(g, intentId);
-      const gates = records.humanTasks.map(mapHumanTask);
+      const stagesByInstance = new Map(
+        (records.stages ?? []).map((stage) => [stage.stageInstanceId, stage]),
+      );
+      const gates = records.humanTasks.map((task) => ({
+        ...mapHumanTask(task),
+        resumeAvailable: resumeOwed({
+          meta: records.meta,
+          gate: task,
+          stageRow: stagesByInstance.get(task.stageInstanceId) ?? null,
+        }),
+      }));
       const answerEvents = await buildGateAnswerEvents(g, gates);
       const priceFor = await getPriceResolver();
       return response(200, {
@@ -4821,6 +5336,11 @@ export const handler = async (event, context) => {
             actor: e.actor ?? null,
             summary: e.summary ?? null,
             timestamp: e.timestamp,
+            // A WHITELIST of `detail` fields the timeline renders — never the
+            // whole object, which carries verbatim agent text and internal ids.
+            // Today: the dissent round counters, so the feed can say "round 1/2"
+            // instead of an unqualified "Maintained dissent".
+            ...timelineEventDetail(e.detail),
           })),
           ...answerEvents,
         ].toSorted((a, b) => String(a.timestamp).localeCompare(String(b.timestamp))),
@@ -4925,7 +5445,7 @@ export const handler = async (event, context) => {
       // Pin the workflow version now (reproducibility) — project pin wins, else
       // resolve the workflow's current latest version.
       const workflowId = cfg.workflowId;
-      const workflowVersion = cfg.workflowVersion ?? (await resolveWorkflowVersion(workflowId));
+      let workflowVersion = cfg.workflowVersion ?? (await resolveWorkflowVersion(workflowId));
       if (!workflowVersion) {
         return response(400, { error: `Workflow "${workflowId}" has no published version` });
       }
@@ -4945,6 +5465,70 @@ export const handler = async (event, context) => {
       if (composedGridError) {
         return response(400, { error: composedGridError });
       }
+      // Per-intent release selection. The registry is the
+      // ONLY selection gate; it is consulted here and nowhere in the execution
+      // path, so demoting a release never changes what an existing intent runs.
+      //
+      // The flag is the hard boundary. While it is off no registry row is read
+      // at all, so an unpinned create stays byte-identical to its pre-#482 form.
+      // A non-string value is a client bug, not an opt-out: silently ignoring it
+      // would create the intent on the stable channel (or unpinned) while the
+      // caller believes it asked for a specific release.
+      if (
+        Object.hasOwn(data, 'methodologyReleaseId') &&
+        data.methodologyReleaseId !== null &&
+        typeof data.methodologyReleaseId !== 'string'
+      ) {
+        return response(400, {
+          error: 'methodologyReleaseId must be a string or null',
+          code: 'release_selection_invalid',
+        });
+      }
+      const requestedReleaseId =
+        typeof data.methodologyReleaseId === 'string' && data.methodologyReleaseId
+          ? data.methodologyReleaseId
+          : null;
+      if (requestedReleaseId && AIDLC_RELEASE_PINNING() !== 'on') {
+        return response(400, {
+          error: 'Per-intent AI-DLC release selection is disabled',
+          code: 'release_selection_disabled',
+        });
+      }
+      let selectedRelease = null;
+      if (AIDLC_RELEASE_PINNING() === 'on') {
+        try {
+          // A null id falls back to the stable channel; an unset stable channel
+          // returns null, which keeps today's derive-the-pin-from-the-ref path.
+          selectedRelease = await resolveSelectableRelease({
+            ddb,
+            tableName: BLOCKS_TABLE(),
+            releaseId: requestedReleaseId,
+          });
+        } catch (error) {
+          // Never substitute a different release than the one requested.
+          if (isReleaseRegistryError(error)) {
+            return response(400, { error: error.message, code: error.code });
+          }
+          throw error;
+        }
+      }
+      let selectedReleasePin = selectedRelease ? releasePinFromRecord(selectedRelease) : null;
+      // Allowed, but loud: the intent pins a closure an older importer produced,
+      // so it misses every field later mappers learned until an admin upgrades
+      // the record (PATCH /aidlc-releases/{releaseId} {importerRevision}).
+      if (selectedRelease?.importerStale === true) {
+        logger.warn('AI-DLC release selected for a new intent has a stale importer closure', {
+          releaseId: selectedRelease.releaseId,
+          importerRevision: selectedRelease.importerRevision,
+          currentImporterRevision: AIDLC_RELEASE_IMPORTER_REVISION,
+        });
+      }
+      // Every create-time resolution (scope vocabulary AND the plan check) runs
+      // against the selected release, so an intent is validated against exactly
+      // the methodology it will run rather than the current SYSTEM catalog.
+      let selectedReleaseOptions = selectedReleasePin
+        ? { methodologyRelease: selectedReleasePin, s3, bucket: ARTIFACTS_BUCKET() }
+        : {};
       let scope = data.scope;
       if (!composedGrid) {
         const scopes = await loadWorkflowScopes({
@@ -4952,6 +5536,7 @@ export const handler = async (event, context) => {
           tableName: BLOCKS_TABLE(),
           workflowId,
           workflowVersion,
+          ...selectedReleaseOptions,
         });
         if (!scope) {
           scope = scopes.includes('feature') ? 'feature' : (scopes[0] ?? null);
@@ -4989,6 +5574,24 @@ export const handler = async (event, context) => {
       // overlay entry the grid already excludes would otherwise fail the
       // resolver's skip_stage_not_in_scope guard on every later recompute.
       const skipStageIds = pruneSkipsForGrid(rawSkipStageIds, composedGrid);
+      if (selectedReleasePin) {
+        // Capture the current user forks before release mode replaces the
+        // mutable SYSTEM library with the immutable closure. SYSTEM coordinates
+        // are intentionally discarded; only user-tenant versions can overlay it.
+        const currentPlan = await loadExecutionPlan({
+          ddb,
+          tableName: BLOCKS_TABLE(),
+          workflowId,
+          workflowVersion,
+          scope,
+          ...(skipStageIds ? { skipStageIds } : {}),
+          ...(composedGrid ? { composedGrid } : {}),
+        });
+        const methodologyPins = await snapshotUserMethodologyPins(currentPlan.methodologyPins);
+        if (methodologyPins) {
+          selectedReleaseOptions = { ...selectedReleaseOptions, methodologyPins };
+        }
+      }
       // Resolve the full execution plan NOW, before any row is written. The
       // plan is a pure function of (workflow@pinnedVersion, scope, skip
       // overlay), so a pass here holds for the whole intent lifetime — this
@@ -4998,7 +5601,7 @@ export const handler = async (event, context) => {
       // Non-fatal `warnings` (scope-shortcut degradations: inputs whose
       // producer is out of scope, sections downgraded to once-per-workflow)
       // are persisted on the intent so the UI can surface the degraded run.
-      const planCheck = await loadExecutionPlan({
+      let planCheck = await loadExecutionPlan({
         ddb,
         tableName: BLOCKS_TABLE(),
         workflowId,
@@ -5006,7 +5609,56 @@ export const handler = async (event, context) => {
         scope,
         ...(skipStageIds ? { skipStageIds } : {}),
         ...(composedGrid ? { composedGrid } : {}),
+        ...selectedReleaseOptions,
       });
+      // A stable channel is an implicit default, so an overlay it cannot apply
+      // must degrade the way the no-channel path degrades rather than blocking
+      // every create in the space: the intent continues as if no channel were
+      // set, so it may still auto-pin the deployment-ref release below. An
+      // explicitly requested release stays strict. The base release is
+      // verified first, so a corrupt closure is never mistaken for an
+      // incompatible user fork.
+      let skippedStableReleaseId = null;
+      if (
+        !planCheck.valid &&
+        selectedReleasePin &&
+        !requestedReleaseId &&
+        selectedReleaseOptions.methodologyPins
+      ) {
+        const baseReleasePlan = await loadExecutionPlan({
+          ddb,
+          tableName: BLOCKS_TABLE(),
+          workflowId,
+          workflowVersion,
+          scope,
+          ...(skipStageIds ? { skipStageIds } : {}),
+          ...(composedGrid ? { composedGrid } : {}),
+          methodologyRelease: selectedReleasePin,
+          s3,
+          bucket: ARTIFACTS_BUCKET(),
+        });
+        if (baseReleasePlan.valid) {
+          logger.warn(
+            'Stable AI-DLC release is incompatible with the user overlay; falling back to the deployment ref',
+            {
+              releaseId: selectedReleasePin.releaseId,
+              errors: planCheck.errors ?? [],
+            },
+          );
+          skippedStableReleaseId = selectedReleasePin.releaseId;
+          selectedReleasePin = null;
+          selectedReleaseOptions = {};
+          planCheck = await loadExecutionPlan({
+            ddb,
+            tableName: BLOCKS_TABLE(),
+            workflowId,
+            workflowVersion,
+            scope,
+            ...(skipStageIds ? { skipStageIds } : {}),
+            ...(composedGrid ? { composedGrid } : {}),
+          });
+        }
+      }
       if (!planCheck.valid) {
         return response(400, {
           error: composedGrid
@@ -5017,9 +5669,13 @@ export const handler = async (event, context) => {
           errors: planCheck.errors ?? [],
         });
       }
+      workflowVersion = planCheck.workflowVersion ?? workflowVersion;
       const planWarnings = planCheck.warnings?.length ? planCheck.warnings : null;
       let aidlcRepoRef = null;
-      if (AIDLC_REPO_REF()) {
+      // A selected release IS the source of truth for the ref, so the network
+      // lookup of the deployment ref is skipped: resolving an unrelated ref
+      // could 503 a create that does not depend on it.
+      if (!selectedReleasePin && AIDLC_REPO_REF()) {
         try {
           aidlcRepoRef = await resolveAidlcRepoRef(AIDLC_REPO_REF());
         } catch (error) {
@@ -5036,6 +5692,214 @@ export const handler = async (event, context) => {
         });
       }
       aidlcRepoRef = planCheck.methodologySourceRefs?.[0] ?? aidlcRepoRef;
+      // Issue #482: bind the intent to the immutable release published for the
+      // resolved SHA, so a later SYSTEM reseed cannot change what it runs. A
+      // ref with no published manifest is NOT an error — the intent stays on
+      // the legacy DynamoDB path exactly as before.
+      let methodologyRelease = null;
+      // The pin set to persist. In release mode it is recomputed from the
+      // release-mode plan, so it never carries the SYSTEM-tenant pins the
+      // DynamoDB resolver produces (see v2-workflow-plan.js).
+      let methodologyPins = planCheck.methodologyPins;
+      if (selectedReleasePin) {
+        // An explicitly selected (or stable-channel) release. Its SHA
+        // is the intent's ref, and the pin is stamped from the registry record
+        // the plan was just validated against.
+        methodologyRelease = selectedReleasePin;
+        aidlcRepoRef = selectedRelease.sourceSha;
+      } else if (AIDLC_RELEASE_PINNING() === 'on' && aidlcRepoRef && ARTIFACTS_BUCKET()) {
+        // The registry decides eligibility, so it is asked first. The manifest is
+        // read only once a row exists: the role has no s3:ListBucket, so a GET
+        // for a ref that was never imported answers 403 AccessDenied, which is
+        // indistinguishable from a real permissions failure.
+        let eligibleRelease = null;
+        let ineligibleCode = null;
+        try {
+          const deploymentProfile = profileFor(aidlcRepoRef);
+          if (deploymentProfile?.upstreamRef === aidlcRepoRef) {
+            // A published closure is evidence, not authorization. Only pin it
+            // when the registry has explicitly made this exact closure visible
+            // and selectable and its recorded authored behavior is still
+            // honoured by this runtime.
+            eligibleRelease = await resolveSelectableRelease({
+              ddb,
+              tableName: BLOCKS_TABLE(),
+              releaseId: deploymentProfile.releaseId,
+            });
+            await assertReleaseCapabilitiesHonoured({
+              release: eligibleRelease,
+              s3,
+              bucket: ARTIFACTS_BUCKET(),
+            });
+          }
+        } catch (error) {
+          // Only a genuine "not registered / not eligible" answer may fall back
+          // to an unpinned intent. A throttled registry read or an unverifiable
+          // capability record means the lookup could not be completed, and
+          // downgrading that to "does not exist" would silently unpin intents.
+          if (!isAutoPinIneligible(error)) {
+            logger.error('AI-DLC release lookup failed', error, { aidlcRepoRef });
+            return response(503, {
+              error: 'The published AI-DLC release could not be resolved',
+              code: 'release_resolution_failed',
+            });
+          }
+          ineligibleCode = error.code;
+          eligibleRelease = null;
+        }
+        if (eligibleRelease) {
+          try {
+            // The manifest is addressed by this runtime's importer revision. After
+            // a revision bump the eligible row still describes the previous
+            // revision until the release is re-imported, and the new-revision
+            // manifest does not exist yet (a 403 without s3:ListBucket). That is
+            // the same half-finished re-import as a closure mismatch below, so it
+            // is detected from the row alone, before S3 is touched.
+            if (Number(eligibleRelease.importerRevision) !== AIDLC_RELEASE_IMPORTER_REVISION) {
+              throw new ReleaseRegistryError(
+                'release_registry_skew',
+                'The eligible registry row was imported under a different importer revision',
+                {
+                  details: {
+                    releaseId: eligibleRelease.releaseId,
+                    fields: ['importerRevision'],
+                    registeredImporterRevision: eligibleRelease.importerRevision,
+                    currentImporterRevision: AIDLC_RELEASE_IMPORTER_REVISION,
+                  },
+                },
+              );
+            }
+            const manifest = await readReleaseManifest({
+              s3,
+              bucket: ARTIFACTS_BUCKET(),
+              sha: aidlcRepoRef,
+              importerRevision: AIDLC_RELEASE_IMPORTER_REVISION,
+            });
+            if (!manifest) {
+              throw new ReleaseRegistryError(
+                'release_not_published',
+                `The registered release ${eligibleRelease.releaseId} has no published manifest`,
+              );
+            }
+            // AUTO-PIN. Everything above was validated against the SYSTEM
+            // DynamoDB library, which is NOT what a pinned intent will run.
+            // Re-resolve the scope vocabulary and the plan against the closure
+            // before committing to the pin: if the release cannot reproduce
+            // them, the intent is created UNPINNED (today's behaviour) rather
+            // than stamped with a pin that would fail on its first run. A 201
+            // followed by a permanent 409 at execution time is the one outcome
+            // this path must never produce.
+            const candidatePin = methodologyReleasePinFromManifest(manifest);
+            const registeredPin = releasePinFromRecord(eligibleRelease);
+            const skewedFields = Object.keys(candidatePin).filter(
+              (key) => candidatePin[key] !== registeredPin[key],
+            );
+            if (skewedFields.length > 0) {
+              throw new ReleaseRegistryError(
+                'release_registry_skew',
+                'The deployment-ref closure does not match its eligible registry row',
+                { details: { releaseId: eligibleRelease.releaseId, fields: skewedFields } },
+              );
+            }
+            // Scope discovery maps a permanent resolution failure to an empty
+            // vocabulary, so read the closure first: without this an unreadable
+            // closure is indistinguishable from an incompatible scope.
+            await loadReleaseClosure({
+              s3,
+              bucket: ARTIFACTS_BUCKET(),
+              methodologyRelease: candidatePin,
+            });
+            const candidateMethodologyPins = await snapshotUserMethodologyPins(
+              planCheck.methodologyPins,
+            );
+            const candidateOptions = {
+              methodologyRelease: candidatePin,
+              s3,
+              bucket: ARTIFACTS_BUCKET(),
+              ...(candidateMethodologyPins ? { methodologyPins: candidateMethodologyPins } : {}),
+            };
+            const releaseScopes = composedGrid
+              ? null
+              : await loadWorkflowScopes({
+                  ddb,
+                  tableName: BLOCKS_TABLE(),
+                  workflowId,
+                  workflowVersion,
+                  ...candidateOptions,
+                });
+            const releasePlan =
+              releaseScopes && !releaseScopes.includes(scope)
+                ? { valid: false, errors: [{ code: 'scope_not_in_release', scope }] }
+                : await loadExecutionPlan({
+                    ddb,
+                    tableName: BLOCKS_TABLE(),
+                    workflowId,
+                    workflowVersion,
+                    scope,
+                    ...(skipStageIds ? { skipStageIds } : {}),
+                    ...(composedGrid ? { composedGrid } : {}),
+                    ...candidateOptions,
+                  });
+            if (releasePlan.valid) {
+              methodologyRelease = candidatePin;
+              methodologyPins = releasePlan.methodologyPins;
+              workflowVersion = releasePlan.workflowVersion ?? workflowVersion;
+              if (skippedStableReleaseId) {
+                logger.info(
+                  'Stable AI-DLC release was skipped; intent auto-pinned to the deployment-ref release',
+                  { releaseId: candidatePin.releaseId, skippedReleaseId: skippedStableReleaseId },
+                );
+              }
+            } else if (
+              (releasePlan.errors ?? []).some((error) =>
+                String(error.code ?? '').startsWith('release_'),
+              )
+            ) {
+              return response(503, {
+                error: 'The published AI-DLC release could not be verified',
+                code: 'release_resolution_failed',
+              });
+            } else {
+              logger.warn(
+                'The published AI-DLC release cannot reproduce this plan; intent stays unpinned',
+                {
+                  aidlcRepoRef,
+                  releaseId: manifest.releaseId,
+                  scope,
+                  errors: releasePlan.errors ?? [],
+                },
+              );
+            }
+          } catch (error) {
+            // A row and a manifest that describe different closures of the same
+            // release, or a row at another importer revision, mean a re-import
+            // under a new importer revision is only half done. Both closures are readable, so this is not an integrity
+            // failure: the intent stays unpinned until the registry catches up.
+            if (isReleaseRegistryError(error) && error.code === 'release_registry_skew') {
+              logger.warn(
+                'Deployment-ref AI-DLC release does not match its registry row; intent stays unpinned',
+                { aidlcRepoRef, code: error.code, ...error.details },
+              );
+            } else {
+              // Otherwise the registry says this closure is eligible, so any
+              // failure to read or verify it (a denied or corrupt manifest, a
+              // missing catalog) is an integrity problem, never a reason to
+              // quietly unpin the intent.
+              logger.error('AI-DLC release lookup failed', error, { aidlcRepoRef });
+              return response(503, {
+                error: 'The published AI-DLC release could not be resolved',
+                code: 'release_resolution_failed',
+              });
+            }
+          }
+        } else {
+          logger.warn('No eligible AI-DLC release for the resolved ref; intent stays unpinned', {
+            aidlcRepoRef,
+            importerRevision: AIDLC_RELEASE_IMPORTER_REVISION,
+            code: ineligibleCode,
+          });
+        }
+      }
       // Optional per-repo base-branch override (see validateBaseBranches) —
       // validated against THIS intent's repo set before anything is written.
       const { value: baseBranches, error: baseBranchesError } = validateBaseBranches(
@@ -5085,6 +5949,20 @@ export const handler = async (event, context) => {
         }
         throw error;
       }
+      // Refuse a strategy the space's providers cannot honour now, before the
+      // execution exists, rather than failing its first unit lane later.
+      const prStrategy = effectivePrStrategy(await fetchPlatformPrStrategy(), cfg.prStrategy);
+      try {
+        assertPrStrategySupported(
+          prStrategy,
+          (cfg.repos ?? []).map((repo) =>
+            sharedRepoProvider(repo, cfg.gitProvider, cfg.repoProviders),
+          ),
+        );
+      } catch (error) {
+        if (error.code !== 'PR_STRATEGY_UNSUPPORTED') throw error;
+        return response(409, { error: error.message, code: error.code });
+      }
       const meta = await store.createExecution({
         executionId: newIntentId,
         projectId,
@@ -5094,7 +5972,8 @@ export const handler = async (event, context) => {
         workflowId,
         workflowVersion,
         aidlcRepoRef,
-        methodologyPins: planCheck.methodologyPins,
+        methodologyPins,
+        methodologyRelease,
         scope,
         startedBy: sub,
         title: data.title || null,
@@ -5113,7 +5992,7 @@ export const handler = async (event, context) => {
         deriveEnrichment: await fetchDeriveEnrichment(),
         parkReleaseSeconds: cfg.parkReleaseSeconds,
         maxParallelUnits: cfg.maxParallelUnits,
-        prStrategy: effectivePrStrategy(await fetchPlatformPrStrategy(), cfg.prStrategy),
+        prStrategy,
         stageSkipping,
         skipStageIds,
         composedGrid,
@@ -5125,6 +6004,11 @@ export const handler = async (event, context) => {
 
     return response(405, { error: 'Method not allowed' });
   } catch (error) {
+    if (error?.code === 'YJS_CLEANUP_PENDING')
+      return response(409, {
+        error: 'Collaboration cleanup is in progress. Retry deletion shortly.',
+        code: 'deletion_pending',
+      });
     // Bind the caught exception and log it with request context. Prior form
     // was `catch {}` + a static `console.error('intents handler error')`, so
     // every 500 in CloudWatch was an identical opaque string with no stack
@@ -5303,6 +6187,7 @@ const repairExpiredDurableExecution = async ({
     completedAt: new Date().toISOString(),
     failureReason,
     pendingHumanTaskId: null,
+    resumeRequired: null,
     ...(meta?.orchestratorRunId ? { ifOrchestratorRunId: meta.orchestratorRunId } : {}),
   });
   await store
@@ -5692,6 +6577,25 @@ const summarizeExecutionMetrics = (metrics = [], stages = [], priceFor) => {
   };
 };
 
+// Whether a recorded answer still needs its durable callback re-sent. The gate
+// must hold an answer whose callback was never consumed, the run must be live
+// (RUNNING or WAITING: not finished, cancelled, failed, or relaunching after a
+// rewind), and the run must still be parked on that gate: either META points
+// at it (an engine gate or a once-per-workflow question) or the stage that
+// asked it is WAITING_FOR_HUMAN on it (a unit-lane question parks only its own
+// stage, while META stays RUNNING for the sibling lanes).
+const resumeOwed = ({ meta, gate, stageRow = null }) =>
+  Boolean(
+    gate &&
+    isHumanTaskAnswerStatus(gate.status) &&
+    gate.callbackId &&
+    !gate.callbackConsumedAt &&
+    ['RUNNING', 'WAITING'].includes(meta?.status) &&
+    (meta.pendingHumanTaskId === gate.humanTaskId ||
+      (stageRow?.state === 'WAITING_FOR_HUMAN' &&
+        stageRow.pendingHumanTaskId === gate.humanTaskId)),
+  );
+
 const mapHumanTask = (h) => ({
   humanTaskId: h.humanTaskId,
   stageInstanceId: h.stageInstanceId ?? null,
@@ -5699,10 +6603,29 @@ const mapHumanTask = (h) => ({
   sectionIndex: h.sectionIndex ?? null,
   kind: h.kind,
   status: h.status,
+  resumeAvailable:
+    isHumanTaskAnswerStatus(h.status) && Boolean(h.callbackId) && !h.callbackConsumedAt,
   prompt: h.prompt ?? null,
   options: h.options ?? null,
   skipTargets: h.skipTargets ?? null,
   recomposeTargets: h.recomposeTargets ?? null,
+  findings: h.findings ?? null,
+  // The learnings ritual rides this gate: the review UI offers the
+  // optional "anything to add for next time?" field only when the flag is set.
+  // Absent (not false) on every gate that does not run it, so the UI's own
+  // default decides rather than a value the backend never computed.
+  ...('learningsRitual' in h ? { learningsRitual: h.learningsRitual ?? false } : {}),
+  // The stage a `loop-back` answer sends the run back to. Absent
+  // (not null) on every gate that does not offer the option, so the review panel
+  // renders no third button rather than one with an empty target.
+  ...('loopBackTarget' in h ? { loopBackTarget: h.loopBackTarget ?? null } : {}),
+  // The agent's reason, the offer rule's outcome, and that outcome in one
+  // sentence. Present whenever the agent recommended a loop-back, INCLUDING the
+  // outcomes that offer no option — those are the ones the reviewer was shown
+  // nothing about. Absent (not null) on every other gate.
+  ...('loopBackReason' in h ? { loopBackReason: h.loopBackReason ?? null } : {}),
+  ...('loopBackStatus' in h ? { loopBackStatus: h.loopBackStatus ?? null } : {}),
+  ...('loopBackNote' in h ? { loopBackNote: h.loopBackNote ?? null } : {}),
   // The computed next stage a plain approve continues to (upstream 2.2.6):
   // string = stageId, null = approving completes the workflow. Omitted (not
   // null) on legacy rows / gates where it was never computed, so the UI can

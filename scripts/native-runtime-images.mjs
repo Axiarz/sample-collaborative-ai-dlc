@@ -84,7 +84,10 @@ export const requiredPins = (rows) => {
 const present = async (ecr, repository, digest) => {
   try {
     const result = await ecr.send(
-      new DescribeImagesCommand({ repositoryName: repository, imageIds: [{ imageDigest: digest }] }),
+      new DescribeImagesCommand({
+        repositoryName: repository,
+        imageIds: [{ imageDigest: digest }],
+      }),
     );
     return (result.imageDetails ?? []).some((image) => image.imageDigest === digest);
   } catch (error) {
@@ -100,7 +103,9 @@ const referenced = async ({ table, repository }) => {
   const pins = requiredPins(await executionRows(ddb, table));
   for (const pin of pins) pin.presentInEcr = await present(ecr, repository, pin.digest);
   const missing = pins.filter((pin) => !pin.presentInEcr);
-  console.log(JSON.stringify({ checkedAt: new Date().toISOString(), pins, missing: missing.length }, null, 2));
+  console.log(
+    JSON.stringify({ checkedAt: new Date().toISOString(), pins, missing: missing.length }, null, 2),
+  );
   if (missing.length) process.exit(1);
 };
 

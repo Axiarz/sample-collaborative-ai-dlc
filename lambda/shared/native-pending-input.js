@@ -135,7 +135,10 @@ const normalizeSpec = (spec) => {
       multiSelect: entry.multiSelect === undefined ? false : entry.multiSelect,
       options: Array.isArray(entry.options)
         ? entry.options.map((option) => {
-            if (!object(option) || Object.keys(option).some((k) => !['label', 'description'].includes(k)))
+            if (
+              !object(option) ||
+              Object.keys(option).some((k) => !['label', 'description'].includes(k))
+            )
               fail();
             return {
               label:
@@ -169,7 +172,9 @@ export const buildNativePendingInput = ({ gate = null, spec = null, messagesText
       questions = normalizeSpec(spec);
       if (
         questions.some((entry) =>
-          entry.options?.some?.((option) => typeof option.label !== 'string' || !messagesText.includes(option.label)),
+          entry.options?.some?.(
+            (option) => typeof option.label !== 'string' || !messagesText.includes(option.label),
+          ),
         )
       )
         questions = null;
@@ -182,7 +187,8 @@ export const buildNativePendingInput = ({ gate = null, spec = null, messagesText
     const extra = (rendered?.options ?? []).filter(
       (option) =>
         !NATIVE_GATE_LABELS.includes(option.label) &&
-        (GATE_OPTIONAL_LABELS.has(option.label) || /^Add [A-Za-z0-9][A-Za-z0-9 -]{0,80}$/.test(option.label)),
+        (GATE_OPTIONAL_LABELS.has(option.label) ||
+          /^Add [A-Za-z0-9][A-Za-z0-9 -]{0,80}$/.test(option.label)),
     );
     const described = (label) =>
       rendered?.options.find((option) => option.label === label)?.description ?? null;
@@ -196,7 +202,8 @@ export const buildNativePendingInput = ({ gate = null, spec = null, messagesText
           {
             id: 'q1',
             prompt:
-              (useRendered && rendered?.prompt) || `The ${gate.stage} stage is waiting for approval.`,
+              (useRendered && rendered?.prompt) ||
+              `The ${gate.stage} stage is waiting for approval.`,
             header: (useRendered && rendered?.header) || 'Approval',
             multiSelect: false,
             options: [
@@ -258,7 +265,8 @@ export const nativeSelection = (pendingInput, selection) => {
       )
         fail();
       const freeText = answer.freeText === undefined ? undefined : answer.freeText;
-      if (freeText !== undefined && !prose(freeText, NATIVE_PENDING_INPUT_LIMITS.freeTextChars)) fail();
+      if (freeText !== undefined && !prose(freeText, NATIVE_PENDING_INPUT_LIMITS.freeTextChars))
+        fail();
       if (!selected.length && freeText === undefined) fail();
       return {
         selectedOptions: [...selected].sort((a, b) => a - b),

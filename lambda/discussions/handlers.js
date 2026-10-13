@@ -11,8 +11,11 @@ import { resolveNativeAwareIntentProject } from '../shared/native-realtime-owner
 import { nativeCollaborationScope, nativeIntentChannel } from '../shared/native-realtime.js';
 import { fetchMembershipRole } from '../shared/trackers.js';
 import { credentialProviderForCli } from '../shared/agent-credentials.js';
-import { resolveEffectiveCredentialBindingsViaBroker } from '../shared/agent-credential-metadata.js';
-import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js';
+import {
+  resolveSelectedAgentCredential,
+  executionCredentialBinding,
+  prepareAgentInvocation,
+} from '../shared/agent-credential-service.js';
 import { executionMetaKey } from '../shared/v2-process-keys.js';
 import { ddb, ssm, query, cardinality, TextP, __, locksTable } from './clients.js';
 import {
@@ -115,7 +118,17 @@ export const issueRealtimeToken = async (event, res) => {
     // Intent realtime token: the route is project-scoped; verify the intent
     // belongs to the project when the Intent vertex exists (post-Start).
     let native = false;
-    projectId = await resolveNativeAwareIntentProject({ onNative: () => { native = true; }, ddb, nativeTable: process.env.NATIVE_RUNTIME_BINDINGS_TABLE, processTable: process.env.V2_PROCESS_TABLE, projectId: pathProjectId, intentId, platformProject: () => query((g) => fetchProjectIdForIntent(g, intentId)) });
+    projectId = await resolveNativeAwareIntentProject({
+      onNative: () => {
+        native = true;
+      },
+      ddb,
+      nativeTable: process.env.NATIVE_RUNTIME_BINDINGS_TABLE,
+      processTable: process.env.V2_PROCESS_TABLE,
+      projectId: pathProjectId,
+      intentId,
+      platformProject: () => query((g) => fetchProjectIdForIntent(g, intentId)),
+    });
     if (!projectId) return res(404, { error: 'Intent not found' });
     // Keep in step with the deployed intents token route (lambda/intents).
     const identity = { projectId, executionId: intentId };
@@ -690,25 +703,30 @@ export const assistDiscussion = async (event, res) => {
         }
         return {
           requestedCli: pinnedCli,
-          credentialBinding: execution.credentialBinding ?? { provider, source: 'platform' },
+          credentialBinding: executionCredentialBinding(
+            { ...execution, agentCli: pinnedCli },
+            auth.projectId,
+          ),
+          runtimeCapabilities: execution.environment,
         };
       }
     }
     if (!credentialProvider) {
       return { requestedCli: null, credentialBinding: null };
     }
-    const bindings = await resolveEffectiveCredentialBindingsViaBroker({
+    const selected = await resolveSelectedAgentCredential({
       projectId: auth.projectId,
       userId: caller.sub,
+      agentCli: requestedCli,
+      runtimeCapabilities: execution?.environment,
     });
-    const binding = bindings[credentialProvider];
-    if (binding) return { requestedCli, credentialBinding: binding };
-    throw Object.assign(
-      new Error(
-        `No ${credentialProvider === 'kiro' ? 'Kiro' : 'Bedrock'} credential is available for this CLI`,
-      ),
-      { code: 'agent_credential_required' },
-    );
+    if (selected.error)
+      throw Object.assign(new Error(selected.error.body.error), { code: selected.error.body.code });
+    return {
+      requestedCli,
+      credentialBinding: selected.credentialBinding,
+      runtimeCapabilities: execution?.environment,
+    };
   };
 
   const messageId = assistMessageIdFor(requestId);
@@ -740,16 +758,21 @@ export const assistDiscussion = async (event, res) => {
 
   const invokeAssist = async () => {
     try {
-      const { requestedCli: effectiveRequestedCli, credentialBinding } =
-        await resolveCredentialContext();
-      const agentCredentialGrant = credentialBinding
-        ? await issueAgentCredentialGrant(ssm, {
-            purpose: 'discussion',
-            projectId: auth.projectId,
-            executionId: scope.rootId,
-            bindings: [credentialBinding],
-          })
-        : null;
+      const {
+        requestedCli: effectiveRequestedCli,
+        credentialBinding,
+        runtimeCapabilities,
+      } = await resolveCredentialContext();
+      const { agentCredentialGrant } = await prepareAgentInvocation(
+        {
+          purpose: 'discussion',
+          projectId: auth.projectId,
+          executionId: scope.rootId,
+          credentialBinding,
+          runtimeCapabilities,
+        },
+        { ssm },
+      );
       // Native: only the verified selected revision travels to Quorum. A thread
       // whose revision can no longer be verified fails visibly; it never falls
       // back to the latest file, the projection graph or the native runtime.
@@ -770,7 +793,9 @@ export const assistDiscussion = async (event, res) => {
             );
           } catch (err) {
             if (err?.code !== 'NATIVE_ARTIFACT_REVISION_INVALID') throw err;
-            return await failMessage('Reason: The discussed artifact revision could not be verified.');
+            return await failMessage(
+              'Reason: The discussed artifact revision could not be verified.',
+            );
           }
         }
         // The run's own verified model pin, so Quorum on the run's harness CLI

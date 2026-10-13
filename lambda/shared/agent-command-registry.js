@@ -9,6 +9,7 @@ export const AGENT_AUTH_MODES = Object.freeze({
   COMPOSE: 'compose',
   DISCUSSION: 'discussion',
   NATIVE_PROBE: 'native-probe',
+  VERIFY_CONNECTION: 'verify-connection',
 });
 
 const command = (handler, agentAuth = false) => Object.freeze({ handler, agentAuth });
@@ -21,6 +22,7 @@ export const COMMANDS = Object.freeze({
   'derive-artifacts': command('deriveArtifacts', AGENT_AUTH_MODES.EXECUTION),
   'create-workflow-checkpoint': command('createWorkflowCheckpoint'),
   'record-pr': command('recordPr'),
+  'record-learning': command('recordLearning'),
   'record-unit-pr': command('recordUnitPr'),
   'init-lane': command('initLane'),
   'merge-lane': command('mergeLane'),
@@ -37,6 +39,7 @@ export const COMMANDS = Object.freeze({
   'managed-runtime-check': command('managedRuntimeCheck'),
   'native-interaction-probe': command('nativeInteractionProbe', AGENT_AUTH_MODES.NATIVE_PROBE),
   'verify-mcp': command('verifyMcp'),
+  'verify-connection': command('verifyConnection', AGENT_AUTH_MODES.VERIFY_CONNECTION),
 });
 
 export const commandDefinition = (name) =>

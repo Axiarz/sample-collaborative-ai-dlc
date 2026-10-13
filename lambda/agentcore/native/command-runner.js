@@ -227,7 +227,10 @@ export const runNativeCommand = async (options) => {
         // its observer's persistence backpressure before the cleanup deadline.
         if (drainingPressure !== pressure) {
           drainingPressure = pressure;
-          Promise.resolve(pressure).then(cleanup, () => { result.spawnError ??= 'IO_ERROR'; cleanup(); });
+          Promise.resolve(pressure).then(cleanup, () => {
+            result.spawnError ??= 'IO_ERROR';
+            cleanup();
+          });
         }
         return;
       }

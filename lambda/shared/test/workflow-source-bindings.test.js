@@ -73,6 +73,7 @@ describe('separate workflow source bindings', () => {
   });
 
   it.each([
+    // secretlint-disable-next-line @secretlint/secretlint-rule-basicauth -- synthetic rejection fixture
     ['github', 'https://user:token@github.com/acme/workflows'],
     ['github', 'acme/sub/workflows'],
     ['bitbucket', 'acme/sub/workflows'],

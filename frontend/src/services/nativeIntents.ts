@@ -1,4 +1,8 @@
-import { canonicalJson, nativePendingInput, type NativePendingInput } from '@/lib/nativePendingInput';
+import {
+  canonicalJson,
+  nativePendingInput,
+  type NativePendingInput,
+} from '@/lib/nativePendingInput';
 import type { StructuredAnswer } from './questions';
 import { api } from './api';
 import type { WorkflowPackageHarness } from './workflowSources';
@@ -340,7 +344,15 @@ function execution(value: unknown): NativeExecution | null {
   }
   return {
     status: value.status as NativeExecution['status'],
-    ...(value.imageStatus !== undefined ? { imageStatus: ['current','retained','revoked','unapproved','unavailable'].includes(String(value.imageStatus)) ? value.imageStatus as NativeExecution['imageStatus'] : 'unavailable' as const } : {}),
+    ...(value.imageStatus !== undefined
+      ? {
+          imageStatus: ['current', 'retained', 'revoked', 'unapproved', 'unavailable'].includes(
+            String(value.imageStatus),
+          )
+            ? (value.imageStatus as NativeExecution['imageStatus'])
+            : ('unavailable' as const),
+        }
+      : {}),
     attemptId: value.attemptId,
     epoch: Number(value.epoch),
     startedAt: value.startedAt,
@@ -627,10 +639,28 @@ const itemPath = (projectId: string, intentId: string) =>
   `${path(projectId)}/${encodeURIComponent(intentId)}`;
 
 export const nativeIntentsService = {
-  async outputs(projectId: string, intentId: string, afterSeq = 0): Promise<{outputs: IntentOutput[]; nextAfter: number | null}> {
-    const value = await api.get<{outputs: IntentOutput[]; nextAfter: number | null}>(`${path(projectId)}/${encodeURIComponent(intentId)}/outputs?afterSeq=${afterSeq}`);
-    if (!record(value) || !Array.isArray(value.outputs) || value.outputs.some(row => !record(row) || !Number.isSafeInteger(row.seq) || row.seq <= afterSeq || typeof row.content !== 'string') ||
-      (value.nextAfter !== null && (!Number.isSafeInteger(value.nextAfter) || value.nextAfter <= afterSeq))) throw new Error('Invalid native output history');
+  async outputs(
+    projectId: string,
+    intentId: string,
+    afterSeq = 0,
+  ): Promise<{ outputs: IntentOutput[]; nextAfter: number | null }> {
+    const value = await api.get<{ outputs: IntentOutput[]; nextAfter: number | null }>(
+      `${path(projectId)}/${encodeURIComponent(intentId)}/outputs?afterSeq=${afterSeq}`,
+    );
+    if (
+      !record(value) ||
+      !Array.isArray(value.outputs) ||
+      value.outputs.some(
+        (row) =>
+          !record(row) ||
+          !Number.isSafeInteger(row.seq) ||
+          row.seq <= afterSeq ||
+          typeof row.content !== 'string',
+      ) ||
+      (value.nextAfter !== null &&
+        (!Number.isSafeInteger(value.nextAfter) || value.nextAfter <= afterSeq))
+    )
+      throw new Error('Invalid native output history');
     return value;
   },
   async list(projectId: string, cursor: string | null = null): Promise<NativeIntentPage> {

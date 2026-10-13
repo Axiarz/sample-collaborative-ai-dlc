@@ -389,7 +389,13 @@ describe('task-3 structured question contract', () => {
     Array.isArray(value)
       ? `[${value.map(canonical).join(',')}]`
       : value && typeof value === 'object'
-        ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(',')}}`
+        ? `{${Object.keys(value)
+            .sort()
+            .map(
+              (key) =>
+                `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`,
+            )
+            .join(',')}}`
         : JSON.stringify(value);
   const v2 = {
     ...interaction,
@@ -398,7 +404,9 @@ describe('task-3 structured question contract', () => {
   };
   it('verifies the digest over messages and the exact presented options', async () => {
     get.mockResolvedValue(v2);
-    expect((await nativeIntentsService.interaction('project-1', 'run-1')).pendingInput).toEqual(pendingInput);
+    expect((await nativeIntentsService.interaction('project-1', 'run-1')).pendingInput).toEqual(
+      pendingInput,
+    );
   });
   it('rejects options changed after the digest was computed', async () => {
     const tampered = structuredClone(v2);
@@ -409,11 +417,30 @@ describe('task-3 structured question contract', () => {
   it('sends the selection alongside its exact label text', async () => {
     post.mockResolvedValue({
       executionAvailable: true,
-      execution: { status: 'DISPATCHING', attemptId: 'attempt-1', epoch: 1, startedAt: '2026-09-29T11:50:00Z', updatedAt: '2026-09-29T12:00:00Z', model: 'm', repository: { provider: 'github', repository: 'o/r', branch: 'main', commit: 'abc' }, publicationId: 'pub-1', interactionId: interaction.id, turnSequence: 2, responsePending: true },
+      execution: {
+        status: 'DISPATCHING',
+        attemptId: 'attempt-1',
+        epoch: 1,
+        startedAt: '2026-09-29T11:50:00Z',
+        updatedAt: '2026-09-29T12:00:00Z',
+        model: 'm',
+        repository: { provider: 'github', repository: 'o/r', branch: 'main', commit: 'abc' },
+        publicationId: 'pub-1',
+        interactionId: interaction.id,
+        turnSequence: 2,
+        responsePending: true,
+      },
       response: { ...response, text: 'Approve' },
     });
     const selection = { answers: [{ selectedOptions: [0] }] };
-    await nativeIntentsService.respond('project-1', 'run-1', { ...request, contentSha256: v2.contentSha256, text: 'Approve', selection }).catch(() => undefined);
+    await nativeIntentsService
+      .respond('project-1', 'run-1', {
+        ...request,
+        contentSha256: v2.contentSha256,
+        text: 'Approve',
+        selection,
+      })
+      .catch(() => undefined);
     expect(post).toHaveBeenCalledWith('/projects/project-1/native-intents/run-1/response', {
       requestId: request.requestId,
       interactionId: interaction.id,

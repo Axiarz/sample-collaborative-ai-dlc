@@ -107,6 +107,9 @@ export const api = {
     return response.json();
   },
 
+  // `body` is optional so existing body-less callers keep their exact
+  // behaviour; DELETE routes with a CAS payload (e.g. clearing an AI-DLC
+  // release channel with { expectedRevision }) pass it explicitly.
   async delete(path: string, body?: unknown): Promise<void> {
     await fetchWithAuth(path, {
       method: 'DELETE',

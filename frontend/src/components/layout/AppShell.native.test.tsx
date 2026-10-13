@@ -14,9 +14,17 @@ const state = vi.hoisted(() => ({
 }));
 // Shared drafts: in-memory Yjs relay + textarea stand-in (see test/collaborationFakes).
 vi.mock('@/hooks/useYjsDocument', async () => await import('@/test/collaborationFakes'));
-vi.mock('@/components/CollaborativeTextarea', async () => await import('@/test/collaborationFakes'));
+vi.mock(
+  '@/components/CollaborativeTextarea',
+  async () => await import('@/test/collaborationFakes'),
+);
 vi.mock('@/services/intents', () => ({ intentsService: { get: state.get } }));
-vi.mock('@/services/nativeIntents', () => ({ nativeIntentsService: { get: state.nativeGet, outputs: async () => ({outputs:[],nextAfter:null}) } }));
+vi.mock('@/services/nativeIntents', () => ({
+  nativeIntentsService: {
+    get: state.nativeGet,
+    outputs: async () => ({ outputs: [], nextAfter: null }),
+  },
+}));
 vi.mock('@/services/workflows', () => ({
   workflowsService: { compiled: state.compiled, get: async () => ({ phases: [] }) },
 }));
@@ -46,7 +54,11 @@ vi.mock('@/components/layout/AppHeader', () => ({
     const context = useIntentOptional();
     return (
       <header>
-        {context?.executionBackend === 'native' ? 'Native context' : context ? context.detail?.intent.title || 'Loading platform' : 'No platform context'}
+        {context?.executionBackend === 'native'
+          ? 'Native context'
+          : context
+            ? context.detail?.intent.title || 'Loading platform'
+            : 'No platform context'}
       </header>
     );
   },
@@ -59,7 +71,11 @@ vi.mock('@/components/layout/ActivityPanel', () => ({
   ActivityPanel: () => <p>Legacy activity</p>,
 }));
 vi.mock('@/components/layout/IntentActivityPanel', () => ({
-  IntentActivityPanel: () => <p>{useIntentOptional()?.executionBackend === 'native' ? 'Native activity' : 'Platform activity'}</p>,
+  IntentActivityPanel: () => (
+    <p>
+      {useIntentOptional()?.executionBackend === 'native' ? 'Native activity' : 'Platform activity'}
+    </p>
+  ),
 }));
 vi.mock('@/hooks/useProjectsCache', () => ({ useProjectSprintsCache: () => ({ sprints: [] }) }));
 vi.mock('@/hooks/useMediaQuery', () => ({ useMediaQuery: () => true }));

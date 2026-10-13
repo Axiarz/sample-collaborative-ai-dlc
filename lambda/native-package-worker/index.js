@@ -20,7 +20,7 @@ import { gitConnectionIdentity } from '../shared/git-connection-identity.js';
 import { WorkflowSourceError } from '../shared/workflow-source-bindings.js';
 import { createNativePackageIntake } from '../shared/native-package-intake.js';
 import { createNativePackageArchive } from '../shared/native-package-archive.js';
-import { loadNativePackage } from '../agentcore/native/package-loader.js';
+import { loadNativePackage } from '../shared/native-package-loader.js';
 import { createNativePackageWorker, NativePackageWorkerError } from './worker.js';
 
 const clientOptions = {
