@@ -8,14 +8,14 @@ The goal is a PR that preserves working behavior and is well designed, understan
 
 Read the relevant documentation, surrounding implementation, callers, and tests before editing or reviewing. Documentation describes intended behavior; code, package scripts, and CI show what is implemented and checked. Investigate discrepancies instead of assuming either side is correct.
 
-| Start here                                                                         | Purpose                                                                       |
-| ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md)                         | Product overview, setup, contribution process                                 |
-| [Architecture](docs/concepts/architecture.md)                                      | Request path, agent runtime, authentication, infrastructure                   |
-| [Execution](docs/concepts/execution.md), [data model](docs/concepts/data-model.md) | Lifecycle, ownership of state, scheduling, artifacts, delivery                |
-| [Workflows and blocks](docs/concepts/workflows-and-blocks.md)                      | Versioning, scope selection, sensors, reviewers, human gates                  |
-| [Testing](docs/development/testing.md)                                             | Deterministic tests and manual integration/E2E procedures                     |
-| [User guides](docs/using-the-platform/)                                            | Expected user behavior for the feature being changed                          |
+| Start here                                                                         | Purpose                                                        |
+| ---------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md)                         | Product overview, setup, contribution process                  |
+| [Architecture](docs/concepts/architecture.md)                                      | Request path, agent runtime, authentication, infrastructure    |
+| [Execution](docs/concepts/execution.md), [data model](docs/concepts/data-model.md) | Lifecycle, ownership of state, scheduling, artifacts, delivery |
+| [Workflows and blocks](docs/concepts/workflows-and-blocks.md)                      | Versioning, scope selection, sensors, reviewers, human gates   |
+| [Testing](docs/development/testing.md)                                             | Deterministic tests and manual integration/E2E procedures      |
+| [User guides](docs/using-the-platform/)                                            | Expected user behavior for the feature being changed           |
 
 ## Project map
 
@@ -111,4 +111,3 @@ Each finding should contain:
 Order findings by severity and combine duplicates with the same root cause. Exclude formatting, naming preferences, minor code rearrangements, and speculative future requirements unless they cause a demonstrated problem. A maintainability finding must explain the concrete ongoing cost.
 
 Return a short behavior/design summary, actionable findings, validation performed and remaining gaps, and an overall assessment of whether changes are needed. If no material issues are found, say so explicitly; include any limits on that conclusion. Keep optional suggestions clearly separate from required fixes.
-
