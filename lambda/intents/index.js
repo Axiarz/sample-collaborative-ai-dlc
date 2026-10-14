@@ -37,7 +37,7 @@ import {
   resolveEnvironmentSnapshot,
 } from '../shared/environment-snapshot.js';
 import { runtimeTargetInput } from '../shared/runtime-target.js';
-import { createProcessStore } from '../shared/v2-process-store.js';
+import { createProcessStore, isTransactionConflict } from '../shared/v2-process-store.js';
 import { isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
 import { deleteIntentCascade, IntentRunningError } from '../shared/intent-deletion.js';
 import { buildResponse } from '../shared/response.js';
@@ -1284,7 +1284,11 @@ const normalizeSource = (raw, trackers) => {
 
 // ── DTO assembly ──
 
-const CREDENTIAL_FAILURE_CODES = ['credential_unavailable', 'credential_invalid'];
+const CREDENTIAL_FAILURE_CODES = [
+  'credential_unavailable',
+  'credential_invalid',
+  'credential_quota_exhausted',
+];
 
 // New execution rows persist a structured failure. Older rows only have the
 // concatenated failureReason string, so normalize those once at the API
@@ -2823,22 +2827,36 @@ export const handler = async (event, context) => {
         answer: data.answer ?? null,
         answeredBy: responder.sub,
         answeredByName: responder.displayName,
+        ifOrchestratorRunId: gate.orchestratorRunId ?? null,
+        ifStageCallbackId: gate.stageCallbackId ?? null,
+        stageInstanceId: gate.stageInstanceId ?? null,
       };
-      const answerResult = steeringMessage
-        ? await store.answerHumanTaskWithSteering({
-            ...answerInput,
-            steering: {
-              kind: 'gate-steer',
-              message: steeringMessage,
-              targetGateId: humanTaskId,
-              createdBy: responder.sub,
-              createdByName: responder.displayName,
-            },
-          })
-        : await store.answerHumanTask(answerInput);
-      const answered = steeringMessage
-        ? answerResult && { ...gate, ...answerResult.answered }
-        : answerResult;
+      let answerResult;
+      try {
+        answerResult = steeringMessage
+          ? await store.answerHumanTaskWithSteering({
+              ...answerInput,
+              steering: {
+                kind: 'gate-steer',
+                message: steeringMessage,
+                targetGateId: humanTaskId,
+                createdBy: responder.sub,
+                createdByName: responder.displayName,
+              },
+            })
+          : await store.answerHumanTask(answerInput);
+      } catch (error) {
+        // The answer transaction also checks META, which running workers write
+        // constantly. A conflict that outlasts the store's retries committed
+        // nothing, so the same answer can simply be sent again.
+        if (!isTransactionConflict(error)) throw error;
+        return response(409, {
+          error: 'The intent was busy saving other changes. Send the answer again.',
+          code: 'gate_answer_conflict',
+          retryable: true,
+        });
+      }
+      const answered = steeringMessage ? answerResult?.answered : answerResult;
       if (!answered) {
         return response(409, { error: 'Gate already answered or not pending' });
       }
@@ -2876,14 +2894,16 @@ export const handler = async (event, context) => {
       // older sibling gate just records the durable Q&A — the run is parked on a
       // different callback. SendDurableExecutionCallbackSuccess resumes the
       // EXISTING execution; a fresh Invoke would start a new one.
-      if (gate.callbackId) {
+      // Binding can finish after the initial GET. ALL_NEW from the answer CAS
+      // is the authoritative callback owner at the instant the answer commits.
+      if (answered.callbackId) {
         try {
-          await resumeDurableCallback(gate.callbackId, answered.answer);
+          await resumeDurableCallback(answered.callbackId, answered.answer);
           await (
             store.markGateCallbackConsumed?.({
               executionId: intentId,
               humanTaskId,
-              callbackId: gate.callbackId,
+              callbackId: answered.callbackId,
             }) ?? Promise.resolve()
           ).catch((markErr) =>
             logger.error('Gate callback consumption marker write failed', markErr),
@@ -2921,7 +2941,7 @@ export const handler = async (event, context) => {
               executionId: intentId,
               resumeRequired: {
                 humanTaskId,
-                callbackId: gate.callbackId,
+                callbackId: answered.callbackId,
                 answeredAt: answered.answeredAt ?? null,
               },
             })
