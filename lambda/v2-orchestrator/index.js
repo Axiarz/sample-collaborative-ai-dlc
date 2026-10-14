@@ -66,6 +66,7 @@ import {
 } from '../shared/stage-loopback.js';
 import { broadcastToIntentChannel } from '../shared/ws-fanout.js';
 import { resolveRuntimeTarget } from '../shared/runtime-target.js';
+import { activePlanUnits, skeletonProblem } from '../shared/unit-completion.js';
 import {
   awaitEngineGate,
   parseChoice,
@@ -398,9 +399,14 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
     return { ok: false, reason: 'not_a_start' };
   }
 
-  const meta = await ctx.step('load-meta', () =>
-    store.getExecution(executionId, { consistentRead: true }),
-  );
+  const meta = await ctx.step('load-meta', async () => {
+    const loaded = await store.getExecution(executionId, {
+      consistentRead: true,
+    });
+    // Version behavior in the existing first checkpoint. Old histories have no
+    // marker and retain their operation sequence; repair creates a new history.
+    return loaded ? { ...loaded, completionPolicyVersion: 1 } : null;
+  });
   if (!meta) return { ok: false, reason: 'execution_not_found' };
   const runtimeTarget = resolveRuntimeTarget(meta, RUNTIME_ARN());
   const stopIntentSession = (sessionId) => stopSession(sessionId, runtimeTarget);
@@ -1121,6 +1127,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
       publishCheckpoint,
       ids: { projectId, intentId, executionId },
       runId: null, // stamped below once minted
+      completionPolicyVersion: meta.completionPolicyVersion ?? 0,
       intentBranch: meta.branch,
       cloneBase: {
         repos: meta.repos ?? [],
@@ -1517,7 +1524,9 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
                       sectionIndex: fanoutSection.index,
                       unitPlan: unitPlanForGate,
                       sectionStages: fanoutSection.stages,
-                      skeleton: defaultSkeletonFor(unitPlanForGate),
+                      skeleton: defaultSkeletonFor(unitPlanForGate, {
+                        legacy: !meta.completionPolicyVersion,
+                      }),
                     }),
                   ]
                 : []),
@@ -1890,12 +1899,26 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
                   });
                   const effective = {
                     walkingSkeleton:
-                      overrides.walkingSkeleton ?? defaultSkeletonFor(unitPlanForGate),
+                      overrides.walkingSkeleton ??
+                      defaultSkeletonFor(unitPlanForGate, {
+                        legacy: !meta.completionPolicyVersion,
+                      }),
                     skipMatrix: overrides.skipMatrix ?? unitPlanForGate.skipMatrix ?? {},
                   };
+                  const problem = skeletonProblem(
+                    unitPlanForGate,
+                    effective.walkingSkeleton,
+                    fanoutSection.stages,
+                  );
+                  if (meta.completionPolicyVersion && problem) return { ...effective, problem };
                   try {
-                    await store.updateUnitPlanDecisions({ executionId, ...effective });
-                  } catch {
+                    await store.updateUnitPlanDecisions({
+                      executionId,
+                      ...effective,
+                      ...(meta.completionPolicyVersion ? { ifOrchestratorRunId: runId } : {}),
+                    });
+                  } catch (error) {
+                    if (meta.completionPolicyVersion) throw error;
                     /* promotion defaults stand when the patch write is lost */
                   }
                   if (overrides.rejected.length) {
@@ -1913,6 +1936,8 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
                   return effective;
                 },
               );
+              if (decisions.problem)
+                return await fail('invalid_walking_skeleton', decisions.problem);
               await emitEvent(
                 ctx,
                 `fanout-approved-${stage.stageId}-${round}`,
@@ -2597,15 +2622,17 @@ const openIntentPrs = async ({
   // rows, or a pre-WP3 run, just omits the section).
   let unitLines = [];
   try {
-    const units = (await store.listUnits?.(executionId)) ?? [];
+    const allUnits = (await store.listUnits?.(executionId)) ?? [];
+    const unitPlan = await store.getUnitPlan?.(executionId);
+    const units = unitPlan ? activePlanUnits(unitPlan, allUnits) : allUnits;
     const unmerged = units.filter((u) => u.state && u.state !== 'MERGED');
     if (units.length) {
       unitLines = [
         '',
-        `Units: ${units.length} total, ${units.length - unmerged.length} merged.`,
+        `Units: ${units.length} total, ${units.length - unmerged.length} integrated into the intent branch.`,
         ...unmerged.map(
           (u) =>
-            `- ⚠️ unit \`${u.slug}\` NOT merged (${u.state}${u.failureReason ? `: ${u.failureReason}` : ''}) — its branch is preserved`,
+            `- ⚠️ unit \`${u.slug}\` NOT integrated (${u.state}${u.failureReason ? `: ${u.failureReason}` : ''}) — its branch is preserved`,
         ),
       ];
     }

@@ -31,3 +31,49 @@ Storage must accept a write to persist FAILED state. During a complete outage th
 worker preserves its structured failure, while durable dispatch and callback
 reconciliation remain the recovery backstop. These guards protect process state;
 they do not undo provider requests or Git operations already in flight.
+
+## Incomplete terminal sections
+
+Lane repair also supports a terminal execution whose active plan contains
+unfinished work. Ordinary rewind resets all affected unit rows, including
+integrated lanes; use the reviewed **Preview recovery** flow when that code must
+be preserved.
+
+`POST .../intents/{intentId}/repair` with `{"preview":true}` is read-only. The
+owner/admin preview loads the pinned workflow, identifies one incomplete section,
+lists preserved and unfinished units and downstream shared stages to rerun, and
+checks recorded final PRs with the provider. A closed/merged final PR blocks this
+recovery. Confirmation sends the preview token and, when necessary, an explicitly
+selected dependency-free `walkingSkeleton`. A changed preview returns 409.
+
+Retirement compares the prior status, run token and update timestamp. Stage
+resets, unit updates and replacement skeleton decisions check the recovery run
+token in the same DynamoDB transaction as the write. A concurrent confirmation
+cannot relaunch a second run. Rewind/recompose cannot steal that retirement
+token. Interrupted cleanup leaves recoverable FAILED state; review a fresh
+preview before retrying. Integrated unit rows and their completed stages are
+never reset by this flow. Missing/unstarted lanes may resume from the section
+boundary; completed stages of unfinished lanes are preserved.
+
+New human skips persist a per-unit `completionSkip` receipt tied to the unit-plan
+identity and answered gate. Original events and answers remain immutable.
+Legacy skips without receipts are shown as accepted partial delivery when the
+current run's answered halt gate records that choice; they are not silently
+reinterpreted as false success.
+
+## Deployment and durable compatibility
+
+Deploy the orchestrator, intents API, AgentCore image and frontend together.
+The first existing `load-meta` step captures `completionPolicyVersion: 1` for new
+histories. A pre-change checkpoint lacks that marker and retains its previous
+operation sequence. The frozen load-meta replay fixture covers this boundary.
+Changing a Lambda alias does not rewrite a finished version-pinned execution or
+repair its stored success.
+
+Recovery launches a new durable history through the configured orchestrator
+target. The original methodology, credential binding, repositories, model
+choices and runtime ARN/endpoint remain pinned. Before approving production
+recovery, verify that this launch target and the captured runtime endpoint serve
+the fixed release. Do not change execution pins or patch DynamoDB rows to force
+the new behavior. Starting the recovery and deploying the release are separate
+operator actions.

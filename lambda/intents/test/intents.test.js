@@ -6413,13 +6413,228 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
       .next();
   };
 
-  const repair = (sub, projectId, intentId) =>
+  const repair = (sub, projectId, intentId, input = {}) =>
     handler({
       httpMethod: 'POST',
       path: `/projects/${projectId}/intents/${intentId}/repair`,
       pathParameters: { projectId, intentId },
+      body: JSON.stringify(input),
       ...claims(sub),
     });
+
+  const falseSuccess = async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedSectionPlan();
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    await seedIntentAnchor(intent.id);
+    setStatus(intent.id, {
+      status: 'SUCCEEDED',
+      orchestratorRunId: 'finished-run',
+      branch: 'aidlc/feature',
+    });
+    seedStageRow(intent.id, 'units-gen');
+    seedStageRow(intent.id, 'cg', 'foundation', 'SUCCEEDED', 1);
+    seedStageRow(intent.id, 'bt');
+    const pk = `EXEC#${intent.id}`;
+    procStore.set(keyOf(pk, 'UNITPLAN'), {
+      pk,
+      sk: 'UNITPLAN',
+      executionId: intent.id,
+      units: [
+        { slug: 'foundation', dependsOn: [] },
+        { slug: 'feature', dependsOn: ['foundation'] },
+      ],
+      batches: [['foundation'], ['feature']],
+      walkingSkeleton: 'feature',
+      autonomyMode: 'autonomous',
+    });
+    for (const [slug, state] of [
+      ['foundation', 'MERGED'],
+      ['feature', 'BLOCKED'],
+      ['old-plan-unit', 'PENDING'],
+    ]) {
+      procStore.set(keyOf(pk, `UNIT#S1#${slug}`), {
+        pk,
+        sk: `UNIT#S1#${slug}`,
+        type: 'Unit',
+        executionId: intent.id,
+        sectionIndex: 1,
+        slug,
+        state,
+        branch: `aidlc/feature--${slug}`,
+      });
+    }
+    await g
+      .addV('PullRequest')
+      .property('id', `pr-${intent.id}`)
+      .property('repository', 'owner/repo')
+      .property('pr_number', 533)
+      .property('pr_url', 'https://github.com/owner/repo/pull/533')
+      .property('branch', 'aidlc/feature')
+      .addE('HAS_PR')
+      .from_(gremlin.process.statics.V().has('Intent', 'id', intent.id))
+      .next();
+    sourceControlOperationHandler = (request) =>
+      request.operation === 'pr-status' ? { state: 'open', sourceBranch: 'aidlc/feature' } : null;
+    return { sub, projectId, intent, pk };
+  };
+
+  it('previews and recovers terminal incomplete work without resetting integration or historical rows', async () => {
+    const { sub, projectId, intent, pk } = await falseSuccess();
+    const before = structuredClone([...procStore.entries()]);
+    const previewResponse = await repair(sub, projectId, intent.id, { preview: true });
+    expect(previewResponse.statusCode).toBe(200);
+    const { preview } = JSON.parse(previewResponse.body);
+    expect(preview).toMatchObject({
+      kind: 'incomplete-section',
+      laneSlugs: ['feature'],
+      preservedSlugs: ['foundation'],
+      rerunSharedStages: ['bt'],
+      skeletonCandidates: ['foundation'],
+      pullRequests: [{ number: 533 }],
+    });
+    expect([...procStore.entries()]).toEqual(before);
+    expect(orchestratorInvokes()).toHaveLength(0);
+    expect(lambdaMock.commandCalls(StopDurableExecutionCommand)).toHaveLength(0);
+    const res = await repair(sub, projectId, intent.id, {
+      previewToken: preview.previewToken,
+      walkingSkeleton: 'foundation',
+    });
+    expect(res.statusCode).toBe(202);
+    expect(procStore.get(keyOf(pk, 'UNIT#S1#foundation')).state).toBe('MERGED');
+    expect(procStore.get(keyOf(pk, 'UNIT#S1#feature'))).toMatchObject({
+      state: 'PENDING',
+      recoveryPreserveCompleted: true,
+    });
+    expect(procStore.get(keyOf(pk, 'UNIT#S1#old-plan-unit')).state).toBe('PENDING');
+    expect(procStore.get(keyOf(pk, `STAGE#${siOf('cg', 'foundation', 1)}`))).toMatchObject({
+      state: 'SUCCEEDED',
+      attempt: 0,
+    });
+    expect(procStore.get(keyOf(pk, `STAGE#${siOf('bt')}`))).toMatchObject({
+      state: 'PENDING',
+      attempt: 1,
+    });
+    expect(procStore.get(keyOf(pk, 'UNITPLAN'))).toMatchObject({
+      walkingSkeleton: 'foundation',
+      autonomyMode: null,
+    });
+    expect(orchestratorInvokes()).toHaveLength(1);
+    expect(
+      (await repair(sub, projectId, intent.id, { previewToken: preview.previewToken })).statusCode,
+    ).toBe(409);
+    expect(orchestratorInvokes()).toHaveLength(1);
+  });
+
+  it('rejects stale previews and dependent selections before changing terminal work', async () => {
+    const { sub, projectId, intent, pk } = await falseSuccess();
+    const { preview } = JSON.parse(
+      (await repair(sub, projectId, intent.id, { preview: true })).body,
+    );
+    expect(
+      (
+        await repair(sub, projectId, intent.id, {
+          previewToken: preview.previewToken,
+          walkingSkeleton: 'feature',
+        })
+      ).statusCode,
+    ).toBe(400);
+    procStore.get(keyOf(pk, 'UNITPLAN')).autonomyMode = 'gated';
+    expect(
+      (
+        await repair(sub, projectId, intent.id, {
+          previewToken: preview.previewToken,
+          walkingSkeleton: 'foundation',
+        })
+      ).statusCode,
+    ).toBe(409);
+    expect(procStore.get(keyOf(pk, 'META')).status).toBe('SUCCEEDED');
+    expect(orchestratorInvokes()).toHaveLength(0);
+  });
+
+  it('admits only one concurrent recovery confirmation', async () => {
+    const { sub, projectId, intent } = await falseSuccess();
+    const { preview } = JSON.parse(
+      (await repair(sub, projectId, intent.id, { preview: true })).body,
+    );
+    const input = { previewToken: preview.previewToken, walkingSkeleton: 'foundation' };
+    const results = await Promise.all([
+      repair(sub, projectId, intent.id, input),
+      repair(sub, projectId, intent.id, input),
+    ]);
+    expect(results.map((result) => result.statusCode).sort()).toEqual([202, 409]);
+    expect(orchestratorInvokes()).toHaveLength(1);
+  });
+
+  it('ordinary rewind explicitly clears a prior omission without changing the answered gate', async () => {
+    const { sub, projectId, intent, pk } = await falseSuccess();
+    procStore.get(keyOf(pk, 'UNIT#S1#feature')).completionSkip = {
+      humanTaskId: 'old-halt',
+      planIdentity: 'old-plan',
+    };
+    seedGate(intent.id, 'old-halt', { status: 'answered' });
+    procStore.get(keyOf(pk, 'HUMAN#old-halt')).answer = { decision: 'skip' };
+    const result = await handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intent.id}/rewind`,
+      pathParameters: { projectId, intentId: intent.id },
+      body: JSON.stringify({ fromStageId: 'cg' }),
+      ...claims(sub),
+    });
+    expect(result.statusCode).toBe(202);
+    expect(procStore.get(keyOf(pk, 'UNIT#S1#feature'))).toMatchObject({
+      state: 'PENDING',
+      completionSkip: null,
+    });
+    expect(procStore.get(keyOf(pk, 'HUMAN#old-halt'))).toMatchObject({
+      status: 'answered',
+      answer: { decision: 'skip' },
+    });
+  });
+
+  it('offers a fresh preview after interrupted cleanup while preserving the integrated unit', async () => {
+    const { sub, projectId, intent, pk } = await falseSuccess();
+    const { preview } = JSON.parse(
+      (await repair(sub, projectId, intent.id, { preview: true })).body,
+    );
+    archiveArtifactsSpy.mockRejectedValueOnce(new Error('temporary archive failure'));
+    const first = await repair(sub, projectId, intent.id, {
+      previewToken: preview.previewToken,
+      walkingSkeleton: 'foundation',
+    });
+    expect(first.statusCode).toBe(502);
+    expect(procStore.get(keyOf(pk, 'META'))).toMatchObject({
+      status: 'FAILED',
+      failureReason: 'lane_repair_failed',
+    });
+    expect(procStore.get(keyOf(pk, 'UNIT#S1#foundation')).state).toBe('MERGED');
+    expect(orchestratorInvokes()).toHaveLength(0);
+    const next = JSON.parse(
+      (await repair(sub, projectId, intent.id, { preview: true })).body,
+    ).preview;
+    expect(next.previewToken).not.toBe(preview.previewToken);
+    expect(
+      (
+        await repair(sub, projectId, intent.id, {
+          previewToken: next.previewToken,
+          walkingSkeleton: 'foundation',
+        })
+      ).statusCode,
+    ).toBe(202);
+    expect(orchestratorInvokes()).toHaveLength(1);
+  });
+
+  it('refuses a closed or merged final PR and enforces owner access for preview and recovery', async () => {
+    const { sub, projectId, intent } = await falseSuccess();
+    sourceControlOperationHandler = () => ({ state: 'merged', sourceBranch: 'aidlc/feature' });
+    expect((await repair(sub, projectId, intent.id, { preview: true })).statusCode).toBe(409);
+    const member = `member-${randomUUID()}`;
+    await addProjectMember(projectId, member, 'member');
+    expect((await repair(member, projectId, intent.id, { preview: true })).statusCode).toBe(403);
+    expect((await repair(member, projectId, intent.id)).statusCode).toBe(403);
+    expect(orchestratorInvokes()).toHaveLength(0);
+  });
 
   it('repairs orphaned parallel waits while preserving merged units', async () => {
     const sub = `u-${randomUUID()}`;

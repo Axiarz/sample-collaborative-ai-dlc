@@ -56,7 +56,8 @@ Rotating a secret does not refresh those configurations.
 | `resume_store_expired`                                                             | Automatic conversation recovery is outside its supported window. Export or use a reviewed stage retry.                                                                                                                                   |
 | `resume_state_unavailable` or `unit_plan_unavailable`                              | A storage read failed. Restore storage availability before retrying; do not treat this as an absent session or missing unit.                                                                                                             |
 | `unit_not_found`                                                                   | Have an operator reconcile the approved dependency DAG with the stored promoted unit plan and lane records before retrying the affected lane. Do not invent a replacement unit or blindly rename existing units.                         |
-| **Parallel execution needs recovery**                                              | An owner or admin can use **Repair execution** for the detected orphaned waits or recoverable PR reviews. This preserves completed stages and merged units where provider reconciliation confirms their state.                           |
+| **Parallel execution needs recovery**                                              | An owner or admin can use **Preview recovery** for detected orphaned waits or recoverable PR reviews. This preserves completed stages and integrated units where provider reconciliation confirms their state.                           |
+| **Current plan has unfinished work**                                               | A previously successful run still has unresolved units. Use **Preview recovery**, not ordinary stage rewind, to preserve integrated units and continue the active plan.                                                                  |
 | `gate_callback_conflict`                                                           | A genuine conflicting callback must not be overwritten. Preserve the error and have an operator inspect the gate and current run owner. The engine handles an answer that wins the bind race without stealing a callback.                |
 
 Repair has deliberately narrower eligibility than a generic restart. It requires
@@ -74,3 +75,31 @@ failure, current stage and gate IDs, credential source (never its secret value),
 and the relevant timeline entries. Compare the execution's current run owner,
 stage/session metadata, gate status and approved unit-plan source before changing
 state.
+
+## Continue an incomplete parallel section
+
+1. Open the intent and choose **Preview recovery** (owner/admin). This step does
+   not start work. The preview lists units preserved, units to continue and shared
+   stages that will rerun.
+2. If the walking skeleton depends on another unit, select a dependency-free
+   unit from the offered choices. An already integrated prerequisite can be
+   selected: its code is preserved and its skeleton review is presented again.
+3. Read the delivery consequence. Continuing adds the remaining implementation
+   to the existing intent branch and therefore expands its open PR. That PR will
+   no longer contain only the originally integrated units. If the recorded PR is
+   already closed or merged, this recovery stops for a separate delivery plan.
+4. Choose **Confirm and continue**. Answer the skeleton review and autonomy
+   question if a replacement selection was required, then the normal stage and
+   batch approvals. Shared tests and delivery stages rerun after the units resolve.
+
+Original timeline entries and accepted answers remain. Historical units outside
+the current plan are retained. Completed lane stages and integrated code are
+preserved; unfinished stages resume on their existing branches. A changed preview
+asks you to refresh rather than applying an outdated choice.
+
+An old **SUCCEEDED** record may instead display **Incomplete work** when its
+current-plan units never finished. An explicit human skip displays **Partial
+delivery**. Neither label describes the final PR's provider merge status.
+
+The fixed application must be deployed before using this path. Deployment alone
+does not restart a completed execution; recovery is an explicit action.

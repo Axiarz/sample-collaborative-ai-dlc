@@ -50,6 +50,14 @@
 // wakes: a superseded gate (cancel/rewind) retires the run with NO writes.
 
 import processKeysPkg from '../shared/v2-process-keys.js';
+import {
+  dependentClosure,
+  effectiveSkeleton,
+  hasUnitSkipDecision,
+  skeletonCeremonyDisabled,
+  skeletonProblem,
+  unitPlanIdentity,
+} from '../shared/unit-completion.js';
 import { stageIsNoopForUnit } from '../shared/unit-kind-pruning.js';
 import { buildIntentAttribution } from './pr-attribution.js';
 import { bindGateCallback, unparkGate } from './gate-callback.js';
@@ -373,14 +381,14 @@ export const validateFanoutOverrides = (answer, { slugs, sectionStages, bySlug }
 // it is (still) a known unit, else the first slug of the first topological
 // wave. Shared by the fan-out approval (index.js) and the section runner so
 // the gate presents exactly what the section would run.
-export const defaultSkeletonFor = (unitPlan) => {
-  const bySlug = new Map((unitPlan?.units ?? []).map((u) => [u.slug, u]));
-  const waves = (
-    unitPlan?.batches?.length ? unitPlan.batches : [(unitPlan?.units ?? []).map((u) => u.slug)]
-  ).map((w) => w.filter((slug) => bySlug.has(slug)));
-  return unitPlan?.walkingSkeleton && bySlug.has(unitPlan.walkingSkeleton)
+export const defaultSkeletonFor = (unitPlan, { legacy = false } = {}) => {
+  if (!legacy) return effectiveSkeleton(unitPlan);
+  const slugs = new Set((unitPlan?.units ?? []).map((unit) => unit.slug));
+  return slugs.has(unitPlan?.walkingSkeleton)
     ? unitPlan.walkingSkeleton
-    : (waves.flat()[0] ?? null);
+    : ((unitPlan?.batches?.length ? unitPlan.batches.flat() : [...slugs]).find((slug) =>
+        slugs.has(slug),
+      ) ?? null);
 };
 
 // The fan-out summary appended to the unit-DAG stage's validation gate (A2
@@ -398,7 +406,12 @@ export const fanoutGateAddendum = ({ sectionIndex, unitPlan, sectionStages, skel
         `- ${u.slug}${(u.dependsOn ?? []).length ? ` (depends on ${(u.dependsOn ?? []).join(', ')})` : ''}`,
     ),
     '',
-    `Walking skeleton: ${skeleton} (runs first, solo, with a mandatory review gate).`,
+    skeletonCeremonyDisabled(sectionStages)
+      ? 'Walking-skeleton ceremony is disabled: all units run with the normal stage and batch gates.'
+      : `Walking skeleton: ${skeleton} (runs first, solo, with a mandatory review gate).`,
+    ...(skeletonProblem(unitPlan, skeleton, sectionStages)
+      ? [skeletonProblem(unitPlan, skeleton, sectionStages)]
+      : []),
     `Per-unit stages: ${sectionStages.map((s) => s.stageId).join(', ')}.`,
     `Skip matrix (CONDITIONAL stages skipped per unit): ${
       Object.keys(unitPlan.skipMatrix ?? {}).length
@@ -436,6 +449,7 @@ export const runParallelSection = async (segment, toolkit) => {
     unitPrProvider = null,
     applicationUrl,
     runId = null,
+    completionPolicyVersion = 1,
     // Derive-time enrichment mode ('off'|'llm'), snapshotted on META — rides
     // the lane derive-artifacts dispatches like the once-per-workflow hook.
     deriveEnrichment = 'off',
@@ -459,6 +473,17 @@ export const runParallelSection = async (segment, toolkit) => {
     unitPlan.batches?.length ? unitPlan.batches : [unitPlan.units.map((u) => u.slug)]
   ).map((w) => w.filter((slug) => bySlug.has(slug)));
   const laneOrder = waves.flat();
+  const checkedCompletion = completionPolicyVersion >= 1;
+  if (checkedCompletion) {
+    const problem = skeletonProblem(unitPlan, undefined, segment.stages);
+    if (problem) return fail('invalid_walking_skeleton', problem);
+    if (laneOrder.length !== bySlug.size || new Set(laneOrder).size !== bySlug.size) {
+      return fail(
+        'invalid_unit_waves',
+        'Every current-plan unit must occur exactly once in the scheduling waves.',
+      );
+    }
+  }
 
   // ── fan-out decisions (A2 rules 2/7/8) ────────────────────────────────────
   // The human approved the fan-out at the unit-DAG stage's validation gate
@@ -466,7 +491,7 @@ export const runParallelSection = async (segment, toolkit) => {
   // UNITPLAN via updateUnitPlanDecisions. The plan row read above (a durable
   // step) is therefore the section's scheduling truth — no second gate here.
   const decisions = {
-    walkingSkeleton: defaultSkeletonFor(unitPlan),
+    walkingSkeleton: defaultSkeletonFor(unitPlan, { legacy: !checkedCompletion }),
     skipMatrix: unitPlan.skipMatrix ?? {},
   };
   await emitEvent(
@@ -483,6 +508,7 @@ export const runParallelSection = async (segment, toolkit) => {
   const withIntegrationLock = makeMergeLock();
   // slug → 'MERGED' | 'FAILED' | 'BLOCKED' — settled lane states (this run).
   const laneState = new Map();
+  const skipped = new Set();
   // slug → in-flight lane DurablePromise (wavefront cross-lane coordination).
   const lanePromises = new Map();
   const usesUnitPrs = prStrategy === 'pr-per-unit';
@@ -502,7 +528,7 @@ export const runParallelSection = async (segment, toolkit) => {
   // gate are not replayed and dependency waits can continue from durable DDB
   // truth rather than the empty in-memory map.
   const persistedUnits = await ctx.step(`load-unit-states-${sk}`, () =>
-    store.listUnits(executionId),
+    store.listUnits(executionId, { consistentRead: checkedCompletion }),
   );
   const persistedBySlug = new Map(
     (persistedUnits ?? [])
@@ -516,6 +542,14 @@ export const runParallelSection = async (segment, toolkit) => {
       bySlug.has(row.slug)
     ) {
       laneState.set(row.slug, 'MERGED');
+    }
+    if (
+      checkedCompletion &&
+      Number(row.sectionIndex) === Number(segment.index) &&
+      bySlug.has(row.slug) &&
+      hasUnitSkipDecision(row, unitPlan)
+    ) {
+      skipped.add(row.slug);
     }
   }
 
@@ -2164,14 +2198,14 @@ export const runParallelSection = async (segment, toolkit) => {
         name: `halt-${sk}${idSuffix}-r${round}${attempt ? `-a${attempt}` : ''}`,
         sectionIndex: segment.index,
         prompt: [
-          `Lane failure in section ${segment.index} (${failedSlugs.length} unit(s) failed, ${blocked().length} blocked, ${
+          `Unresolved work in section ${segment.index} (${failedSlugs.length} unit(s) need a decision, ${blocked().length} blocked, ${
             [...laneState.values()].filter((s) => s === 'MERGED').length
           } merged).`,
           ...detailLines,
           '',
           'All pushed work is preserved on the unit branches. Choose:',
-          '- retry: re-run the failed lanes (and their blocked dependents) in place',
-          '- skip: continue without them (their work will be missing downstream)',
+          '- retry: re-run unresolved lanes (and their blocked dependents) in place; integrated work is preserved',
+          '- skip: explicitly omit these lanes and all their unintegrated dependents from delivery',
           '- abort: fail the run',
           ...(attempt
             ? [
@@ -2208,11 +2242,11 @@ export const runParallelSection = async (segment, toolkit) => {
         return {
           terminal: await fail(
             'section_aborted',
-            `section ${segment.index}: units [${failedSlugs.join(', ')}] failed; human aborted`,
+            `section ${segment.index}: units [${failedSlugs.join(', ')}] unresolved; human aborted`,
           ),
         };
       }
-      return { choice };
+      return { choice, humanTaskId: halt.gate.humanTaskId };
     }
   };
 
@@ -2248,7 +2282,7 @@ export const runParallelSection = async (segment, toolkit) => {
     initialSlugs,
     { tag, idSuffix = '', feedbackTaskId = null, revive = false },
   ) => {
-    let toRun = initialSlugs;
+    let toRun = initialSlugs.filter((slug) => !skipped.has(slug));
     let round = 0;
     // A retry round re-runs the previous round's FAILED lanes and revives
     // their BLOCKED dependents. Unbounded by design — each round is one
@@ -2260,16 +2294,46 @@ export const runParallelSection = async (segment, toolkit) => {
         laneOpts: { idSuffix, feedbackTaskId, revive },
       });
       if (terminal) return terminal;
-      const failed = toRun.filter((s) => laneState.get(s) === 'FAILED');
+      const failed = toRun.filter((s) =>
+        checkedCompletion
+          ? laneState.get(s) !== 'MERGED' && !skipped.has(s)
+          : laneState.get(s) === 'FAILED',
+      );
       if (failed.length === 0) return null;
-      const decision = await haltAndAsk(round, failed, idSuffix);
+      const decisionSuffix = checkedCompletion ? `${tag}${idSuffix}` : idSuffix;
+      const decision = await haltAndAsk(round, failed, decisionSuffix);
       if (decision.terminal) return decision.terminal;
       if (decision.choice === 'skip') {
+        if (checkedCompletion) {
+          const omitted = dependentClosure(unitPlan, failed).filter(
+            (slug) => laneState.get(slug) !== 'MERGED' && !skipped.has(slug),
+          );
+          await ctx.step(`record-lane-skips-${sk}${decisionSuffix}-r${round}`, async () => {
+            for (const slug of omitted) {
+              const saved = await store.updateUnitState({
+                executionId,
+                sectionIndex: segment.index,
+                slug,
+                state: laneState.get(slug) ?? 'BLOCKED',
+                ifOrchestratorRunId: runId,
+                fields: {
+                  completionSkip: {
+                    humanTaskId: decision.humanTaskId,
+                    planIdentity: unitPlanIdentity(unitPlan),
+                  },
+                },
+              });
+              if (!saved) throw new Error('Unit skip decision lost execution ownership');
+            }
+            return omitted;
+          });
+          omitted.forEach((slug) => skipped.add(slug));
+        }
         await emitEvent(
           ctx,
-          `skip-lanes-${sk}${idSuffix}-r${round}`,
+          `skip-lanes-${sk}${checkedCompletion ? decisionSuffix : idSuffix}-r${round}`,
           'v2.units.lanes_skipped',
-          `Continuing section ${segment.index} without [${failed.join(', ')}] (human skip); dependents stay blocked`,
+          `Continuing section ${segment.index} without [${failed.join(', ')}] and their unintegrated dependents (human skip); their work is omitted from delivery`,
           { sectionIndex: segment.index },
         );
         return null;
@@ -2290,7 +2354,7 @@ export const runParallelSection = async (segment, toolkit) => {
         });
       }
       round += 1;
-      toRun = [...failed, ...toRun.filter((s) => laneState.get(s) === 'BLOCKED')];
+      toRun = [...new Set([...failed, ...toRun.filter((s) => laneState.get(s) === 'BLOCKED')])];
     }
   };
 
@@ -2303,8 +2367,7 @@ export const runParallelSection = async (segment, toolkit) => {
   // policy, which only exists in release mode — so an unpinned run takes the
   // pre-Phase-6 path byte for byte.
   const skeleton = decisions.walkingSkeleton;
-  const skeletonCeremonyOff =
-    (segment.stages.find((stage) => stage.policy?.skeleton)?.policy?.skeleton ?? null) === 'off';
+  const skeletonCeremonyOff = skeletonCeremonyDisabled(segment.stages);
   const skeletonAlreadyApproved =
     laneState.get(skeleton) === 'MERGED' &&
     CONSTRUCTION_AUTONOMY_MODES.includes(unitPlan.autonomyMode);
@@ -2390,14 +2453,28 @@ export const runParallelSection = async (segment, toolkit) => {
 
   // ── phase 2: autonomy ladder (A2 rule 9), then the remaining lanes ───────
   const remaining = laneOrder.filter(
-    (s) => (skeletonCeremonyOff || s !== skeleton) && laneState.get(s) !== 'MERGED',
+    (s) =>
+      (skeletonCeremonyOff || s !== skeleton) && laneState.get(s) !== 'MERGED' && !skipped.has(s),
   );
+  const validateCompletion = () => {
+    const unresolved = laneOrder.filter(
+      (slug) => laneState.get(slug) !== 'MERGED' && !skipped.has(slug),
+    );
+    return checkedCompletion && unresolved.length
+      ? fail(
+          'section_incomplete',
+          `Section ${segment.index} still has unresolved units: ${unresolved.join(', ')}. Review recovery before continuing.`,
+        )
+      : null;
+  };
   if (remaining.length === 0) {
+    const incomplete = await validateCompletion();
+    if (incomplete) return incomplete;
     await emitEvent(
       ctx,
       `fan-in-${sk}`,
       'v2.units.fan_in',
-      `Section ${segment.index} complete: ${[...laneState.values()].filter((s) => s === 'MERGED').length}/${laneOrder.length} unit(s) merged`,
+      `Section ${segment.index} resolved: ${[...laneState.values()].filter((s) => s === 'MERGED').length}/${laneOrder.length} unit(s) integrated${skipped.size ? `; ${skipped.size} explicitly omitted by human decision` : ''}`,
       { sectionIndex: segment.index },
     );
     return null;
@@ -2431,8 +2508,13 @@ export const runParallelSection = async (segment, toolkit) => {
         /* META mirror is best-effort; the UNITPLAN write below is the truth */
       }
       try {
-        await store.updateUnitPlanDecisions({ executionId, autonomyMode: parsed });
-      } catch {
+        await store.updateUnitPlanDecisions({
+          executionId,
+          autonomyMode: parsed,
+          ...(checkedCompletion ? { ifOrchestratorRunId: runId } : {}),
+        });
+      } catch (error) {
+        if (checkedCompletion) throw error;
         /* tolerated — the step result governs this run */
       }
       return parsed;
@@ -2520,14 +2602,14 @@ export const runParallelSection = async (segment, toolkit) => {
   }
 
   // ── fan-in bookkeeping (A2 rule 5) ────────────────────────────────────────
+  const incomplete = await validateCompletion();
+  if (incomplete) return incomplete;
   const merged = [...laneState.values()].filter((s) => s === 'MERGED').length;
   await emitEvent(
     ctx,
     `fan-in-${sk}`,
     'v2.units.fan_in',
-    `Section ${segment.index} complete: ${merged}/${laneOrder.length} unit(s) merged${
-      merged < laneOrder.length ? ' (some lanes skipped after failure — see halt decisions)' : ''
-    }`,
+    `Section ${segment.index} resolved: ${merged}/${laneOrder.length} unit(s) integrated${skipped.size ? `; ${skipped.size} explicitly omitted by human decision` : ''}`,
     { sectionIndex: segment.index },
   );
   return null;

@@ -37,6 +37,8 @@ import {
   resolveEnvironmentSnapshot,
 } from '../shared/environment-snapshot.js';
 import { runtimeTargetInput } from '../shared/runtime-target.js';
+import { unitCompletion, skeletonProblem } from '../shared/unit-completion.js';
+import { incompleteSectionRepair, repairPreviewToken } from './lane-repair.js';
 import { createProcessStore, isTransactionConflict } from '../shared/v2-process-store.js';
 import { isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
 import { deleteIntentCascade, IntentRunningError } from '../shared/intent-deletion.js';
@@ -1785,6 +1787,19 @@ export const handler = async (event, context) => {
 
     const auth = await authorize(g, projectId, sub, response);
     if (auth.res) return auth.res;
+    if (
+      intentId &&
+      (httpMethod === 'DELETE' ||
+        (httpMethod === 'POST' && /\/(rewind|recompose|cancel)$/.test(path ?? '')))
+    ) {
+      const current = await store.getExecution(intentId, { consistentRead: true });
+      if (current?.projectId === projectId && current.failureReason === 'lane_repair_in_progress') {
+        return response(409, {
+          error: 'Recovery is in progress. Refresh before changing this execution.',
+          code: 'repair_in_progress',
+        });
+      }
+    }
 
     // Authenticated unit-review selection. Provider comments are data only:
     // no webhook/comment can launch an agent. GET refreshes selectable
@@ -4126,15 +4141,36 @@ export const handler = async (event, context) => {
       if (auth.role !== 'owner' && auth.role !== 'admin') {
         return response(403, { error: 'Only project owners and admins can repair intents' });
       }
-      const meta = await store.getExecution(intentId);
+      const meta = await store.getExecution(intentId, { consistentRead: true });
       if (!meta || meta.projectId !== projectId) {
         return response(404, { error: 'Intent not found' });
       }
-      if (!['RUNNING', 'WAITING', 'FAILED'].includes(meta.status)) {
-        return response(409, { error: `Intent is ${meta.status}; no active run can be repaired` });
+      if (!['RUNNING', 'WAITING', 'FAILED', 'SUCCEEDED'].includes(meta.status)) {
+        return response(409, {
+          error: `Intent is ${meta.status}; no active run can be repaired`,
+        });
       }
+      if (meta.failureReason === 'lane_repair_in_progress') {
+        return response(409, {
+          error: 'Recovery is already in progress; refresh before retrying.',
+          code: 'repair_in_progress',
+        });
+      }
+      const repairInput = body ? JSON.parse(body) : {};
 
-      const records = await store.getExecutionRecords(intentId, { includeOutputs: false });
+      const records = await store.getExecutionRecords(intentId, {
+        includeOutputs: false,
+        consistentRead: true,
+      });
+      const planResult = await intentMethodology.loadPlan(meta);
+      if (!planResult.valid || !planResult.plan) {
+        return response(409, {
+          error: 'Execution plan cannot be resolved for repair',
+          errors: planResult.errors ?? [],
+        });
+      }
+      const incompleteRepair = incompleteSectionRepair(meta, records, planResult.plan);
+      if (incompleteRepair?.error) return response(409, { error: incompleteRepair.error });
       const pendingByStage = new Map(
         (records.humanTasks ?? [])
           .filter((gate) => gate.status === 'pending' && gate.stageInstanceId)
@@ -4163,7 +4199,7 @@ export const handler = async (event, context) => {
               pr.number != null,
           ),
       );
-      if (orphaned.length === 0 && prUnits.length === 0) {
+      if (orphaned.length === 0 && prUnits.length === 0 && !incompleteRepair) {
         return response(409, {
           error: 'No orphaned parallel lane waits or recoverable PR reviews were detected',
           code: 'repair_not_needed',
@@ -4172,6 +4208,7 @@ export const handler = async (event, context) => {
       const sectionIndexes = [
         ...new Set(
           [
+            ...(incompleteRepair ? [incompleteRepair.sectionIndex] : []),
             ...orphaned.map((stage) => stage.sectionIndex),
             ...prUnits.map((unit) => unit.sectionIndex),
           ].filter(
@@ -4197,19 +4234,21 @@ export const handler = async (event, context) => {
         'FAILED',
         'BLOCKED',
       ]);
-      const repairUnits = (records.units ?? []).filter(
-        (unit) => Number(unit.sectionIndex) === sectionIndex && repairableStates.has(unit.state),
-      );
+      const repairUnits = incompleteRepair
+        ? incompleteRepair.laneSlugs.map(
+            (slug) =>
+              (records.units ?? []).find(
+                (unit) => unit.slug === slug && Number(unit.sectionIndex) === sectionIndex,
+              ) ?? { slug, sectionIndex, state: 'PENDING' },
+          )
+        : (records.units ?? []).filter(
+            (unit) =>
+              Number(unit.sectionIndex) === sectionIndex && repairableStates.has(unit.state),
+          );
       const repairSlugs = [...new Set(repairUnits.map((unit) => unit.slug))];
       if (repairSlugs.length === 0) {
-        return response(409, { error: 'No active lanes are available to repair' });
-      }
-
-      const planResult = await intentMethodology.loadPlan(meta);
-      if (!planResult.valid || !planResult.plan) {
         return response(409, {
-          error: 'Execution plan cannot be resolved for repair',
-          errors: planResult.errors ?? [],
+          error: 'No active lanes are available to repair',
         });
       }
       const sectionStages = planResult.plan.stages.filter(
@@ -4235,6 +4274,16 @@ export const handler = async (event, context) => {
         const row = stagesByInstance.get(instance.stageInstanceId);
         return row && !completedStageStates.has(row.state);
       });
+      if (incompleteRepair) {
+        for (const stage of planResult.plan.stages.filter((item) =>
+          incompleteRepair.rerunSharedStages.includes(item.stageId),
+        )) {
+          const stageInstanceId =
+            stage.stageInstanceId ?? planStageInstanceId(planNamespace, stage.stageId);
+          if (stagesByInstance.has(stageInstanceId))
+            resetInstances.push({ stage, slug: null, stageInstanceId });
+        }
+      }
       const responder = getResponder(event);
       const repairId = `repair-${randomUUID()}`;
       const repairReason = `Recover durable parallel work in section ${sectionIndex}`;
@@ -4248,7 +4297,39 @@ export const handler = async (event, context) => {
         (pr) => Number(pr.sectionIndex) === sectionIndex && repairSlugs.includes(pr.unitSlug),
       );
       const remotePrs = new Map();
+      const finalPrs = [];
       try {
+        if (incompleteRepair) {
+          for (const pr of await fetchPullRequests(g, intentId)) {
+            if (!pr.repository || pr.prNumber == null || pr.branch !== meta.branch) {
+              throw new Error('The recorded final pull request cannot be verified');
+            }
+            const status = await sourceControlOperation({
+              projectId,
+              provider: meta.repoProviders?.[pr.repository] || meta.gitProvider || 'github',
+              repo: pr.repository,
+              operation: 'pr-status',
+              args: { number: pr.prNumber },
+            });
+            if (!status?.state || !status.sourceBranch)
+              throw new Error('Final pull request status unavailable');
+            if (
+              status.state !== 'open' ||
+              (status.sourceBranch && status.sourceBranch !== meta.branch)
+            ) {
+              return response(409, {
+                error:
+                  'The final pull request is no longer open on the intent branch. Review a follow-up delivery plan before recovering.',
+                code: 'repair_delivery_changed',
+              });
+            }
+            finalPrs.push({
+              repository: pr.repository,
+              number: pr.prNumber,
+              url: pr.prUrl,
+            });
+          }
+        }
         for (const pr of repairPrs) {
           if (pr.state === 'UNCHANGED' || pr.number == null) continue;
           const provider =
@@ -4291,6 +4372,52 @@ export const handler = async (event, context) => {
         });
       }
 
+      const preview = incompleteRepair
+        ? { ...incompleteRepair, pullRequests: finalPrs }
+        : {
+            kind: 'orphaned-lanes',
+            sectionIndex,
+            fromStageId: sectionStages[0].stageId,
+            laneSlugs: repairSlugs,
+            preservedSlugs: (records.units ?? [])
+              .filter(
+                (unit) => Number(unit.sectionIndex) === sectionIndex && unit.state === 'MERGED',
+              )
+              .map((unit) => unit.slug),
+            rerunSharedStages: [],
+            skeletonProblem: null,
+            skeletonCandidates: [],
+            walkingSkeleton: records.unitPlan?.walkingSkeleton ?? null,
+            branch: meta.branch,
+            pullRequests: [],
+            approvals:
+              'Completed lane stages and existing pull requests are preserved. Normal approvals apply to unfinished work.',
+          };
+      const previewToken = repairPreviewToken(meta, records, preview);
+      if (repairInput.preview === true)
+        return response(200, { preview: { ...preview, previewToken } });
+      if (
+        (incompleteRepair || repairInput.previewToken) &&
+        repairInput.previewToken !== previewToken
+      ) {
+        return response(409, {
+          error: 'Recovery preview changed. Review it again before continuing.',
+          code: 'repair_preview_changed',
+        });
+      }
+      if (incompleteRepair?.skeletonProblem) {
+        const problem = skeletonProblem(
+          records.unitPlan,
+          repairInput.walkingSkeleton,
+          sectionStages,
+        );
+        if (!repairInput.walkingSkeleton || problem) {
+          return response(400, {
+            error: problem ?? 'Select a dependency-free walking skeleton.',
+          });
+        }
+      }
+
       const mcpLaunch = await prepareMcpLaunch(g, meta);
       if (mcpLaunch.error) return response(mcpLaunch.statusCode, mcpLaunch.error);
       let priorDurableExecutionArn = meta.durableExecutionArn ?? null;
@@ -4305,247 +4432,293 @@ export const handler = async (event, context) => {
         priorDurableExecutionArn = listed.DurableExecutions?.[0]?.DurableExecutionArn ?? null;
       }
 
-      await store.updateExecution({
-        executionId: intentId,
-        projectId,
-        status: 'FAILED',
-        fromStatus: meta.status,
-        startedAt: meta.startedAt,
-        pendingHumanTaskId: null,
-        resumeRequired: null,
-        failureReason: 'lane_repair_in_progress',
-        completedAt: null,
-        orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
-      });
-      if (priorDurableExecutionArn) {
-        try {
-          await lambdaClient.send(
-            new StopDurableExecutionCommand({
-              DurableExecutionArn: priorDurableExecutionArn,
-              Error: {
-                ErrorType: 'LaneRepair',
-                ErrorMessage: repairReason,
-                ErrorData: JSON.stringify({ repairId, sectionIndex, repairSlugs }),
-              },
-            }),
-          );
-        } catch (error) {
-          if (!['ResourceNotFoundException', 'ConflictException'].includes(error?.name)) {
-            await store
-              .updateExecution({
-                executionId: intentId,
-                projectId,
-                failureReason: 'lane_repair_durable_stop_failed',
-              })
-              .catch(() => {});
-            await store
-              .appendEvent({
-                executionId: intentId,
-                type: 'v2.execution.repair_failed',
-                actor: responder.displayName || responder.sub,
-                summary: `Could not stop the prior durable execution: ${error?.message ?? 'unknown error'}`,
-              })
-              .catch(() => {});
-            return response(502, {
-              error: 'The old durable execution could not be stopped; repair did not relaunch',
-              code: 'durable_stop_failed',
-            });
-          }
-        }
-      }
-
-      const archivedArtifacts = await archiveArtifactsForStages({
-        g,
-        intentId,
-        stageInstanceIds: resetInstances.map((instance) => instance.stageInstanceId),
-        restartId: repairId,
-        reason: repairReason,
-        actor: responder.displayName || responder.sub,
-      });
-      await retireParkedRun(intentId, repairReason);
-      await stopRuntimeSessions(intentId, meta, {
-        sectionIndexes: [sectionIndex],
-        unitSlugs: repairSlugs,
-      });
-
-      await mapWithConcurrency(resetInstances, 12, async ({ stage, slug, stageInstanceId }) => {
-        const reset = await store.resetStageRow({
-          executionId: intentId,
-          stageInstanceId,
-          preservePendingCodeCommitRefs: true,
-        });
-        if (!reset) return;
-        await store
-          .appendEvent({
-            executionId: intentId,
-            type: 'v2.stage.reset',
-            stageInstanceId,
-            unitSlug: slug,
-            sectionIndex,
-            actor: responder.displayName || responder.sub,
-            summary: `Stage ${stage.stageId} [unit ${slug}] reset by lane repair`,
-          })
-          .catch(() => {});
-      });
-      const reconciledPrs = await mapWithConcurrency(repairPrs, 8, async (pr) => {
-        if (pr.state === 'UNCHANGED' || pr.number == null) return pr;
-        const remote = remotePrs.get(pr.sk);
-        const status = remote.status;
-        let state;
-        let repositoryOutcome = null;
-        if (status.state === 'merged') {
-          state = remote.mergedHeadIsAncestor ? 'MERGED' : 'FAILED';
-          repositoryOutcome = remote.mergedHeadIsAncestor ? 'merged' : 'ready_head_not_on_intent';
-        } else if (status.state === 'closed') {
-          state = 'CLOSED';
-          repositoryOutcome = 'closed_without_merge';
-        } else {
-          const stillReady =
-            !status.draft &&
-            pr.readyHeadSha &&
-            status.headSha === pr.readyHeadSha &&
-            (!pr.targetSha || !status.targetSha || status.targetSha === pr.targetSha);
-          state = stillReady ? 'READY' : 'DRAFT';
-        }
-        return store.updateUnitPr({
-          executionId: intentId,
-          sectionIndex,
-          slug: pr.unitSlug,
-          repository: pr.repository,
-          state,
-          fields: {
-            providerId: status.providerId ?? pr.providerId ?? null,
-            number: status.number ?? pr.number,
-            url: status.url ?? pr.url,
-            sourceBranch: status.sourceBranch ?? pr.sourceBranch,
-            targetBranch: status.targetBranch ?? pr.targetBranch,
-            headSha: status.headSha ?? pr.headSha ?? null,
-            targetSha: status.targetSha ?? pr.targetSha ?? null,
-            readyHeadSha: state === 'READY' || state === 'MERGED' ? pr.readyHeadSha : null,
-            mergeable: status.mergeable ?? null,
-            repositoryOutcome,
-          },
-        });
-      });
-      const prsByUnit = new Map();
-      for (const pr of reconciledPrs.filter(Boolean)) {
-        const rows = prsByUnit.get(pr.unitSlug) ?? [];
-        rows.push(pr);
-        prsByUnit.set(pr.unitSlug, rows);
-      }
-      await mapWithConcurrency(repairSlugs, 8, async (slug) => {
-        const prs = prsByUnit.get(slug) ?? [];
-        const changed = prs.filter((pr) => pr.state !== 'UNCHANGED');
-        const constructionComplete = sectionStages.every((stage) => {
-          const stageInstanceId = planStageInstanceId(
-            planNamespace,
-            stage.stageId,
-            slug,
-            sectionIndex,
-          );
-          return completedStageStates.has(stagesByInstance.get(stageInstanceId)?.state);
-        });
-        const fullyMerged =
-          changed.length > 0 &&
-          changed.every((pr) => pr.state === 'MERGED') &&
-          prs.every((pr) => pr.state === 'MERGED' || pr.state === 'UNCHANGED');
-        const resumeReview =
-          constructionComplete &&
-          changed.some((pr) => pr.state === 'DRAFT' || pr.state === 'READY') &&
-          !changed.some((pr) => pr.state === 'CLOSED' || pr.state === 'FAILED');
-        return store.updateUnitState({
-          executionId: intentId,
-          sectionIndex,
-          slug,
-          state: fullyMerged ? 'MERGED' : resumeReview ? 'PR_DRAFT' : 'PENDING',
-          fields: {
-            failureReason: null,
-            blockedOn: null,
-            integrationOwner: false,
-            recoveryPreserveCompleted: true,
-            blockedReason: fullyMerged
-              ? null
-              : resumeReview
-                ? 'Resuming existing pull request after durable recovery'
-                : 'Replaying unfinished work after durable recovery',
-            ...(fullyMerged ? { mergedAt: true } : {}),
-          },
-        });
-      });
-      await store
-        .appendEvent({
-          executionId: intentId,
-          type: 'v2.execution.lanes_repaired',
-          actor: responder.displayName || responder.sub,
-          summary: `${responder.displayName || 'Someone'} recovered section ${sectionIndex}; reconciled ${repairPrs.length} pull request(s), preserved completed stages, and relaunched unfinished lanes [${repairSlugs.join(', ')}] (${archivedArtifacts.length} artifact version(s) archived)`,
-        })
-        .catch(() => {});
-
-      const fromStageId = sectionStages[0].stageId;
-      const durableExecutionName = durableExecutionNameForIntent(intentId);
-      await store.deleteWorkflowCheckpoint(intentId);
-      const updated = await store.updateExecution({
-        executionId: intentId,
-        projectId,
-        status: 'CREATED',
-        fromStatus: 'FAILED',
-        startedAt: meta.startedAt,
-        durableExecutionName,
-        durableExecutionArn: null,
-        orchestratorStartedAt: null,
-        orchestratorExpiresAt: null,
-        pendingHumanTaskId: null,
-        resumeRequired: null,
-        failureReason: null,
-        failure: null,
-        completedAt: null,
-        rewindFromStageId: fromStageId,
-        startedBy: responder.sub,
-        starterName: responder.displayName,
-        starterEmail: responder.email,
-        ...mcpLaunch.update,
-      });
+      const repairRunId = `retired-${randomBytes(8).toString('hex')}`;
       try {
-        const invoked = await invokeOrchestrator(
-          {
-            action: 'start',
-            intentId,
-            executionId: intentId,
-            startAtStageId: fromStageId,
-          },
-          { durableExecutionName },
-        );
-        if (invoked?.durableExecutionArn) {
-          await store
-            .updateExecution({
-              executionId: intentId,
-              durableExecutionArn: invoked.durableExecutionArn,
-            })
-            .catch((error) => logger.error('Repair durable execution ARN stamp failed', error));
-        }
-      } catch (error) {
         await store.updateExecution({
           executionId: intentId,
           projectId,
           status: 'FAILED',
-          fromStatus: 'CREATED',
+          fromStatus: meta.status,
+          ifOrchestratorRunId: meta.orchestratorRunId,
+          ifUpdatedAt: meta.updatedAt,
           startedAt: meta.startedAt,
           pendingHumanTaskId: null,
-          failureReason: 'lane_repair_relaunch_failed',
-          durableExecutionArn: null,
+          resumeRequired: null,
+          failureReason: 'lane_repair_in_progress',
+          completedAt: null,
+          orchestratorRunId: repairRunId,
         });
-        throw error;
+      } catch (error) {
+        if (error?.name !== 'ConditionalCheckFailedException') throw error;
+        return response(409, {
+          error: 'Execution changed; refresh the recovery preview.',
+          code: 'repair_preview_changed',
+        });
       }
-      return response(202, {
-        intent: mapIntent(updated),
-        repair: {
-          repairId,
-          sectionIndex,
-          laneSlugs: repairSlugs,
-          archivedArtifactCount: archivedArtifacts.length,
-          fromStageId,
-        },
-      });
+      try {
+        if (priorDurableExecutionArn) {
+          try {
+            await lambdaClient.send(
+              new StopDurableExecutionCommand({
+                DurableExecutionArn: priorDurableExecutionArn,
+                Error: {
+                  ErrorType: 'LaneRepair',
+                  ErrorMessage: repairReason,
+                  ErrorData: JSON.stringify({ repairId, sectionIndex, repairSlugs }),
+                },
+              }),
+            );
+          } catch (error) {
+            if (!['ResourceNotFoundException', 'ConflictException'].includes(error?.name)) {
+              await store
+                .updateExecution({
+                  executionId: intentId,
+                  projectId,
+                  failureReason: 'lane_repair_durable_stop_failed',
+                  ifOrchestratorRunId: repairRunId,
+                })
+                .catch(() => {});
+              await store
+                .appendEvent({
+                  executionId: intentId,
+                  type: 'v2.execution.repair_failed',
+                  actor: responder.displayName || responder.sub,
+                  summary: `Could not stop the prior durable execution: ${error?.message ?? 'unknown error'}`,
+                })
+                .catch(() => {});
+              return response(502, {
+                error: 'The old durable execution could not be stopped; repair did not relaunch',
+                code: 'durable_stop_failed',
+              });
+            }
+          }
+        }
+
+        const archivedArtifacts = await archiveArtifactsForStages({
+          g,
+          intentId,
+          stageInstanceIds: resetInstances.map((instance) => instance.stageInstanceId),
+          restartId: repairId,
+          reason: repairReason,
+          actor: responder.displayName || responder.sub,
+        });
+        await retireParkedRun(intentId, repairReason);
+        await stopRuntimeSessions(intentId, meta, {
+          sectionIndexes: [sectionIndex],
+          unitSlugs: repairSlugs,
+        });
+        if (incompleteRepair?.skeletonProblem) {
+          await store.updateUnitPlanDecisions({
+            executionId: intentId,
+            ifOrchestratorRunId: repairRunId,
+            walkingSkeleton: repairInput.walkingSkeleton,
+            autonomyMode: null,
+          });
+          await store.appendEvent({
+            executionId: intentId,
+            type: 'v2.units.recovery_decision',
+            actor: responder.displayName || responder.sub,
+            summary: `Recovery confirmed: walking skeleton ${records.unitPlan.walkingSkeleton} → ${repairInput.walkingSkeleton}; integrated units preserved, skeleton review and autonomy selection required again.`,
+          });
+        }
+
+        await mapWithConcurrency(resetInstances, 12, async ({ stage, slug, stageInstanceId }) => {
+          const reset = await store.resetStageRow({
+            executionId: intentId,
+            stageInstanceId,
+            preservePendingCodeCommitRefs: true,
+            ifOrchestratorRunId: repairRunId,
+          });
+          if (!reset) return;
+          await store
+            .appendEvent({
+              executionId: intentId,
+              type: 'v2.stage.reset',
+              stageInstanceId,
+              unitSlug: slug,
+              sectionIndex,
+              actor: responder.displayName || responder.sub,
+              summary: `Stage ${stage.stageId}${slug ? ` [unit ${slug}]` : ''} reset by lane repair`,
+            })
+            .catch(() => {});
+        });
+        const reconciledPrs = await mapWithConcurrency(repairPrs, 8, async (pr) => {
+          if (pr.state === 'UNCHANGED' || pr.number == null) return pr;
+          const remote = remotePrs.get(pr.sk);
+          const status = remote.status;
+          let state;
+          let repositoryOutcome = null;
+          if (status.state === 'merged') {
+            state = remote.mergedHeadIsAncestor ? 'MERGED' : 'FAILED';
+            repositoryOutcome = remote.mergedHeadIsAncestor ? 'merged' : 'ready_head_not_on_intent';
+          } else if (status.state === 'closed') {
+            state = 'CLOSED';
+            repositoryOutcome = 'closed_without_merge';
+          } else {
+            const stillReady =
+              !status.draft &&
+              pr.readyHeadSha &&
+              status.headSha === pr.readyHeadSha &&
+              (!pr.targetSha || !status.targetSha || status.targetSha === pr.targetSha);
+            state = stillReady ? 'READY' : 'DRAFT';
+          }
+          return store.updateUnitPr({
+            executionId: intentId,
+            sectionIndex,
+            slug: pr.unitSlug,
+            repository: pr.repository,
+            state,
+            fields: {
+              providerId: status.providerId ?? pr.providerId ?? null,
+              number: status.number ?? pr.number,
+              url: status.url ?? pr.url,
+              sourceBranch: status.sourceBranch ?? pr.sourceBranch,
+              targetBranch: status.targetBranch ?? pr.targetBranch,
+              headSha: status.headSha ?? pr.headSha ?? null,
+              targetSha: status.targetSha ?? pr.targetSha ?? null,
+              readyHeadSha: state === 'READY' || state === 'MERGED' ? pr.readyHeadSha : null,
+              mergeable: status.mergeable ?? null,
+              repositoryOutcome,
+            },
+          });
+        });
+        const prsByUnit = new Map();
+        for (const pr of reconciledPrs.filter(Boolean)) {
+          const rows = prsByUnit.get(pr.unitSlug) ?? [];
+          rows.push(pr);
+          prsByUnit.set(pr.unitSlug, rows);
+        }
+        await mapWithConcurrency(repairSlugs, 8, async (slug) => {
+          const prs = prsByUnit.get(slug) ?? [];
+          const changed = prs.filter((pr) => pr.state !== 'UNCHANGED');
+          const constructionComplete = sectionStages.every((stage) => {
+            const stageInstanceId = planStageInstanceId(
+              planNamespace,
+              stage.stageId,
+              slug,
+              sectionIndex,
+            );
+            return completedStageStates.has(stagesByInstance.get(stageInstanceId)?.state);
+          });
+          const fullyMerged =
+            changed.length > 0 &&
+            changed.every((pr) => pr.state === 'MERGED') &&
+            prs.every((pr) => pr.state === 'MERGED' || pr.state === 'UNCHANGED');
+          const resumeReview =
+            constructionComplete &&
+            changed.some((pr) => pr.state === 'DRAFT' || pr.state === 'READY') &&
+            !changed.some((pr) => pr.state === 'CLOSED' || pr.state === 'FAILED');
+          return store.updateUnitState({
+            executionId: intentId,
+            sectionIndex,
+            slug,
+            state: fullyMerged ? 'MERGED' : resumeReview ? 'PR_DRAFT' : 'PENDING',
+            ifOrchestratorRunId: repairRunId,
+            fields: {
+              failureReason: null,
+              blockedOn: null,
+              integrationOwner: false,
+              recoveryPreserveCompleted: true,
+              completionSkip: null,
+              blockedReason: fullyMerged
+                ? null
+                : resumeReview
+                  ? 'Resuming existing pull request after durable recovery'
+                  : 'Replaying unfinished work after durable recovery',
+              ...(fullyMerged ? { mergedAt: true } : {}),
+            },
+          });
+        });
+        await store
+          .appendEvent({
+            executionId: intentId,
+            type: 'v2.execution.lanes_repaired',
+            actor: responder.displayName || responder.sub,
+            summary: `${responder.displayName || 'Someone'} recovered section ${sectionIndex}; reconciled ${repairPrs.length} pull request(s), preserved completed stages, and relaunched unfinished lanes [${repairSlugs.join(', ')}] (${archivedArtifacts.length} artifact version(s) archived)`,
+          })
+          .catch(() => {});
+
+        const fromStageId = sectionStages[0].stageId;
+        const durableExecutionName = durableExecutionNameForIntent(intentId);
+        await store.deleteWorkflowCheckpoint(intentId);
+        const updated = await store.updateExecution({
+          executionId: intentId,
+          projectId,
+          status: 'CREATED',
+          fromStatus: 'FAILED',
+          ifOrchestratorRunId: repairRunId,
+          startedAt: meta.startedAt,
+          durableExecutionName,
+          durableExecutionArn: null,
+          orchestratorStartedAt: null,
+          orchestratorExpiresAt: null,
+          pendingHumanTaskId: null,
+          resumeRequired: null,
+          failureReason: null,
+          failure: null,
+          completedAt: null,
+          rewindFromStageId: fromStageId,
+          startedBy: responder.sub,
+          starterName: responder.displayName,
+          starterEmail: responder.email,
+          ...mcpLaunch.update,
+        });
+        try {
+          const invoked = await invokeOrchestrator(
+            {
+              action: 'start',
+              intentId,
+              executionId: intentId,
+              startAtStageId: fromStageId,
+            },
+            { durableExecutionName },
+          );
+          if (invoked?.durableExecutionArn) {
+            await store
+              .updateExecution({
+                executionId: intentId,
+                durableExecutionArn: invoked.durableExecutionArn,
+              })
+              .catch((error) => logger.error('Repair durable execution ARN stamp failed', error));
+          }
+        } catch (error) {
+          await store.updateExecution({
+            executionId: intentId,
+            projectId,
+            status: 'FAILED',
+            fromStatus: 'CREATED',
+            startedAt: meta.startedAt,
+            pendingHumanTaskId: null,
+            failureReason: 'lane_repair_relaunch_failed',
+            durableExecutionArn: null,
+          });
+          throw error;
+        }
+        return response(202, {
+          intent: mapIntent(updated),
+          repair: {
+            repairId,
+            sectionIndex,
+            laneSlugs: repairSlugs,
+            archivedArtifactCount: archivedArtifacts.length,
+            fromStageId,
+          },
+        });
+      } catch (error) {
+        await store
+          .updateExecution({
+            executionId: intentId,
+            ifOrchestratorRunId: repairRunId,
+            failureReason: 'lane_repair_failed',
+          })
+          .catch(() => {});
+        logger.error('Lane repair failed', error);
+        return response(502, {
+          error:
+            'Recovery did not finish. Integrated work is preserved. Refresh and review recovery again to retry.',
+          code: 'lane_repair_failed',
+        });
+      }
     }
 
     // POST /projects/{projectId}/intents/{intentId}/rewind
@@ -4726,6 +4899,7 @@ export const handler = async (event, context) => {
         resumeRequired: null,
         failureReason: 'rewind_in_progress',
         completedAt: null,
+        ifOrchestratorRunId: meta.orchestratorRunId,
         orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
       });
       // Retire a parked run first so the woken orchestrator exits quietly (its
@@ -4795,7 +4969,7 @@ export const handler = async (event, context) => {
               sectionIndex,
               slug,
               state: 'PENDING',
-              fields: { failureReason: null, blockedOn: null },
+              fields: { failureReason: null, blockedOn: null, completionSkip: null },
             })
             .catch((err) => logger.error('Unit lane reset failed', err, { sectionIndex, slug })),
         );
@@ -5041,6 +5215,7 @@ export const handler = async (event, context) => {
       await store.updateExecution({
         executionId: intentId,
         fromStatus: meta.status,
+        ifOrchestratorRunId: meta.orchestratorRunId,
         orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
       });
       await retireParkedRun(intentId, `recomposed from ${fromStage.stageId}`);
@@ -5274,6 +5449,7 @@ export const handler = async (event, context) => {
         // + the live UNIT lane rows, so the UI can render the lane board and
         // attribute per-unit stage instances. Both null/empty pre-promotion.
         unitPlan: mapUnitPlan(records.unitPlan),
+        unitCompletion: unitCompletion(records),
         units: (records.units ?? []).map(mapUnit),
         unitPrs: (records.unitPrs ?? []).map(mapUnitPr),
         feedbackBatches: (records.feedbackBatches ?? []).map(mapFeedbackBatch),

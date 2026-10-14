@@ -62,6 +62,25 @@ beforeEach(() => {
   };
 });
 
+it('preserves and reports a captured skeleton that a new DAG makes dependent', async () => {
+  store.getUnitPlan.mockResolvedValue({ walkingSkeleton: 'checkout', autonomyMode: 'gated' });
+  const result = await promoteUnits(basePayload, deps);
+  expect(result.ok).toBe(true);
+  expect(result.walkingSkeleton).toBe('checkout');
+  expect(result.selectionProblem).toContain('depends on auth, catalog');
+  expect(store.putUnitPlan).toHaveBeenCalledWith(
+    expect.objectContaining({
+      walkingSkeleton: 'checkout',
+      autonomyMode: 'gated',
+    }),
+  );
+  expect(store.appendEvent).toHaveBeenCalledWith(
+    expect.objectContaining({
+      type: 'v2.units.decisions_invalid',
+    }),
+  );
+});
+
 describe('pickCurrentArtifact', () => {
   it('prefers non-superseded rows and the newest timestamp', () => {
     const rows = [

@@ -67,6 +67,7 @@ const start = vi.fn();
 const rewind = vi.fn();
 const answerGate = vi.fn();
 const repair = vi.fn();
+const previewRepair = vi.fn();
 const exportWorkflow = vi.fn();
 const writeText = vi.fn();
 const graph = vi.fn();
@@ -79,6 +80,7 @@ vi.mock('@/services/intents', () => ({
     rewind: (...a: unknown[]) => rewind(...a),
     answerGate: (...a: unknown[]) => answerGate(...a),
     repair: (...a: unknown[]) => repair(...a),
+    previewRepair: (...a: unknown[]) => previewRepair(...a),
     exportWorkflow: (...a: unknown[]) => exportWorkflow(...a),
     // Knowledge graph feeding the popovers/derived-items section — empty
     // graph keeps those affordances out of these page-behavior tests.
@@ -164,6 +166,23 @@ describe('IntentView', () => {
     rewind.mockReset();
     answerGate.mockReset();
     repair.mockReset();
+    previewRepair.mockReset().mockResolvedValue({
+      preview: {
+        previewToken: 'preview-token',
+        kind: 'orphaned-lanes',
+        sectionIndex: 1,
+        fromStageId: 'cg',
+        laneSlugs: ['asset-containment'],
+        preservedSlugs: [],
+        rerunSharedStages: [],
+        skeletonProblem: null,
+        skeletonCandidates: [],
+        walkingSkeleton: 'asset-containment',
+        branch: 'aidlc/feature',
+        approvals: 'Normal approvals apply.',
+        pullRequests: [],
+      },
+    });
     exportWorkflow.mockReset();
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
@@ -982,10 +1001,104 @@ describe('IntentView', () => {
 
     expect(await screen.findByText('Parallel execution needs recovery')).toBeInTheDocument();
     expect(screen.getByText('Needs recovery')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Repair execution' }));
-    expect(await screen.findByText('Repair parallel execution')).toBeInTheDocument();
-    await userEvent.click(screen.getAllByRole('button', { name: 'Repair execution' }).at(-1)!);
-    expect(repair).toHaveBeenCalledWith('p1', 'i1');
+    await userEvent.click(screen.getByRole('button', { name: 'Preview recovery' }));
+    expect(await screen.findByText('Review recovery')).toBeInTheDocument();
+    expect(repair).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm and continue' }));
+    expect(repair).toHaveBeenCalledWith('p1', 'i1', { previewToken: 'preview-token' });
+  });
+
+  it('explains incomplete terminal work, previews preserved code and confirms expansion of the existing PR', async () => {
+    get.mockResolvedValue({
+      ...baseDetail({ status: 'SUCCEEDED' }),
+      unitCompletion: {
+        state: 'incomplete',
+        total: 11,
+        integrated: 1,
+        skipped: 0,
+        legacyPartial: false,
+        unresolved: [{ sectionIndex: 1, slug: 'notification-core', state: 'BLOCKED' }],
+      },
+    });
+    previewRepair.mockResolvedValue({
+      preview: {
+        previewToken: 'current-preview',
+        kind: 'incomplete-section',
+        sectionIndex: 1,
+        fromStageId: 'functional-design',
+        laneSlugs: ['notification-core'],
+        preservedSlugs: ['notifications-data-infra'],
+        rerunSharedStages: ['build-and-test', 'ci-pipeline'],
+        skeletonProblem: 'notification-core depends on notifications-data-infra.',
+        skeletonCandidates: ['notifications-data-infra'],
+        walkingSkeleton: 'notification-core',
+        branch: 'aidlc/notifications',
+        approvals: 'Review the skeleton again, then choose autonomy.',
+        pullRequests: [
+          { number: 533, repository: 'owner/repo', url: 'https://github.com/owner/repo/pull/533' },
+        ],
+      },
+    });
+    repair.mockResolvedValue({});
+    renderAt();
+    expect(await screen.findByText('Incomplete work')).toBeInTheDocument();
+    expect(screen.queryByText('SUCCEEDED')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Preview recovery' }));
+    expect(await screen.findByText(/This expands the existing open PR #533/)).toBeInTheDocument();
+    expect(screen.getByText(/build-and-test, ci-pipeline/)).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Walking skeleton' })).toHaveValue(
+      'notifications-data-infra',
+    );
+    expect(repair).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm and continue' }));
+    expect(repair).toHaveBeenCalledWith('p1', 'i1', {
+      previewToken: 'current-preview',
+      walkingSkeleton: 'notifications-data-infra',
+    });
+  });
+
+  it('identifies explicitly accepted partial delivery without offering to undo it', async () => {
+    get.mockResolvedValue({
+      ...baseDetail({ status: 'SUCCEEDED' }),
+      unitCompletion: {
+        state: 'partial',
+        total: 2,
+        integrated: 1,
+        skipped: 1,
+        unresolved: [],
+        legacyPartial: false,
+      },
+    });
+    renderAt();
+    expect(await screen.findByText('Partial delivery')).toBeInTheDocument();
+    expect(screen.getByText(/Partial delivery was explicitly accepted/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Preview recovery' })).not.toBeInTheDocument();
+  });
+
+  it('returns to a visible explanation and a fresh preview after a stale confirmation', async () => {
+    get.mockResolvedValue({
+      ...baseDetail({ status: 'SUCCEEDED' }),
+      unitCompletion: {
+        state: 'incomplete',
+        total: 2,
+        integrated: 1,
+        skipped: 0,
+        unresolved: [],
+        legacyPartial: false,
+      },
+    });
+    repair.mockRejectedValue(
+      new Error('Recovery preview changed. Review it again before continuing.'),
+    );
+    renderAt();
+    await userEvent.click(await screen.findByRole('button', { name: 'Preview recovery' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Confirm and continue' }));
+    expect(
+      await screen.findByText('Recovery preview changed. Review it again before continuing.'),
+    ).toBeVisible();
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Preview recovery' })).toBeEnabled();
+    expect(repair).toHaveBeenCalledTimes(1);
   });
 
   it('renders a review-verdict gate with its options and answers through the gate endpoint', async () => {

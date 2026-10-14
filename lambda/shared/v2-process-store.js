@@ -140,6 +140,31 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
   const now = () => (clock ? clock() : new Date().toISOString());
   const nextId = () => (ids ? ids() : randomUUID());
 
+  // Used by recovery's retired owner as well as active section decisions.
+  // The token check and row mutation must commit together.
+  const updateForRun = async (executionId, runId, params) => {
+    const { ReturnValues: _returnValues, ...update } = params;
+    await transact([
+      {
+        ConditionCheck: {
+          TableName: table(),
+          Key: executionMetaKey(executionId),
+          ConditionExpression: 'orchestratorRunId = :run',
+          ExpressionAttributeValues: { ':run': runId },
+        },
+      },
+      { Update: update },
+    ]);
+    const { Item } = await ddb.send(
+      new GetCommand({
+        TableName: table(),
+        Key: params.Key,
+        ConsistentRead: true,
+      }),
+    );
+    return Item ?? null;
+  };
+
   const transact = async (TransactItems) => {
     try {
       await ddb.send(new TransactWriteCommand({ TransactItems }));
@@ -381,6 +406,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     status,
     fromStatus = null,
     ifOrchestratorRunId = null,
+    ifUpdatedAt,
     ifPendingHumanTaskId,
     ownership = null,
     additionalWrites = [],
@@ -700,6 +726,10 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     if (ifOrchestratorRunId) {
       conditions.push('orchestratorRunId = :ifOrid');
       params.ExpressionAttributeValues[':ifOrid'] = ifOrchestratorRunId;
+    }
+    if (ifUpdatedAt !== undefined) {
+      conditions.push('updatedAt = :ifUpdatedAt');
+      params.ExpressionAttributeValues[':ifUpdatedAt'] = ifUpdatedAt;
     }
     if (ifResumeRequiredFor !== null) {
       conditions.push('resumeRequired.humanTaskId = :ifRrh');
@@ -1590,6 +1620,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     preservePendingCodeCommitRefs = false,
     loopBackId = null,
     countsAgainstCap = true,
+    ifOrchestratorRunId = null,
   }) => {
     const existing = await getStage(executionId, stageInstanceId, {
       consistentRead: Boolean(loopBackId),
@@ -1664,6 +1695,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
         : { ReturnValues: 'ALL_NEW' }),
     };
     if (!loopBackId) {
+      if (ifOrchestratorRunId) return updateForRun(executionId, ifOrchestratorRunId, stageUpdate);
       const { Attributes } = await ddb.send(new UpdateCommand(stageUpdate));
       return Attributes;
     }
@@ -2218,11 +2250,12 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
   // All unit lane rows for an execution. SK prefix 'UNIT#' (exact — a bare
   // 'UNIT' would also match UNITPLAN). Paginated: the orchestrator's lane
   // scheduler reads this — a dropped page would make lanes invisible.
-  const listUnits = async (executionId) => {
+  const listUnits = async (executionId, { consistentRead = false } = {}) => {
     const items = await queryAll(ddb, {
       TableName: table(),
       KeyConditionExpression: 'pk = :pk AND begins_with(sk, :p)',
       ExpressionAttributeValues: { ':pk': executionPk(executionId), ':p': 'UNIT#' },
+      ...(consistentRead ? { ConsistentRead: true } : {}),
     });
     return items.toSorted(bySk);
   };
@@ -2320,6 +2353,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     state,
     fromStates = null,
     fields = {},
+    ifOrchestratorRunId = null,
   }) => {
     if (!UNIT_STATES.includes(state)) throw new Error(`invalid unit state: ${state}`);
     const ts = now();
@@ -2369,6 +2403,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       });
     }
     try {
+      if (ifOrchestratorRunId) return await updateForRun(executionId, ifOrchestratorRunId, params);
       const { Attributes } = await ddb.send(new UpdateCommand(params));
       return Attributes;
     } catch (e) {
@@ -2813,6 +2848,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     skipMatrix,
     walkingSkeleton,
     autonomyMode,
+    ifOrchestratorRunId = null,
   }) => {
     const sets = ['updatedAt = :ts'];
     const values = { ':ts': now() };
@@ -2828,16 +2864,16 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       sets.push('autonomyMode = :am');
       values[':am'] = autonomyMode;
     }
-    const { Attributes } = await ddb.send(
-      new UpdateCommand({
-        TableName: table(),
-        Key: unitPlanKey(executionId),
-        UpdateExpression: `SET ${sets.join(', ')}`,
-        ExpressionAttributeValues: values,
-        ConditionExpression: 'attribute_exists(pk)',
-        ReturnValues: 'ALL_NEW',
-      }),
-    );
+    const params = {
+      TableName: table(),
+      Key: unitPlanKey(executionId),
+      UpdateExpression: `SET ${sets.join(', ')}`,
+      ExpressionAttributeValues: values,
+      ConditionExpression: 'attribute_exists(pk)',
+      ReturnValues: 'ALL_NEW',
+    };
+    if (ifOrchestratorRunId) return updateForRun(executionId, ifOrchestratorRunId, params);
+    const { Attributes } = await ddb.send(new UpdateCommand(params));
     return Attributes;
   };
 
@@ -3149,9 +3185,13 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
   // seconds and outputs are the bulk of a long run's partition. '#' is 0x23;
   // '$' (0x24) is the next code point, so sk < 'OUTPUT#' and sk >= 'OUTPUT$'
   // partition the SK space exactly around the OUTPUT# prefix.
-  const getExecutionRecords = async (executionId, { includeOutputs = true } = {}) => {
+  const getExecutionRecords = async (
+    executionId,
+    { includeOutputs = true, consistentRead = false } = {},
+  ) => {
     const base = {
       TableName: table(),
+      ...(consistentRead ? { ConsistentRead: true } : {}),
       ExpressionAttributeValues: { ':pk': executionPk(executionId) },
     };
     const Items = includeOutputs

@@ -797,9 +797,33 @@ export interface IntentDetail {
   /** Composer sessions (scope/grid proposals + authoritative validation). */
   composes?: ComposeSession[];
   unitPlan?: IntentUnitPlan | null;
+  unitCompletion?: {
+    state: 'complete' | 'partial' | 'incomplete';
+    total: number;
+    integrated: number;
+    skipped: number;
+    unresolved: { sectionIndex: number; slug: string; state: UnitState }[];
+    legacyPartial: boolean;
+  } | null;
   units?: IntentUnit[];
   unitPrs?: IntentUnitPr[];
   feedbackBatches?: IntentFeedbackBatch[];
+}
+
+export interface IntentRepairPreview {
+  previewToken: string;
+  kind: 'incomplete-section' | 'orphaned-lanes';
+  sectionIndex: number;
+  fromStageId: string;
+  laneSlugs: string[];
+  preservedSlugs: string[];
+  rerunSharedStages: string[];
+  skeletonProblem: string | null;
+  skeletonCandidates: string[];
+  walkingSkeleton: string | null;
+  branch: string;
+  approvals: string;
+  pullRequests: { repository: string; number: string | number; url: string }[];
 }
 
 export interface IntentRepairResult {
@@ -1186,8 +1210,17 @@ export const intentsService = {
       `/projects/${projectId}/intents/${intentId}/rewind`,
       input,
     ),
-  repair: (projectId: string, intentId: string) =>
-    api.post<IntentRepairResult>(`/projects/${projectId}/intents/${intentId}/repair`, {}),
+  previewRepair: (projectId: string, intentId: string) =>
+    api.post<{ preview: IntentRepairPreview }>(
+      `/projects/${projectId}/intents/${intentId}/repair`,
+      { preview: true },
+    ),
+  repair: (
+    projectId: string,
+    intentId: string,
+    input?: { previewToken: string; walkingSkeleton?: string },
+  ) =>
+    api.post<IntentRepairResult>(`/projects/${projectId}/intents/${intentId}/repair`, input ?? {}),
   // Re-attempt the durable callback for an already-recorded gate answer
   // (`intent.resumeRequired`). Idempotent: `resumed: false` means there was
   // nothing left to resume, which is a success, not an error.

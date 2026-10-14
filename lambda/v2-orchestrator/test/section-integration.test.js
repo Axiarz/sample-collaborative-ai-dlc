@@ -492,6 +492,7 @@ describe('WP8 fixture 2 — forced merge conflict → halt-and-ask SKIP (real gi
       'c:RUNNING',
       'c:MERGING',
       'c:FAILED',
+      'c:FAILED', // Human omission receipt retains the original failure state.
     ]);
     const cFailed = world.events.find((e) => e.type === 'v2.unit.failed' && e.unitSlug === 'c');
     expect(cFailed?.summary).toContain('markers_remain');

@@ -34,6 +34,7 @@
 
 import { createGraphWriter, closeGraphSource } from '../mcp/graph-writer.js';
 import { parseBoltDag } from '../../shared/v2-sensor-contract.js';
+import { effectiveSkeleton, skeletonProblem } from '../../shared/unit-completion.js';
 
 const DAG_ARTIFACT_TYPE = 'unit-of-work-dependency';
 
@@ -132,10 +133,23 @@ export const promoteUnits = async (payload, deps) => {
       // a rewind re-produces the DAG, not the humans' skip/skeleton/autonomy
       // answers (the unit-DAG stage's gate re-confirms them on re-approval).
       skipMatrix: existingPlan?.skipMatrix ?? {},
-      walkingSkeleton: existingPlan?.walkingSkeleton ?? batches[0]?.[0] ?? null,
+      walkingSkeleton: effectiveSkeleton({
+        units,
+        batches,
+        walkingSkeleton: existingPlan?.walkingSkeleton,
+      }),
       autonomyMode: existingPlan?.autonomyMode ?? null,
     });
-    const sync = await store.syncUnitRows({ executionId, units, batches, sectionIndexes });
+    const sync = await store.syncUnitRows({
+      executionId,
+      units,
+      batches,
+      sectionIndexes,
+    });
+    // A new DAG can invalidate a captured choice. Preserve the decision for
+    // explicit re-approval and surface the dependency before it can execute.
+    const selectionProblem = skeletonProblem(plan);
+    if (selectionProblem) await event('v2.units.decisions_invalid', selectionProblem);
 
     // 4. Traceability mirror (never blocks promotion outcome — the DDB truth
     // is already written; a mirror failure is recorded and visible).
@@ -164,6 +178,7 @@ export const promoteUnits = async (payload, deps) => {
       unitCount: units.length,
       batchCount: batches.length,
       walkingSkeleton: plan.walkingSkeleton,
+      selectionProblem,
       sync,
       mirror,
     };

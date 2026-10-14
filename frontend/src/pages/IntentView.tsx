@@ -133,6 +133,10 @@ export default function IntentView() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmRepair, setConfirmRepair] = useState(false);
+  const [repairPreview, setRepairPreview] = useState<
+    import('@/services/intents').IntentRepairPreview | null
+  >(null);
+  const [repairSkeleton, setRepairSkeleton] = useState('');
   const [repairing, setRepairing] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [resumeNotice, setResumeNotice] = useState<{
@@ -270,14 +274,36 @@ export default function IntentView() {
     }
   };
 
+  const previewRepair = async () => {
+    setRepairing(true);
+    setActionError(null);
+    setRepairPreview(null);
+    try {
+      const { preview } = await intentsService.previewRepair(projectId, intentId);
+      setRepairPreview(preview);
+      setRepairSkeleton(preview.skeletonCandidates[0] ?? '');
+      setConfirmRepair(true);
+    } catch (err) {
+      setDismissedError(null);
+      setActionError(err instanceof Error ? err.message : 'Failed to preview recovery');
+    } finally {
+      setRepairing(false);
+    }
+  };
+
   const handleRepair = async () => {
+    if (!repairPreview) return;
     setRepairing(true);
     setActionError(null);
     try {
-      await intentsService.repair(projectId, intentId);
+      await intentsService.repair(projectId, intentId, {
+        previewToken: repairPreview.previewToken,
+        ...(repairPreview.skeletonProblem ? { walkingSkeleton: repairSkeleton } : {}),
+      });
       setConfirmRepair(false);
       await reload();
     } catch (err) {
+      setConfirmRepair(false);
       setDismissedError(null);
       setActionError(err instanceof Error ? err.message : 'Failed to repair intent');
     } finally {
@@ -344,8 +370,14 @@ export default function IntentView() {
   const intent = detail.intent;
   const laneWaits = deriveLaneWaits(detail.stages, gates);
   const recoveryWaits = Object.values(laneWaits).filter((wait) => wait.kind === 'recovery');
+  const terminalIncomplete =
+    ['SUCCEEDED', 'FAILED'].includes(intent.status) &&
+    detail.unitCompletion?.state === 'incomplete';
+  const terminalPartial =
+    intent.status === 'SUCCEEDED' && detail.unitCompletion?.state === 'partial';
   const needsLaneRepair =
-    recoveryWaits.length > 0 && ['RUNNING', 'WAITING', 'FAILED'].includes(intent.status);
+    terminalIncomplete ||
+    (recoveryWaits.length > 0 && ['RUNNING', 'WAITING', 'FAILED'].includes(intent.status));
   const error = actionError ?? loadError;
   const visibleError = error && error !== dismissedError ? errorMessage(error) : null;
   const isDraft = intent.status === 'DRAFT';
@@ -417,7 +449,11 @@ export default function IntentView() {
           </h1>
           {TERMINAL_STATUSES.has(intent.status) && (
             <Badge variant="outline" className="text-[10px] shrink-0">
-              {intent.status}
+              {terminalIncomplete
+                ? 'Incomplete work'
+                : terminalPartial
+                  ? 'Partial delivery'
+                  : intent.status}
             </Badge>
           )}
           <MethodologyReleaseBadge release={intent.methodologyRelease ?? null} />
@@ -585,12 +621,20 @@ export default function IntentView() {
             <div className="min-w-0">
               <div className="flex items-center gap-1.5 font-medium text-agent-error">
                 <TriangleAlert className="h-4 w-4" />
-                Parallel execution needs recovery
+                {terminalIncomplete
+                  ? 'Current plan has unfinished work'
+                  : 'Parallel execution needs recovery'}
               </div>
               <p className="mt-1 text-[12px] text-muted-foreground">
-                {recoveryWaits.length} lane{recoveryWaits.length === 1 ? ' is' : 's are'} parked
-                without an answerable question. Merged units are safe; active lanes must be replayed
-                from the section boundary.
+                {terminalIncomplete ? (
+                  `${detail.unitCompletion?.integrated} of ${detail.unitCompletion?.total} units integrated. The recorded completion did not finish the current plan. Preview recovery to preserve integrated work and continue the remaining units.`
+                ) : (
+                  <>
+                    {recoveryWaits.length} lane{recoveryWaits.length === 1 ? ' is' : 's are'} parked
+                    without an answerable question. Merged units are safe; active lanes must be
+                    replayed from the section boundary.
+                  </>
+                )}
               </p>
             </div>
             {canRepair && (
@@ -600,18 +644,24 @@ export default function IntentView() {
                 variant="outline"
                 className="shrink-0 gap-1.5"
                 disabled={repairing}
-                onClick={() => setConfirmRepair(true)}
+                onClick={() => void previewRepair()}
               >
                 {repairing ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 ) : (
                   <Wrench className="h-3.5 w-3.5" />
                 )}
-                Repair execution
+                Preview recovery
               </Button>
             )}
           </div>
         </div>
+      )}
+      {terminalPartial && (
+        <p className="rounded border p-3 text-sm">
+          Partial delivery was explicitly accepted. Some current-plan work was omitted; integrated
+          work is on the intent branch. The final pull request has its own review and merge status.
+        </p>
       )}
 
       {/* The answer is already recorded; only its durable callback failed, so one
@@ -903,23 +953,69 @@ export default function IntentView() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Repair parallel execution</AlertDialogTitle>
+            <AlertDialogTitle>Review recovery</AlertDialogTitle>
             <AlertDialogDescription>
-              This stops the orphaned execution, preserves merged units, archives active lane
-              artifacts, resets active lanes and their draft pull requests, then relaunches the
-              affected section.
+              Continue unfinished work on the existing intent branch. Original events, accepted
+              answers and integrated code are preserved. Completed lane stages are reused;
+              unfinished stages resume. This starts a new execution run with the original workflow
+              and runtime settings.
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {repairPreview && (
+            <div className="max-h-[50vh] space-y-3 overflow-y-auto text-sm">
+              <p>
+                <strong>Preserved units:</strong>{' '}
+                {repairPreview.preservedSlugs.join(', ') || 'None integrated yet'}.
+              </p>
+              <p>
+                <strong>Units to continue:</strong> {repairPreview.laneSlugs.join(', ')}.
+              </p>
+              <p>
+                <strong>Shared stages to rerun:</strong>{' '}
+                {repairPreview.rerunSharedStages.join(', ') || 'None reset by this recovery'}.
+              </p>
+              <p>{repairPreview.approvals}</p>
+              {repairPreview.skeletonProblem && (
+                <label className="block space-y-2">
+                  <span>{repairPreview.skeletonProblem}</span>
+                  <span className="block font-medium">Walking skeleton</span>
+                  <select
+                    className="w-full rounded border bg-background p-2"
+                    aria-label="Walking skeleton"
+                    value={repairSkeleton}
+                    onChange={(event) => setRepairSkeleton(event.target.value)}
+                  >
+                    {repairPreview.skeletonCandidates.map((slug) => (
+                      <option key={slug} value={slug}>
+                        {slug}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <p>
+                <strong>Delivery:</strong> Remaining implementation is added to{' '}
+                <code>{repairPreview.branch}</code>.
+                {repairPreview.pullRequests.length > 0
+                  ? ` This expands the existing open PR ${repairPreview.pullRequests.map((pr) => `#${pr.number}`).join(', ')}; it does not stay limited to the currently integrated units.`
+                  : ' Existing unit pull requests are reused. Final delivery follows the original PR strategy.'}
+              </p>
+            </div>
+          )}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={repairing}>Cancel</AlertDialogCancel>
             <AlertDialogAction
-              disabled={repairing}
+              disabled={
+                repairing ||
+                !repairPreview ||
+                (Boolean(repairPreview?.skeletonProblem) && !repairSkeleton)
+              }
               onClick={(event) => {
                 event.preventDefault();
                 void handleRepair();
               }}
             >
-              {repairing ? 'Repairing…' : 'Repair execution'}
+              {repairing ? 'Starting recovery…' : 'Confirm and continue'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

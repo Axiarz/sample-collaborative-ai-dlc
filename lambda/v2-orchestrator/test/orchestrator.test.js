@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { __durableHandler } from '../index.js';
+import dependentSkeletonPlan from './fixtures/dependent-skeleton-plan.json';
 
 // The orchestrator's control flow is driven through an injected `deps` bag and a
 // fake DurableContext — no real AWS/Neptune. This isolates the sequencing logic
@@ -133,6 +134,7 @@ beforeEach(() => {
       putTrackerSync: vi.fn(async (args) => args),
       failRunningStageAttempt: vi.fn(async () => null),
       listUnits: vi.fn(async () => []),
+      updateUnitPlanDecisions: vi.fn(async () => ({})),
       getUnit: vi.fn(async () => null),
     },
     loadPlan: vi.fn(async () => ({
@@ -2491,6 +2493,72 @@ describe('WP5 — engine-gate decisions', () => {
   const start = () =>
     __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
 
+  it('rejects the observed dependent skeleton before building, shared checks or final PR creation', async () => {
+    unitPlanRow = structuredClone(dependentSkeletonPlan);
+    const result = await start();
+    expect(result).toMatchObject({ ok: false, reason: 'invalid_walking_skeleton' });
+    expect(stageStarts().filter((payload) => payload.unitSlug)).toEqual([]);
+    expect(stageStarts().some((payload) => payload.stageId === 'bt')).toBe(false);
+    expect(deps.openPr).not.toHaveBeenCalled();
+    expect(
+      deps.store.updateExecution.mock.calls.some(([input]) => input.status === 'SUCCEEDED'),
+    ).toBe(false);
+    expect(unitPlanRow.walkingSkeleton).toBe('notification-core');
+  });
+
+  it('does not execute a different default when an approved fan-out decision cannot be saved', async () => {
+    deps.store.updateUnitPlanDecisions.mockRejectedValue(new Error('decision store unavailable'));
+    const result = await start();
+    expect(result.ok).toBe(false);
+    expect(stageStarts().filter((payload) => payload.unitSlug)).toEqual([]);
+    expect(deps.openPr).not.toHaveBeenCalled();
+  });
+
+  it('integrates all eleven units with the dependency-free control, preserving the recovered foundation', async () => {
+    unitPlanRow = {
+      ...structuredClone(dependentSkeletonPlan),
+      walkingSkeleton: 'notifications-data-infra',
+    };
+    deps.store.listUnits.mockResolvedValue([
+      { slug: 'notifications-data-infra', sectionIndex: 1, state: 'MERGED' },
+      { slug: 'old-plan-unit', sectionIndex: 1, state: 'PENDING' },
+    ]);
+    const result = await start();
+    expect(result.ok).toBe(true);
+    const integrations = invokes.filter((payload) => payload.command === 'merge-lane');
+    expect(integrations).toHaveLength(10);
+    expect(integrations.some((payload) => payload.unitSlug === 'notifications-data-infra')).toBe(
+      false,
+    );
+    expect(stageStarts().some((payload) => payload.stageId === 'bt')).toBe(true);
+    expect(
+      deps.store.appendEvent.mock.calls
+        .map(([event]) => event)
+        .find((event) => event.type === 'v2.units.fan_in').summary,
+    ).toContain('11/11');
+  });
+
+  it('does not let blocked-only lanes reach shared work without an explicit outcome', async () => {
+    unitPlanRow = {
+      units: [{ slug: 'blocked', dependsOn: ['missing-prerequisite'] }],
+      batches: [['blocked']],
+      walkingSkeleton: 'blocked',
+      autonomyMode: 'autonomous',
+    };
+    const plan = SECTION_PLAN();
+    plan.plan.stages
+      .filter((stage) => stage.parallelSection === 1)
+      .forEach((stage) => {
+        stage.policy = { skeleton: 'off' };
+      });
+    deps.loadPlan.mockResolvedValue(plan);
+    deps.store.getHumanTask = gateReads({ 'eg-halt': { answer: { decision: 'abort' } } });
+    const result = await start();
+    expect(result).toMatchObject({ ok: false, reason: 'section_aborted' });
+    expect(stageStarts().some((payload) => payload.stageId === 'bt')).toBe(false);
+    expect(deps.openPr).not.toHaveBeenCalled();
+  });
+
   it('halt-and-ask RETRY re-runs the failed lane under fresh round identities and completes the run', async () => {
     let cgBillingAttempts = 0;
     deps.store.getHumanTask = gateReads({ 'eg-halt': { answer: { decision: 'retry' } } });
@@ -2603,6 +2671,19 @@ describe('WP5 — engine-gate decisions', () => {
     const eventCalls = deps.store.appendEvent.mock.calls.map((c) => c[0]);
     expect(eventCalls.some((e) => e.type === 'v2.units.lanes_skipped')).toBe(true);
     expect(eventCalls.find((e) => e.type === 'v2.units.fan_in')?.summary).toContain('1/2');
+    expect(
+      unitStates.find((unit) => unit.slug === 'billing' && unit.fields?.completionSkip),
+    ).toMatchObject({
+      fields: {
+        completionSkip: {
+          humanTaskId: expect.stringMatching(/^eg-halt/),
+          planIdentity: expect.any(String),
+        },
+      },
+    });
+    expect(eventCalls.find((e) => e.type === 'v2.units.fan_in')?.summary).toContain(
+      'explicitly omitted',
+    );
   });
 
   it('AUTONOMOUS wavefront: a failed lane BLOCKS its dependents while independents finish', async () => {
@@ -2633,7 +2714,7 @@ describe('WP5 — engine-gate decisions', () => {
     // c never dispatched a stage — it blocked on b.
     expect(stageStarts().some((p) => p.unitSlug === 'c')).toBe(false);
     const cStates = unitStates.filter((u) => u.slug === 'c').map((u) => u.state);
-    expect(cStates).toEqual(['BLOCKED']);
+    expect([...new Set(cStates)]).toEqual(['BLOCKED']);
     expect(unitStates.find((u) => u.slug === 'c' && u.state === 'BLOCKED').fields).toMatchObject({
       blockedOn: 'b',
     });
@@ -2835,8 +2916,8 @@ describe('WP5 — engine-gate decisions', () => {
 
   it('an uninterpretable halt-and-ask answer RE-ASKS; the follow-up choice is honored', async () => {
     deps.store.getHumanTask = gateReads({
-      'eg-halt-s1-r0-a1': { answer: { decision: 'skip' } },
-      'eg-halt-s1-r0': { answer: { decision: 'garbage' } },
+      'eg-halt-s1-w1-r0-a1': { answer: { decision: 'skip' } },
+      'eg-halt-s1-w1-r0': { answer: { decision: 'garbage' } },
     });
     deps.invokeRuntime = makeRuntime(ctx, (payload) => {
       if (payload.command === 'init-ws') return { ok: true };
@@ -2999,6 +3080,21 @@ describe('WP6 — PR opened on SUCCEEDED (intent-pr)', () => {
     __durableHandler({ action: 'start', intentId: 'i1', executionId: 'i1' }, ctx, deps);
   const events = () => deps.store.appendEvent.mock.calls.map((c) => c[0]);
 
+  it('counts only current-plan units in the final PR summary, retaining older rows', async () => {
+    const rows = [
+      { slug: 'auth', state: 'MERGED' },
+      { slug: 'billing', state: 'MERGED' },
+      { slug: 'retired-plan-unit', state: 'PENDING' },
+    ];
+    deps.store.listUnits.mockResolvedValue(rows);
+    deps.store.getUnitPlan = vi.fn(async () => UNIT_PLAN());
+    expect((await start()).ok).toBe(true);
+    const body = deps.openPr.mock.calls[0][0].body;
+    expect(body).toContain('2 total, 2 integrated into the intent branch');
+    expect(body).not.toContain('retired-plan-unit');
+    expect(rows).toHaveLength(3);
+  });
+
   it('opens one PR per repo from the intent branch with execution provenance in the body', async () => {
     deps.store.getExecution = vi.fn(async () => ({
       ...META,
@@ -3036,7 +3132,7 @@ describe('WP6 — PR opened on SUCCEEDED (intent-pr)', () => {
       'created by [AI-DLC](https://aidlc.example.test/space/p1/intent/i1)',
     );
     expect(deps.openPr.mock.calls[0][0].body).toContain('strategy: intent-pr');
-    expect(deps.openPr.mock.calls[0][0].body).toContain('2 total, 2 merged');
+    expect(deps.openPr.mock.calls[0][0].body).toContain('2 total, 2 integrated');
     const opened = events().filter((e) => e.type === 'v2.pr.opened');
     expect(opened).toHaveLength(2);
     expect(opened[0].summary).toContain('https://github.com/o/r/pull/7');
@@ -3238,9 +3334,9 @@ describe('WP6 — PR opened on SUCCEEDED (intent-pr)', () => {
     deps.openPr = vi.fn(async () => ({ prUrl: 'https://x/pr/1', prNumber: 1 }));
     await start();
     const body = deps.openPr.mock.calls[0][0].body;
-    expect(body).toContain('3 total, 1 merged');
-    expect(body).toContain('unit `billing` NOT merged (FAILED: merge-lane: markers_remain)');
-    expect(body).toContain('unit `checkout` NOT merged (BLOCKED)');
+    expect(body).toContain('3 total, 1 integrated');
+    expect(body).toContain('unit `billing` NOT integrated (FAILED: merge-lane: markers_remain)');
+    expect(body).toContain('unit `checkout` NOT integrated (BLOCKED)');
   });
 
   it('an identical branch records v2.pr.skipped without calling the provider create API', async () => {
