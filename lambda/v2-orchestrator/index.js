@@ -79,6 +79,7 @@ import { runQuorumEdit } from './quorum-edit.js';
 import { buildIntentAttribution } from './pr-attribution.js';
 import { bindGateCallback, ownsAnsweredGate, unparkGate } from './gate-callback.js';
 import { OVERRIDE_REASON_MAX } from '../shared/gate-answer.js';
+import recoveryCapabilities from '../shared/recovery-capabilities.json' with { type: 'json' };
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
 // this module implements. Checked against the registry by a test, so a
@@ -398,6 +399,17 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
     logger.info('ignoring non-start invocation', { action: event.action });
     return { ok: false, reason: 'not_a_start' };
   }
+  if (
+    event.recoveryRuntime &&
+    (event.recoveryRuntime.schemaVersion !== recoveryCapabilities.schemaVersion ||
+      !Array.isArray(event.recoveryRuntime.requiredCapabilities) ||
+      !event.recoveryRuntime.requiredCapabilities.length ||
+      !event.recoveryRuntime.requiredCapabilities.every((capability) =>
+        recoveryCapabilities.capabilities.includes(capability),
+      ))
+  ) {
+    return { ok: false, reason: 'recovery_capability_unsupported' };
+  }
 
   const meta = await ctx.step('load-meta', async () => {
     const loaded = await store.getExecution(executionId, {
@@ -405,10 +417,26 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
     });
     // Version behavior in the existing first checkpoint. Old histories have no
     // marker and retain their operation sequence; repair creates a new history.
-    return loaded ? { ...loaded, completionPolicyVersion: 1 } : null;
+    return loaded
+      ? {
+          ...loaded,
+          completionPolicyVersion: 1,
+          ...(event.recoveryRuntime ? { recoveryRuntime: event.recoveryRuntime } : {}),
+        }
+      : null;
   });
   if (!meta) return { ok: false, reason: 'execution_not_found' };
   const runtimeTarget = resolveRuntimeTarget(meta, RUNTIME_ARN());
+  const recoveryRuntime = meta.recoveryRuntime;
+  if (
+    recoveryRuntime &&
+    (recoveryRuntime.agentRuntimeArn !== runtimeTarget.agentRuntimeArn ||
+      recoveryRuntime.qualifier !== (runtimeTarget.qualifier || 'DEFAULT'))
+  ) {
+    return { ok: false, reason: 'recovery_target_changed' };
+  }
+  const checkedPayload = (payload) =>
+    recoveryRuntime ? { ...recoveryRuntime, command: 'recovery-dispatch', payload } : payload;
   const stopIntentSession = (sessionId) => stopSession(sessionId, runtimeTarget);
 
   const { projectId, workflowId, workflowVersion, scope } = meta;
@@ -416,7 +444,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
   const invokeIntentRuntime = async (payload, runtimeSessionId) => {
     const authMode = commandDefinition(payload.command)?.agentAuth;
     if (!authMode || !credentialBinding || typeof deps.issueAgentCredentialGrant !== 'function') {
-      return rawInvokeRuntime(payload, runtimeSessionId, runtimeTarget);
+      return rawInvokeRuntime(checkedPayload(payload), runtimeSessionId, runtimeTarget);
     }
     const { agentCredentialGrant } = await prepareAgentInvocation(
       {
@@ -429,10 +457,10 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
       { issueGrant: deps.issueAgentCredentialGrant },
     );
     return rawInvokeRuntime(
-      {
+      checkedPayload({
         ...payload,
         agentCredentialGrant,
-      },
+      }),
       runtimeSessionId,
       runtimeTarget,
     );

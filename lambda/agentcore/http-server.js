@@ -79,6 +79,7 @@ import { commandDefinition } from './command-registry.js';
 import { installProcessGroupShutdown } from './cli/spawn.js';
 import { createCredentialSession } from './credential-session.js';
 import { accountCredentialInvocation } from './invocation-accounting.js';
+import { deployedRecoveryCapabilities, recoveryDispatchPayload } from './recovery-capabilities.js';
 
 const logger = new Logger({ persistentKeys: { component: 'agentcore' } });
 
@@ -114,6 +115,24 @@ export const dispatchInvocation = async ({
   now = () => new Date().toISOString(),
 }) => {
   const command = payload?.command;
+  // Both commands are handled before auth, accounting, busy state or business
+  // handlers. An old image rejects the envelope as an unknown command.
+  if (command === 'recovery-capabilities') {
+    return { statusCode: 200, body: { ok: true, ...deployedRecoveryCapabilities() } };
+  }
+  if (command === 'recovery-dispatch') {
+    const checked = recoveryDispatchPayload(payload);
+    if (!checked) {
+      return {
+        statusCode: 409,
+        body: {
+          error: 'Recovery environment changed. Refresh the recovery preview before retrying.',
+          code: 'recovery_runtime_changed',
+        },
+      };
+    }
+    return dispatchInvocation({ payload: checked, handlers, busy, prepareInvocation, now });
+  }
   if (!command) {
     logger.warn('dispatch rejected: missing command');
     return { statusCode: 400, body: { error: 'missing "command"' } };

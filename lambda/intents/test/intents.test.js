@@ -17,6 +17,8 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import {
   LambdaClient,
+  GetAliasCommand,
+  GetFunctionConfigurationCommand,
   GetDurableExecutionCommand,
   InvokeCommand,
   ListDurableExecutionsByFunctionCommand,
@@ -29,6 +31,11 @@ import {
   InvokeAgentRuntimeCommand,
   StopRuntimeSessionCommand,
 } from '@aws-sdk/client-bedrock-agentcore';
+import {
+  BedrockAgentCoreControlClient,
+  GetAgentRuntimeEndpointCommand,
+} from '@aws-sdk/client-bedrock-agentcore-control';
+import recoveryContract from '../../shared/recovery-capabilities.json' with { type: 'json' };
 import {
   CopyObjectCommand,
   DeleteObjectCommand,
@@ -96,6 +103,10 @@ const ddbMock = mockClient(DynamoDBDocumentClient);
 const lambdaMock = mockClient(LambdaClient);
 const ssmMock = mockClient(SSMClient);
 const agentcoreMock = mockClient(BedrockAgentCoreClient);
+const runtimeControlMock = mockClient(BedrockAgentCoreControlClient);
+const recoveryFunctionArn = 'arn:aws:lambda:us-east-1:123456789012:function:orchestrator-test:17';
+const recoveryRuntimeArn =
+  'arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/original-abcdefghij';
 let sourceControlReviewComments = [];
 let sourceControlValidationResponse = { ready: true, repositories: [] };
 const s3Mock = mockClient(S3Client);
@@ -513,6 +524,9 @@ beforeEach(() => {
       .map((Name) => ({ Name, Value: `${Name}-value` })),
   }));
   agentcoreMock.reset();
+  runtimeControlMock.reset();
+  vi.stubEnv('V2_ORCHESTRATOR_FUNCTION', 'orchestrator-test');
+  vi.stubEnv('RECOVERY_ORCHESTRATOR_RELEASE', undefined);
   attachmentUpdateConflict = null;
   archiveArtifactsSpy.mockClear();
   readCheckpointArtifactVersionsSpy.mockClear();
@@ -531,7 +545,9 @@ const claims = (sub) => ({
 const orchestratorInvokes = () =>
   lambdaMock
     .commandCalls(InvokeCommand)
-    .filter((call) => call.args[0].input.FunctionName === 'orchestrator-test');
+    .filter((call) =>
+      ['orchestrator-test', recoveryFunctionArn].includes(call.args[0].input.FunctionName),
+    );
 
 // Seed a v2 project with an owner member + a primary repo + a workflow META row.
 const seedV2Project = async (sub) => {
@@ -6423,6 +6439,37 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
     });
 
   const falseSuccess = async () => {
+    vi.stubEnv('V2_ORCHESTRATOR_FUNCTION', 'orchestrator-test:live');
+    vi.stubEnv(
+      'RECOVERY_ORCHESTRATOR_RELEASE',
+      JSON.stringify({
+        ...recoveryContract,
+        functionArn: recoveryFunctionArn,
+        codeSha256: 'package-hash',
+      }),
+    );
+    lambdaMock.on(GetAliasCommand).resolves({ FunctionVersion: '17', RevisionId: 'alias-1' });
+    lambdaMock.on(GetFunctionConfigurationCommand).resolves({
+      FunctionArn: recoveryFunctionArn,
+      Version: '17',
+      State: 'Active',
+      CodeSha256: 'package-hash',
+    });
+    runtimeControlMock.on(GetAgentRuntimeEndpointCommand).resolves({
+      agentRuntimeArn: recoveryRuntimeArn,
+      name: 'original',
+      status: 'READY',
+      liveVersion: '7',
+      targetVersion: '7',
+      lastUpdatedAt: new Date('2026-01-01'),
+    });
+    agentcoreMock.on(InvokeAgentRuntimeCommand).callsFake(() => ({
+      response: [
+        Buffer.from(
+          JSON.stringify({ ok: true, ...recoveryContract, sourceSha256: 'a'.repeat(64) }),
+        ),
+      ],
+    }));
     const sub = `u-${randomUUID()}`;
     const projectId = await seedV2Project(sub);
     seedSectionPlan();
@@ -6432,6 +6479,7 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
       status: 'SUCCEEDED',
       orchestratorRunId: 'finished-run',
       branch: 'aidlc/feature',
+      environment: { runtimeArn: recoveryRuntimeArn, runtimeEndpoint: 'original' },
     });
     seedStageRow(intent.id, 'units-gen');
     seedStageRow(intent.id, 'cg', 'foundation', 'SUCCEEDED', 1);
@@ -6521,6 +6569,19 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
       autonomyMode: null,
     });
     expect(orchestratorInvokes()).toHaveLength(1);
+    const launch = orchestratorInvokes()[0].args[0].input;
+    expect(launch.FunctionName).toBe(recoveryFunctionArn);
+    expect(JSON.parse(Buffer.from(launch.Payload))).toMatchObject({
+      recoveryRuntime: {
+        sourceSha256: 'a'.repeat(64),
+        agentRuntimeArn: recoveryRuntimeArn,
+        qualifier: 'original',
+      },
+    });
+    expect(procStore.get(keyOf(pk, 'META')).environment).toEqual({
+      runtimeArn: recoveryRuntimeArn,
+      runtimeEndpoint: 'original',
+    });
     expect(
       (await repair(sub, projectId, intent.id, { previewToken: preview.previewToken })).statusCode,
     ).toBe(409);
@@ -6549,6 +6610,76 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
     expect(lambdaMock.commandCalls(StopDurableExecutionCommand)).toHaveLength(0);
   });
 
+  it.each(['unsupported', 'denied', 'outage'])(
+    'makes no recovery mutation when deployment is %s, including direct confirmation without preview',
+    async (failure) => {
+      const { sub, projectId, intent } = await falseSuccess();
+      if (failure === 'unsupported') {
+        agentcoreMock.on(InvokeAgentRuntimeCommand).callsFake(() => ({
+          response: [Buffer.from(JSON.stringify({ error: 'unknown command' }))],
+        }));
+      } else {
+        runtimeControlMock.on(GetAgentRuntimeEndpointCommand).rejects(
+          Object.assign(new Error('read failed'), {
+            name: failure === 'denied' ? 'AccessDeniedException' : 'ServiceException',
+          }),
+        );
+      }
+      const before = structuredClone([...procStore.entries()]);
+      const preview = JSON.parse(
+        (await repair(sub, projectId, intent.id, { preview: true })).body,
+      ).preview;
+      expect(preview.compatibility.status).toBe(
+        failure === 'unsupported' ? 'update-required' : 'unverified',
+      );
+      for (const input of [
+        {},
+        { previewToken: preview.previewToken, walkingSkeleton: 'foundation' },
+      ]) {
+        const response = await repair(sub, projectId, intent.id, input);
+        expect(response.statusCode).toBe(409);
+        expect(JSON.parse(response.body).code).toBe('repair_compatibility_blocked');
+      }
+      expect([...procStore.entries()]).toEqual(before);
+      expect(archiveArtifactsSpy).not.toHaveBeenCalled();
+      expect(orchestratorInvokes()).toHaveLength(0);
+      expect(lambdaMock.commandCalls(StopDurableExecutionCommand)).toHaveLength(0);
+      expect(agentcoreMock.commandCalls(StopRuntimeSessionCommand)).toHaveLength(0);
+      for (const call of agentcoreMock.commandCalls(InvokeAgentRuntimeCommand)) {
+        expect(JSON.parse(Buffer.from(call.args[0].input.payload))).toEqual({
+          command: 'recovery-capabilities',
+        });
+      }
+    },
+  );
+
+  it.each(['after-preview', 'before-retirement'])(
+    'requires a fresh preview when the launch alias moves %s',
+    async (timing) => {
+      const { sub, projectId, intent } = await falseSuccess();
+      const { preview } = JSON.parse(
+        (await repair(sub, projectId, intent.id, { preview: true })).body,
+      );
+      const before = structuredClone([...procStore.entries()]);
+      const moved = { FunctionVersion: '17', RevisionId: 'alias-2' };
+      if (timing === 'after-preview') lambdaMock.on(GetAliasCommand).resolves(moved);
+      else
+        lambdaMock
+          .on(GetAliasCommand)
+          .resolvesOnce({ FunctionVersion: '17', RevisionId: 'alias-1' })
+          .resolves(moved);
+      const result = await repair(sub, projectId, intent.id, {
+        previewToken: preview.previewToken,
+        walkingSkeleton: 'foundation',
+      });
+      expect(result.statusCode).toBe(409);
+      expect(JSON.parse(result.body).code).toBe('repair_preview_changed');
+      expect([...procStore.entries()]).toEqual(before);
+      expect(archiveArtifactsSpy).not.toHaveBeenCalled();
+      expect(orchestratorInvokes()).toHaveLength(0);
+    },
+  );
+
   it('rejects stale previews and dependent selections before changing terminal work', async () => {
     const { sub, projectId, intent, pk } = await falseSuccess();
     const { preview } = JSON.parse(
@@ -6572,6 +6703,31 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
       ).statusCode,
     ).toBe(409);
     expect(procStore.get(keyOf(pk, 'META')).status).toBe('SUCCEEDED');
+    expect(orchestratorInvokes()).toHaveLength(0);
+  });
+
+  it('refuses an endpoint version change after preview without changing the original target', async () => {
+    const { sub, projectId, intent } = await falseSuccess();
+    const { preview } = JSON.parse(
+      (await repair(sub, projectId, intent.id, { preview: true })).body,
+    );
+    const before = structuredClone([...procStore.entries()]);
+    runtimeControlMock.on(GetAgentRuntimeEndpointCommand).resolves({
+      agentRuntimeArn: recoveryRuntimeArn,
+      name: 'original',
+      status: 'READY',
+      liveVersion: '8',
+      targetVersion: '8',
+      lastUpdatedAt: new Date('2026-01-02'),
+    });
+    const result = await repair(sub, projectId, intent.id, {
+      previewToken: preview.previewToken,
+      walkingSkeleton: 'foundation',
+    });
+    expect(result.statusCode).toBe(409);
+    expect(JSON.parse(result.body).code).toBe('repair_preview_changed');
+    expect([...procStore.entries()]).toEqual(before);
+    expect(archiveArtifactsSpy).not.toHaveBeenCalled();
     expect(orchestratorInvokes()).toHaveLength(0);
   });
 

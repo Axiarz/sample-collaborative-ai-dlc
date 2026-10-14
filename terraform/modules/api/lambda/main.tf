@@ -9,6 +9,13 @@ locals {
   all_lambdas_in_vpc   = var.lambda_vpc_scope == "all"
 
   powertools_service_name = var.powertools_service_name
+  recovery_orchestrator_release = merge(
+    jsondecode(file("${path.module}/../../../../lambda/shared/recovery-capabilities.json")),
+    {
+      functionArn = module.v2_orchestrator_lambda.lambda_function_qualified_arn
+      codeSha256  = module.v2_orchestrator_lambda.lambda_function_source_code_hash
+    }
+  )
 
   # Lambdas that bundle code from lambda/shared/** via esbuild are packaged by
   # the terraform-aws-modules/lambda module,
@@ -2854,7 +2861,7 @@ resource "aws_iam_role_policy" "intents" {
         # service before marking them failed. The authenticated lane repair
         # endpoint also stops an orphaned durable run before relaunching it.
         Effect   = "Allow"
-        Action   = ["lambda:GetDurableExecution", "lambda:ListDurableExecutionsByFunction", "lambda:StopDurableExecution"]
+        Action   = ["lambda:GetDurableExecution", "lambda:ListDurableExecutionsByFunction", "lambda:StopDurableExecution", "lambda:GetAlias", "lambda:GetFunctionConfiguration"]
         Resource = local.v2_orchestrator_function_arns
       },
       {
@@ -2943,7 +2950,7 @@ resource "aws_iam_role_policy" "intents" {
         # session so a relaunch starts a fresh microVM on the CURRENT image
         # (zombie-session field incident) and a cancelled run frees compute.
         Effect = "Allow"
-        Action = ["bedrock-agentcore:InvokeAgentRuntime", "bedrock-agentcore:StopRuntimeSession"]
+        Action = ["bedrock-agentcore:InvokeAgentRuntime", "bedrock-agentcore:StopRuntimeSession", "bedrock-agentcore:GetAgentRuntimeEndpoint"]
         Resource = [
           var.agentcore_runtime_arn,
           "${var.agentcore_runtime_arn}/*",
@@ -3018,7 +3025,11 @@ module "intents_lambda" {
     CONNECTIONS_TABLE  = var.connections_table_name
     WEBSOCKET_ENDPOINT = var.websocket_api_endpoint_https
     # Qualified name (function:alias) — durable functions reject $LATEST invokes.
-    V2_ORCHESTRATOR_FUNCTION          = "${module.v2_orchestrator_lambda.lambda_function_name}:${module.v2_orchestrator_alias.lambda_alias_name}"
+    V2_ORCHESTRATOR_FUNCTION = "${module.v2_orchestrator_lambda.lambda_function_name}:${module.v2_orchestrator_alias.lambda_alias_name}"
+    # Attest the actual published artifact. Recovery compares both identity and
+    # package hash with Lambda, then invokes this numeric version. An older API
+    # during rollout cannot certify a new alias target using a nominal version.
+    RECOVERY_ORCHESTRATOR_RELEASE     = jsonencode(local.recovery_orchestrator_release)
     SOURCE_CONTROL_FUNCTION           = module.source_control_lambda.lambda_function_name
     DURABLE_EXECUTION_TIMEOUT_SECONDS = "31622400"
   }

@@ -1,0 +1,4 @@
+{
+  "schemaVersion": 1,
+  "capabilities": ["preserve-integrated-section@1", "checked-runtime-dispatch@1"]
+}

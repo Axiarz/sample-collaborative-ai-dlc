@@ -292,7 +292,12 @@ export default function IntentView() {
   };
 
   const handleRepair = async () => {
-    if (!repairPreview) return;
+    if (
+      !repairPreview ||
+      (repairPreview.kind === 'incomplete-section' &&
+        repairPreview.compatibility?.status !== 'supported')
+    )
+      return;
     setRepairing(true);
     setActionError(null);
     try {
@@ -963,6 +968,59 @@ export default function IntentView() {
           </AlertDialogHeader>
           {repairPreview && (
             <div className="max-h-[50vh] space-y-3 overflow-y-auto text-sm">
+              {repairPreview.kind === 'incomplete-section' && (
+                <div className="space-y-2 rounded border p-3" role="status">
+                  <p className="font-medium">
+                    {repairPreview.compatibility?.status === 'supported'
+                      ? 'Recovery is available'
+                      : repairPreview.compatibility?.status === 'update-required'
+                        ? 'A deployment update is needed'
+                        : 'Recovery cannot currently be verified'}
+                  </p>
+                  {repairPreview.compatibility?.status === 'supported' ? (
+                    <p>
+                      Both the recovery service and this intent’s original environment support
+                      preserving integrated work. We check again when you confirm.
+                    </p>
+                  ) : (
+                    <p>
+                      Recovery has made no changes.{' '}
+                      {[
+                        repairPreview.compatibility?.orchestrator.message,
+                        repairPreview.compatibility?.runtime.message,
+                      ]
+                        .filter(Boolean)
+                        .join(' ') ||
+                        'Ask an administrator to deploy the recovery checks, then refresh this preview.'}
+                    </p>
+                  )}
+                  <Button
+                    variant="outline"
+                    disabled={repairing}
+                    onClick={() => void previewRepair()}
+                  >
+                    Refresh recovery preview
+                  </Button>
+                  {repairPreview.compatibility && (
+                    <details>
+                      <summary>Deployment details for administrators</summary>
+                      <dl className="mt-2 break-all">
+                        <dt>Recovery service</dt>
+                        <dd>
+                          {repairPreview.compatibility.orchestrator.functionArn || 'Not verified'}
+                        </dd>
+                        <dt>Original environment endpoint</dt>
+                        <dd>
+                          {repairPreview.compatibility.runtime.agentRuntimeArn || 'Not verified'}{' '}
+                          {repairPreview.compatibility.runtime.qualifier}{' '}
+                          {repairPreview.compatibility.runtime.version &&
+                            `(version ${repairPreview.compatibility.runtime.version})`}
+                        </dd>
+                      </dl>
+                    </details>
+                  )}
+                </div>
+              )}
               <p>
                 <strong>Preserved units:</strong>{' '}
                 {repairPreview.preservedSlugs.join(', ') || 'None integrated yet'}.
@@ -1008,6 +1066,8 @@ export default function IntentView() {
               disabled={
                 repairing ||
                 !repairPreview ||
+                (repairPreview.kind === 'incomplete-section' &&
+                  repairPreview.compatibility?.status !== 'supported') ||
                 (Boolean(repairPreview?.skeletonProblem) && !repairSkeleton)
               }
               onClick={(event) => {

@@ -155,6 +155,51 @@ beforeEach(() => {
 const stageStarts = () => invokes.filter((p) => p.command === 'run-stage-start');
 
 describe('orchestrator durable handler', () => {
+  it('carries checked recovery dispatch through every runtime call without changing the captured target', async () => {
+    const runtime = deps.invokeRuntime;
+    const recoveryRuntime = {
+      schemaVersion: 1,
+      sourceSha256: 'a'.repeat(64),
+      requiredCapabilities: ['preserve-integrated-section@1', 'checked-runtime-dispatch@1'],
+      ...MANAGED_RUNTIME_TARGET,
+    };
+    deps.invokeRuntime = vi.fn((envelope, session, target) => {
+      expect(envelope).toMatchObject({ command: 'recovery-dispatch', ...recoveryRuntime });
+      expect(target).toEqual(MANAGED_RUNTIME_TARGET);
+      return runtime(envelope.payload, session, target);
+    });
+    const result = await __durableHandler(
+      { action: 'start', intentId: 'i1', executionId: 'i1', recoveryRuntime },
+      ctx,
+      deps,
+    );
+    expect(result.ok).toBe(true);
+    expect(deps.invokeRuntime).toHaveBeenCalledTimes(6);
+    expect(stageStarts()).toHaveLength(2);
+    expect(stageStarts()[0].agentCredentialGrant).toBe('test-agent-credential-grant');
+  });
+
+  it('refuses a recovery target different from the original pin before writing or invoking', async () => {
+    const result = await __durableHandler(
+      {
+        action: 'start',
+        intentId: 'i1',
+        executionId: 'i1',
+        recoveryRuntime: {
+          ...MANAGED_RUNTIME_TARGET,
+          qualifier: 'different',
+          schemaVersion: 1,
+          requiredCapabilities: ['preserve-integrated-section@1'],
+        },
+      },
+      ctx,
+      deps,
+    );
+    expect(result.reason).toBe('recovery_target_changed');
+    expect(deps.store.updateExecution).not.toHaveBeenCalled();
+    expect(deps.invokeRuntime).not.toHaveBeenCalled();
+  });
+
   it('ignores non-start invocations', async () => {
     const res = await __durableHandler({ action: 'answer', intentId: 'i1' }, ctx, deps);
     expect(res).toEqual({ ok: false, reason: 'not_a_start' });

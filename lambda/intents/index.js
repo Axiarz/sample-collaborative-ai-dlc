@@ -39,6 +39,7 @@ import {
 import { runtimeTargetInput } from '../shared/runtime-target.js';
 import { unitCompletion, skeletonProblem } from '../shared/unit-completion.js';
 import { incompleteSectionRepair, repairPreviewToken } from './lane-repair.js';
+import { checkRecoveryCompatibility, recoveryRuntimeGuard } from './recovery-compatibility.js';
 import { createProcessStore, isTransactionConflict } from '../shared/v2-process-store.js';
 import { isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
 import { deleteIntentCascade, IntentRunningError } from '../shared/intent-deletion.js';
@@ -4393,9 +4394,23 @@ export const handler = async (event, context) => {
             approvals:
               'Completed lane stages and existing pull requests are preserved. Normal approvals apply to unfinished work.',
           };
+      // Only preservation recovery requires the new completion/dispatch contract.
+      // Legacy running-lane repair and rewind retain their supported semantics.
+      const compatibilityInput = { meta, lambda: lambdaClient, agentcore };
+      if (incompleteRepair) {
+        preview.compatibility = await checkRecoveryCompatibility(compatibilityInput);
+      }
       const previewToken = repairPreviewToken(meta, records, preview);
       if (repairInput.preview === true)
         return response(200, { preview: { ...preview, previewToken } });
+      if (preview.compatibility && preview.compatibility.status !== 'supported') {
+        return response(409, {
+          error:
+            'Recovery is not available until both deployment checks succeed. Refresh the recovery preview for the next action.',
+          code: 'repair_compatibility_blocked',
+          compatibility: preview.compatibility,
+        });
+      }
       if (
         (incompleteRepair || repairInput.previewToken) &&
         repairInput.previewToken !== previewToken
@@ -4432,6 +4447,22 @@ export const handler = async (event, context) => {
         priorDurableExecutionArn = listed.DurableExecutions?.[0]?.DurableExecutionArn ?? null;
       }
 
+      // Revalidate immediately before retirement; preparation above can take
+      // time. Launch the observed numeric Lambda version, never its moving alias.
+      // The runtime envelope continues checking the observed code after launch.
+      if (preview.compatibility) {
+        const fresh = await checkRecoveryCompatibility(compatibilityInput);
+        if (
+          fresh.status !== 'supported' ||
+          JSON.stringify(fresh) !== JSON.stringify(preview.compatibility)
+        ) {
+          return response(409, {
+            error:
+              'The recovery deployment changed or could not be verified. Refresh the preview; no recovery changes were made.',
+            code: 'repair_preview_changed',
+          });
+        }
+      }
       const repairRunId = `retired-${randomBytes(8).toString('hex')}`;
       try {
         await store.updateExecution({
@@ -4670,8 +4701,11 @@ export const handler = async (event, context) => {
               intentId,
               executionId: intentId,
               startAtStageId: fromStageId,
+              ...(preview.compatibility
+                ? { recoveryRuntime: recoveryRuntimeGuard(preview.compatibility) }
+                : {}),
             },
-            { durableExecutionName },
+            { durableExecutionName, functionName: preview.compatibility?.orchestrator.functionArn },
           );
           if (invoked?.durableExecutionArn) {
             await store
@@ -6110,8 +6144,8 @@ export const handler = async (event, context) => {
 
 // Start the orchestrator durable execution. Async (Event) — the orchestrator
 // runs the long stage loop; the HTTP caller returns immediately (202).
-const invokeOrchestrator = async (payload, { durableExecutionName = null } = {}) => {
-  const fn = ORCHESTRATOR_FN();
+const invokeOrchestrator = async (payload, { durableExecutionName = null, functionName } = {}) => {
+  const fn = functionName || ORCHESTRATOR_FN();
   if (!fn) {
     logger.error('V2_ORCHESTRATOR_FUNCTION not configured — cannot start');
     return;

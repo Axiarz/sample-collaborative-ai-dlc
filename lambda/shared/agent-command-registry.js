@@ -35,6 +35,8 @@ export const COMMANDS = Object.freeze({
   'repair-structure': command('repairStructure', AGENT_AUTH_MODES.EXECUTION),
   inspect: command('inspect'),
   capabilities: command('capabilities', AGENT_AUTH_MODES.CAPABILITIES),
+  'recovery-capabilities': command('recoveryCapabilities'),
+  'recovery-dispatch': command('recoveryDispatch'),
   'managed-runtime-check': command('managedRuntimeCheck'),
   'verify-mcp': command('verifyMcp'),
   'verify-connection': command('verifyConnection', AGENT_AUTH_MODES.VERIFY_CONNECTION),

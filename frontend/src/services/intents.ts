@@ -824,6 +824,25 @@ export interface IntentRepairPreview {
   branch: string;
   approvals: string;
   pullRequests: { repository: string; number: string | number; url: string }[];
+  compatibility?: {
+    schemaVersion: number;
+    status: 'supported' | 'update-required' | 'unverified';
+    requiredCapabilities: string[];
+    orchestrator: {
+      status: string;
+      message?: string;
+      functionArn?: string;
+      codeSha256?: string;
+    };
+    runtime: {
+      status: string;
+      message?: string;
+      agentRuntimeArn?: string;
+      qualifier?: string;
+      version?: string;
+      sourceSha256?: string;
+    };
+  };
 }
 
 export interface IntentRepairResult {

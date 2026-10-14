@@ -1024,6 +1024,13 @@ describe('IntentView', () => {
       preview: {
         previewToken: 'current-preview',
         kind: 'incomplete-section',
+        compatibility: {
+          schemaVersion: 1,
+          status: 'supported',
+          requiredCapabilities: ['preserve-integrated-section@1'],
+          orchestrator: { status: 'supported' },
+          runtime: { status: 'supported' },
+        },
         sectionIndex: 1,
         fromStageId: 'functional-design',
         laneSlugs: ['notification-core'],
@@ -1056,6 +1063,85 @@ describe('IntentView', () => {
       walkingSkeleton: 'notifications-data-infra',
     });
   });
+
+  it.each([
+    ['update-required', 'A deployment update is needed'],
+    ['unverified', 'Recovery cannot currently be verified'],
+    ['missing', 'Recovery cannot currently be verified'],
+  ])(
+    'explains %s compatibility and allows a safe refresh before confirming',
+    async (status, heading) => {
+      get.mockResolvedValue({
+        ...baseDetail({ status: 'SUCCEEDED' }),
+        unitCompletion: {
+          state: 'incomplete',
+          total: 2,
+          integrated: 1,
+          skipped: 0,
+          legacyPartial: false,
+          unresolved: [{ sectionIndex: 1, slug: 'remaining', state: 'BLOCKED' }],
+        },
+      });
+      const preview = {
+        previewToken: 'blocked-preview',
+        kind: 'incomplete-section',
+        sectionIndex: 1,
+        fromStageId: 'code',
+        laneSlugs: ['remaining'],
+        preservedSlugs: ['foundation'],
+        rerunSharedStages: [],
+        skeletonProblem: null,
+        skeletonCandidates: [],
+        walkingSkeleton: 'foundation',
+        branch: 'aidlc/feature',
+        approvals: 'Normal approvals apply.',
+        pullRequests: [],
+      };
+      previewRepair.mockResolvedValueOnce({
+        preview: {
+          ...preview,
+          ...(status === 'missing'
+            ? {}
+            : {
+                compatibility: {
+                  schemaVersion: 1,
+                  status,
+                  requiredCapabilities: [],
+                  orchestrator: { status: 'supported' },
+                  runtime: {
+                    status,
+                    message: 'Ask an administrator to update the original environment.',
+                  },
+                },
+              }),
+        },
+      });
+      renderAt();
+      await userEvent.click(await screen.findByRole('button', { name: 'Preview recovery' }));
+      expect(await screen.findByText(heading)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Confirm and continue' })).toBeDisabled();
+      expect(repair).not.toHaveBeenCalled();
+      previewRepair.mockResolvedValueOnce({
+        preview: {
+          ...preview,
+          previewToken: 'refreshed-preview',
+          compatibility: {
+            schemaVersion: 1,
+            status: 'supported',
+            requiredCapabilities: [],
+            orchestrator: { status: 'supported' },
+            runtime: { status: 'supported' },
+          },
+        },
+      });
+      await userEvent.click(screen.getByRole('button', { name: 'Refresh recovery preview' }));
+      expect(await screen.findByText('Recovery is available')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Confirm and continue' })).toBeEnabled();
+      repair.mockResolvedValue({});
+      await userEvent.click(screen.getByRole('button', { name: 'Confirm and continue' }));
+      expect(repair).toHaveBeenCalledWith('p1', 'i1', { previewToken: 'refreshed-preview' });
+    },
+  );
 
   it('identifies explicitly accepted partial delivery without offering to undo it', async () => {
     get.mockResolvedValue({
