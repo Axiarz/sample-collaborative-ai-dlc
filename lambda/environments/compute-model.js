@@ -68,13 +68,14 @@ const instancesUnavailableReason = (architecture) => {
 // run it, and why not when it cannot. Exposed on GET /environments/capabilities
 // so the UI renders exactly the selectable combinations instead of hardcoding
 // them; normalizeCompute validates creation against the same cells.
+const microvmsCell = (architecture, reason = null) => ({
+  type: 'microvms',
+  architecture,
+  available: reason === null,
+  ...(reason ? { reason } : {}),
+});
+
 export const capabilities = () => {
-  const microvms = (architecture, reason = null) => ({
-    type: 'microvms',
-    architecture,
-    available: reason === null,
-    ...(reason ? { reason } : {}),
-  });
   const instances = (architecture) => {
     const reason = instancesUnavailableReason(architecture);
     return {
@@ -90,8 +91,8 @@ export const capabilities = () => {
     amd64CoreImage: amd64CoreImageConfigured(),
     default: { ...DEFAULT_COMPUTE },
     combinations: [
-      microvms('arm64'),
-      microvms('x86_64', 'MICROVMS_ARCHITECTURE_UNSUPPORTED'),
+      microvmsCell('arm64'),
+      microvmsCell('x86_64', 'MICROVMS_ARCHITECTURE_UNSUPPORTED'),
       instances('arm64'),
       instances('x86_64'),
     ],
@@ -99,6 +100,46 @@ export const capabilities = () => {
 };
 
 // --- normalization / validation ----------------------------------------------
+
+// Throws the actionable error for a (type, architecture) cell this deployment
+// cannot build or run. One rule for every admission point: creating an
+// environment (normalizeCompute) and starting any new image build of an
+// existing one (assertBuildAdmissible). The default cell is always available.
+export const assertComputeAvailable = ({ type, architecture }) => {
+  const cell = capabilities().combinations.find(
+    (item) => item.type === type && item.architecture === architecture,
+  );
+  if (!cell) throw httpError('Unsupported compute selection', 409, 'COMPUTE_UNSUPPORTED');
+  if (cell.available) return;
+  switch (cell.reason) {
+    case 'MICROVMS_ARCHITECTURE_UNSUPPORTED':
+      throw httpError(
+        'The microVMs compute type only supports the arm64 architecture',
+        400,
+        'COMPUTE_ARCHITECTURE_UNSUPPORTED',
+      );
+    case 'INSTANCES_COMPUTE_NOT_CONFIGURED':
+      throw httpError(
+        'The Instances compute type is not configured on this deployment (set enable_instances_compute)',
+        409,
+        'INSTANCES_COMPUTE_NOT_CONFIGURED',
+      );
+    case 'NO_INSTANCE_TYPES':
+      throw httpError(
+        `No ${architecture} instance types are allowed on this deployment`,
+        409,
+        'NO_INSTANCE_TYPES',
+      );
+    case 'AMD64_CORE_IMAGE_MISSING':
+      throw httpError(
+        'No x86_64 core image is published on this deployment',
+        409,
+        'AMD64_CORE_IMAGE_MISSING',
+      );
+    default:
+      throw httpError('Unsupported compute selection', 409, 'COMPUTE_UNSUPPORTED');
+  }
+};
 
 // Normalizes and validates the `compute` field of an environment. Returns null
 // for the default (microVMs, arm64) so existing records stay untouched.
@@ -118,39 +159,7 @@ export const normalizeCompute = (input) => {
   if (type === DEFAULT_COMPUTE.type && architecture === DEFAULT_COMPUTE.architecture) {
     return null; // default — persist nothing
   }
-  const cell = capabilities().combinations.find(
-    (item) => item.type === type && item.architecture === architecture,
-  );
-  if (!cell.available) {
-    switch (cell.reason) {
-      case 'MICROVMS_ARCHITECTURE_UNSUPPORTED':
-        throw httpError(
-          'The microVMs compute type only supports the arm64 architecture',
-          400,
-          'COMPUTE_ARCHITECTURE_UNSUPPORTED',
-        );
-      case 'INSTANCES_COMPUTE_NOT_CONFIGURED':
-        throw httpError(
-          'The Instances compute type is not configured on this deployment (set enable_instances_compute)',
-          409,
-          'INSTANCES_COMPUTE_NOT_CONFIGURED',
-        );
-      case 'NO_INSTANCE_TYPES':
-        throw httpError(
-          `No ${architecture} instance types are allowed on this deployment`,
-          409,
-          'NO_INSTANCE_TYPES',
-        );
-      case 'AMD64_CORE_IMAGE_MISSING':
-        throw httpError(
-          'No x86_64 core image is published on this deployment',
-          409,
-          'AMD64_CORE_IMAGE_MISSING',
-        );
-      default:
-        throw httpError('Unsupported compute selection', 409, 'COMPUTE_UNSUPPORTED');
-    }
-  }
+  assertComputeAvailable({ type, architecture });
   return { type, architecture };
 };
 
@@ -159,6 +168,25 @@ export const computeOf = (environment) => ({
   type: environment?.compute?.type ?? DEFAULT_COMPUTE.type,
   architecture: environment?.compute?.architecture ?? DEFAULT_COMPUTE.architecture,
 });
+
+// Admission for a NEW image build of an existing environment (direct build,
+// retry, single or bulk rebuild). The persisted compute was valid when the
+// environment was created, but the deployment may have changed since (feature
+// disabled, allowlist emptied, amd64 core gone), so it is re-checked against
+// the same capability rules before any build attempt, context upload or
+// CodeBuild start. Only new builds are gated: published revisions, intent
+// snapshots, resume/rewind and session cleanup never consult this.
+export const assertBuildAdmissible = (environment) => {
+  const compute = computeOf(environment);
+  try {
+    assertComputeAvailable(compute);
+  } catch (error) {
+    throw Object.assign(
+      new Error(`Environment ${environment.environmentId} cannot be built: ${error.message}`),
+      { statusCode: error.statusCode, code: error.code, compute },
+    );
+  }
+};
 
 export const environmentArchitecture = (environment) => computeOf(environment).architecture;
 
@@ -247,6 +275,8 @@ export default {
   instancesComputeConfigured,
   amd64CoreImageConfigured,
   allowedInstanceTypes,
+  assertComputeAvailable,
+  assertBuildAdmissible,
   normalizeCompute,
   computeOf,
   environmentArchitecture,

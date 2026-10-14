@@ -551,8 +551,9 @@ Turning the flag **off again** after Instances environments have been used
 does not destroy anything that live runtimes depend on: the capacity-provider
 operator role is created unconditionally (capacity providers are retained and
 keep referencing it), and existing capacity providers, runtimes, and published
-revisions are left in place. New Instances drafts are refused and existing
-Instances revisions stop being rebuilt/validated until the flag is re-enabled.
+revisions are left in place. New Instances drafts are refused, and no new
+image build of an existing Instances environment is admitted until the flag is
+re-enabled (see below).
 Workspace cleanup is not gated by the flag: the poller keeps its
 `DeleteCapacityProviderSession` permission, so queued releases still complete
 and intents on retained Instances runtimes can still be deleted.
@@ -563,6 +564,20 @@ be selected.
 Changing an allowlist or `instances_workspace_gib`
 produces a new capacity provider on the next runtime creation; runtimes
 created earlier keep the provider they were built with.
+
+**Build admission.** Every new image build of an existing environment —
+**Build**, **Retry**, **Rebuild** and the bulk rebuild — is checked against
+the same capability matrix before anything is created: if the environment's
+compute cell is unavailable on the deployment (flag off, its architecture's
+allowlist empty, or the x86_64 core image missing), the request is rejected
+with the cell's code (`INSTANCES_COMPUTE_NOT_CONFIGURED`, `NO_INSTANCE_TYPES`,
+`AMD64_CORE_IMAGE_MISSING`) and no revision, build context or CodeBuild run is
+created. A bulk rebuild that names environments explicitly is rejected as a
+whole and lists the unbuildable ones; the implicit "everything with an update"
+rebuild skips them and reports them under `skipped`. Saving a draft is not a
+build and stays allowed. Admission only gates new builds: published
+revisions, intents already pinned to a snapshot (including resume and
+rewind), and workspace cleanup keep working.
 
 #### Create an Instances environment
 

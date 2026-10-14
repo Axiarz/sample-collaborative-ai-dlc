@@ -34,6 +34,7 @@ import {
   capabilities,
   normalizeCompute,
   prepareRecipesForCompute,
+  assertBuildAdmissible,
 } from './compute-model.js';
 import { runtimeBackendFor } from './runtime-backends/index.js';
 
@@ -158,6 +159,7 @@ const assertCatalogRevision = (environmentId, revision) => {
 };
 
 const startBuild = async ({ store, environment, revision, actor, deps }) => {
+  assertBuildAdmissible(environment);
   if (revision.status !== 'DRAFT') {
     throw Object.assign(new Error(`Revision is ${revision.status} and cannot be built`), {
       statusCode: 409,
@@ -317,6 +319,9 @@ const cloneOnLatestBase = async ({ store, environment, actor }) => {
       statusCode: 409,
     });
   }
+  // Before the replacement revision exists: an unavailable compute must not
+  // leave a DRAFT attempt behind.
+  assertBuildAdmissible(environment);
   const sourceRevisionId = environment.publishedRevisionId ?? environment.currentRevisionId;
   if (!sourceRevisionId) {
     throw Object.assign(new Error('Environment has no recipe to rebuild'), {
@@ -453,10 +458,35 @@ export const createHandler = ({
         const selected = Array.isArray(data.environmentIds)
           ? all.filter((item) => data.environmentIds.includes(item.environmentId))
           : all.filter((item) => item.updateAvailable);
+        // Admission happens for the whole batch before any revision is
+        // created. Environments named explicitly must all be buildable (409
+        // otherwise, nothing started); the implicit "everything with an
+        // update" batch skips the unbuildable ones and reports them, so one
+        // environment on a disabled compute cannot block the others.
+        const candidates = selected.filter((item) => item.baseEnvironmentId);
+        const skipped = [];
+        const admitted = candidates.filter((item) => {
+          try {
+            assertBuildAdmissible(item);
+            return true;
+          } catch (error) {
+            skipped.push({
+              environmentId: item.environmentId,
+              code: error.code,
+              error: error.message,
+            });
+            return false;
+          }
+        });
+        if (Array.isArray(data.environmentIds) && skipped.length > 0) {
+          return response(409, {
+            error: 'Some environments cannot be built on this deployment',
+            code: skipped[0].code,
+            environments: skipped,
+          });
+        }
         const builds = [];
-        for (const environment of orderRebuilds(
-          selected.filter((item) => item.baseEnvironmentId),
-        )) {
+        for (const environment of orderRebuilds(admitted)) {
           const revision = await cloneOnLatestBase({
             store,
             environment,
@@ -472,7 +502,7 @@ export const createHandler = ({
             }),
           );
         }
-        return response(202, { builds });
+        return response(202, { builds, ...(skipped.length ? { skipped } : {}) });
       }
 
       const environment = environmentId ? await store.getEnvironment(environmentId) : null;
@@ -624,6 +654,7 @@ export const createHandler = ({
             error: 'Only failed revisions can be retried',
           });
         }
+        assertBuildAdmissible(environment);
         const replacement = await store.createRevision({
           environment,
           recipe: revision.recipe,
