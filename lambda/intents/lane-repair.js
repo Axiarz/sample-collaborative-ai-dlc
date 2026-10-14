@@ -19,6 +19,15 @@ export const incompleteSectionRepair = (meta, records, plan) => {
         .map((stage) => Number(stage.parallelSection)),
     ),
   ];
+  if (
+    sections.length &&
+    activePlanUnits(records.unitPlan, records.units).some((unit) => unit.sectionIndex == null)
+  ) {
+    return {
+      error:
+        'Legacy unit records have no section mapping. Review that mapping before recovery so integrated work is preserved.',
+    };
+  }
   const completion = unitCompletion({ ...records, meta }, sections);
   if (completion?.state !== 'incomplete') return null;
   const incompleteSections = [...new Set(completion.unresolved.map((unit) => unit.sectionIndex))];

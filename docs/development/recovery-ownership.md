@@ -45,6 +45,8 @@ lists preserved and unfinished units and downstream shared stages to rerun, and
 checks recorded final PRs with the provider. A closed/merged final PR blocks this
 recovery. Confirmation sends the preview token and, when necessary, an explicitly
 selected dependency-free `walkingSkeleton`. A changed preview returns 409.
+Legacy unit rows without a section mapping remain readable, but this recovery
+refuses them rather than guessing which integrated work to preserve.
 
 Retirement compares the prior status, run token and update timestamp. Stage
 resets, unit updates and replacement skeleton decisions check the recovery run

@@ -6527,6 +6527,28 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
     expect(orchestratorInvokes()).toHaveLength(1);
   });
 
+  it('refuses unmapped legacy integration before preview or recovery can rebuild it', async () => {
+    const { sub, projectId, intent, pk } = await falseSuccess();
+    const integrated = procStore.get(keyOf(pk, 'UNIT#S1#foundation'));
+    procStore.delete(keyOf(pk, 'UNIT#S1#foundation'));
+    procStore.set(keyOf(pk, 'UNIT#foundation'), {
+      ...integrated,
+      sk: 'UNIT#foundation',
+      sectionIndex: null,
+    });
+    const before = structuredClone([...procStore.entries()]);
+    for (const input of [{ preview: true }, {}]) {
+      const result = await repair(sub, projectId, intent.id, input);
+      expect(result.statusCode).toBe(409);
+      expect(JSON.parse(result.body).error).toContain(
+        'Legacy unit records have no section mapping',
+      );
+    }
+    expect([...procStore.entries()]).toEqual(before);
+    expect(orchestratorInvokes()).toHaveLength(0);
+    expect(lambdaMock.commandCalls(StopDurableExecutionCommand)).toHaveLength(0);
+  });
+
   it('rejects stale previews and dependent selections before changing terminal work', async () => {
     const { sub, projectId, intent, pk } = await falseSuccess();
     const { preview } = JSON.parse(
