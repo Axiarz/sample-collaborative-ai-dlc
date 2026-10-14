@@ -567,8 +567,10 @@ resource "aws_iam_role_policy" "agents_orchestrator" {
         Resource = "*"
       },
       {
+        # InvokeAgentRuntime: capability, MCP and connection probes.
+        # StopRuntimeSession: end a probe's session once it answered.
         Effect = "Allow"
-        Action = ["bedrock-agentcore:InvokeAgentRuntime"]
+        Action = ["bedrock-agentcore:InvokeAgentRuntime", "bedrock-agentcore:StopRuntimeSession"]
         Resource = [
           var.agentcore_runtime_arn,
           "${var.agentcore_runtime_arn}/*",
@@ -577,8 +579,20 @@ resource "aws_iam_role_policy" "agents_orchestrator" {
         ]
       },
       {
+        # A probe against a space's Instances runtime gets an EBS workspace;
+        # it is deleted right after the probe (shared/runtime-session.js
+        # withDisposableSession).
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem"]
+        Action   = ["bedrock-agentcore:DeleteCapacityProviderSession"]
+        Resource = "arn:${local.partition}:bedrock-agentcore:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:capacity-provider/*"
+      },
+      {
+        # GetItem: resolve the space's environment snapshot. PutItem/DeleteItem:
+        # the SESSION_CLEANUP# record that owns a probe session's release from
+        # before it is invoked until it is deleted (the environments poller
+        # finishes it if the probe cannot).
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"]
         Resource = var.environment_registry_table_arn
       }
     ]

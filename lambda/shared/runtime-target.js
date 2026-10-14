@@ -26,4 +26,11 @@ export const runtimeTargetInput = (meta, fallbackRuntimeArn = '') => {
   };
 };
 
-export default { resolveRuntimeTarget, runtimeTargetInput };
+// SDK input from a full target (drops capacityProviderArn, which the
+// Invoke/Stop APIs do not accept).
+export const runtimeSdkInput = (target) => ({
+  agentRuntimeArn: target?.agentRuntimeArn ?? '',
+  ...(target?.qualifier ? { qualifier: target.qualifier } : {}),
+});
+
+export default { resolveRuntimeTarget, runtimeTargetInput, runtimeSdkInput };

@@ -8,6 +8,8 @@ import {
   retryQueuedReleases,
   stopSession,
   stopSessions,
+  withDisposableSession,
+  DISPOSABLE_SESSION_GRACE_MS,
 } from '../runtime-session.js';
 
 const CP_ARN = 'arn:aws:bedrock-agentcore:us-east-1:111111111111:capacity-provider/cp-123';
@@ -216,5 +218,153 @@ describe('retryQueuedReleases', () => {
       { sessionId: 'orphan', dropped: true },
     ]);
     expect(client.send).not.toHaveBeenCalled();
+  });
+});
+
+describe('withDisposableSession', () => {
+  const NOW = Date.parse('2026-01-01T00:00:00.000Z');
+  const queue = (overrides = {}) => {
+    const log = [];
+    return {
+      log,
+      enqueue: vi.fn().mockImplementation(async (record) => log.push(['enqueue', record])),
+      remove: vi.fn().mockImplementation(async (id) => log.push(['remove', id])),
+      listPending: vi.fn().mockResolvedValue([]),
+      recordAttempt: vi.fn(),
+      ...overrides,
+    };
+  };
+  const tracingClient = (log, { deleteError } = {}) => ({
+    send: vi.fn().mockImplementation(async (command) => {
+      log.push([command.constructor.name, command.input]);
+      if (command.constructor.name === 'DeleteCapacityProviderSessionCommand' && deleteError) {
+        throw deleteError;
+      }
+      return {};
+    }),
+  });
+
+  it('runs unchanged on microVM targets (no record, no release)', async () => {
+    const cleanupStore = queue();
+    const client = tracingClient([]);
+    const use = vi.fn().mockResolvedValue('ok');
+    const result = await withDisposableSession(
+      { client, target: { agentRuntimeArn: 'arn:rt' }, cleanupStore, sessionId: 's-1' },
+      use,
+    );
+    expect(result).toBe('ok');
+    expect(use).toHaveBeenCalledWith('s-1');
+    expect(cleanupStore.enqueue).not.toHaveBeenCalled();
+    expect(client.send).not.toHaveBeenCalled();
+  });
+
+  it('owns the session before it is used, then releases it and drops the record', async () => {
+    const cleanupStore = queue();
+    const client = tracingClient(cleanupStore.log);
+    const use = vi.fn().mockImplementation(async (id) => {
+      cleanupStore.log.push(['use', id]);
+      return 'probe-result';
+    });
+    const result = await withDisposableSession(
+      { client, target, cleanupStore, source: 'verify-mcp', sessionId: 's-1', now: () => NOW },
+      use,
+    );
+    expect(result).toBe('probe-result');
+    expect(cleanupStore.log.map(([step]) => step)).toEqual([
+      'enqueue',
+      'use',
+      'StopRuntimeSessionCommand',
+      'DeleteCapacityProviderSessionCommand',
+      'remove',
+    ]);
+    expect(cleanupStore.log[0][1]).toMatchObject({
+      sessionId: 's-1',
+      capacityProviderArn: CP_ARN,
+      source: 'verify-mcp',
+      notBefore: new Date(NOW + DISPOSABLE_SESSION_GRACE_MS).toISOString(),
+    });
+    expect(cleanupStore.log[3][1]).toEqual({ capacityProviderId: 'cp-123', sessionId: 's-1' });
+    // The SDK never receives the capacity provider.
+    expect(cleanupStore.log[2][1]).not.toHaveProperty('capacityProviderArn');
+  });
+
+  it('never invokes when ownership cannot be registered', async () => {
+    const cleanupStore = queue({ enqueue: vi.fn().mockRejectedValue(new Error('table down')) });
+    const client = tracingClient([]);
+    const use = vi.fn();
+    await expect(
+      withDisposableSession({ client, target, cleanupStore, sessionId: 's-1' }, use),
+    ).rejects.toThrow('table down');
+    expect(use).not.toHaveBeenCalled();
+    expect(client.send).not.toHaveBeenCalled();
+  });
+
+  it('refuses an Instances target with no cleanup store at all', async () => {
+    const use = vi.fn();
+    await expect(
+      withDisposableSession({ client: tracingClient([]), target, sessionId: 's-1' }, use),
+    ).rejects.toBeInstanceOf(SessionReleaseHandoffError);
+    expect(use).not.toHaveBeenCalled();
+  });
+
+  it('still releases when the probe fails or its response is lost', async () => {
+    const cleanupStore = queue();
+    const client = tracingClient(cleanupStore.log);
+    await expect(
+      withDisposableSession({ client, target, cleanupStore, sessionId: 's-1' }, async () => {
+        throw named('RuntimeClientError', 'socket hang up');
+      }),
+    ).rejects.toThrow('socket hang up');
+    expect(sent(client, 'DeleteCapacityProviderSessionCommand')).toHaveLength(1);
+    expect(cleanupStore.remove).toHaveBeenCalledWith('s-1');
+  });
+
+  it('leaves the record as the owner when the delete fails', async () => {
+    const cleanupStore = queue();
+    const client = tracingClient(cleanupStore.log, {
+      deleteError: named('InternalServerException'),
+    });
+    await withDisposableSession(
+      { client, target, cleanupStore, sessionId: 's-1' },
+      async () => 'x',
+    );
+    expect(cleanupStore.enqueue).toHaveBeenCalledTimes(1);
+    expect(cleanupStore.remove).not.toHaveBeenCalled();
+  });
+
+  it('treats an already-absent session as released', async () => {
+    const cleanupStore = queue();
+    const client = tracingClient([], { deleteError: named('ResourceNotFoundException') });
+    await withDisposableSession(
+      { client, target, cleanupStore, sessionId: 's-1' },
+      async () => 'x',
+    );
+    expect(cleanupStore.remove).toHaveBeenCalledWith('s-1');
+  });
+});
+
+describe('retryQueuedReleases with deferred records', () => {
+  const NOW = Date.parse('2026-01-01T00:00:00.000Z');
+  it('leaves a record alone until its grace window has passed, then deletes it', async () => {
+    const record = {
+      sessionId: 's-probe',
+      capacityProviderArn: CP_ARN,
+      notBefore: new Date(NOW + 60_000).toISOString(),
+    };
+    const cleanupStore = {
+      listPending: vi.fn().mockResolvedValue([record]),
+      remove: vi.fn(),
+      recordAttempt: vi.fn(),
+    };
+    const client = { send: vi.fn().mockResolvedValue({}) };
+    expect(await retryQueuedReleases({ client, cleanupStore, now: () => NOW })).toEqual([
+      { sessionId: 's-probe', deferred: true },
+    ]);
+    expect(client.send).not.toHaveBeenCalled();
+    expect(cleanupStore.remove).not.toHaveBeenCalled();
+
+    await retryQueuedReleases({ client, cleanupStore, now: () => NOW + 120_000 });
+    expect(sent(client, 'DeleteCapacityProviderSessionCommand')).toHaveLength(1);
+    expect(cleanupStore.remove).toHaveBeenCalledWith('s-probe');
   });
 });

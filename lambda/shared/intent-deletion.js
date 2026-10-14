@@ -22,6 +22,13 @@ import { DeleteObjectsCommand, ListObjectVersionsCommand, S3Client } from '@aws-
 import { revokeYjsScope } from './yjs-revocation.js';
 import { resolveRuntimeTarget } from './runtime-target.js';
 import { releaseSessions } from './runtime-session.js';
+import {
+  composeSessionIdFor,
+  discussionSessionIdFor,
+  intentSessionIdFor,
+  laneSessionIdFor,
+  quorumEditSessionIdFor,
+} from './runtime-session-ids.js';
 
 const logger = new Logger({ persistentKeys: { component: 'intent-deletion' } });
 const __ = gremlin.process.statics;
@@ -54,11 +61,9 @@ const purgeAttachmentPrefix = async (bucket, prefix) => {
   } while (KeyMarker);
 };
 
-// Session-id conventions — MUST mirror lambda/intents/index.js and
-// lambda/agentcore/v2-orchestrator/section.js (laneSessionIdFor).
-const runtimeSessionIdFor = (intentId) => `aidlc-intent-${intentId}`.padEnd(33, '0');
-const laneSessionIdFor = (intentId, sectionIndex, slug) =>
-  `aidlc-intent-${intentId}-s${sectionIndex}-${slug}`.padEnd(33, '0');
+// Session-id conventions live in shared/runtime-session-ids.js, the module the
+// producers (orchestrator, intents, discussions) derive them from.
+const runtimeSessionIdFor = intentSessionIdFor;
 
 // A caller-recognizable error for a live run refused without `force`. The
 // intents lambda maps this to a 409; the projects lambda passes force:true so it
@@ -73,17 +78,27 @@ class IntentRunningError extends Error {
 }
 
 // Every session an intent may have opened on the Instances compute type,
-// rebuilt from the PERSISTED records (not the current unit plan). The UNIT#
-// rows are the source of truth: the orchestrator stamps each lane's sessionId
-// on the row when the lane starts, and the rows survive plan rewinds — so
-// historical/orphaned lanes that are no longer in the current plan are still
-// covered. A row without a stamped sessionId (a lane that never started, or a
-// legacy row) falls back to the deterministic lane id derived from its
-// persisted sectionIndex + slug, and lane STAGE# rows (which persist
-// sectionIndex + unitSlug) contribute the same derivation as a second net.
-// The result is a superset — callers tolerate deleting/stopping a session
-// that never existed.
-const collectIntentSessionIds = (intentId, records = {}) => {
+// rebuilt from records that are written BEFORE the session they name is first
+// invoked, so each session has a cleanup owner from its start:
+//
+//   main      always (deterministic per intent)
+//   lanes     UNIT# rows: the orchestrator stamps each lane's sessionId when
+//             the lane starts, and the rows survive plan rewinds — historical
+//             and orphaned lanes are still covered. A row without a stamped id
+//             falls back to its persisted sectionIndex + slug, and lane STAGE#
+//             rows (sectionIndex + unitSlug) contribute the same derivation.
+//   compose   COMPOSE# rows (created before the compose dispatch)
+//   Quorum    one per intent, reused by every edit; present once a QEDIT# row
+//   edit      exists (created before the orchestrator hand-off)
+//   discuss   one per Discussion vertex of the intent (created before any
+//             assist on it) — passed in by the caller, see
+//             collectDiscussionIds
+//
+// The result is a superset — callers tolerate deleting or stopping a session
+// that never existed. Intent-bound sessions are retained until this point (a
+// reused id cannot be restarted once deleted on Instances), never released
+// earlier.
+const collectIntentSessionIds = (intentId, records = {}, { discussionIds = [] } = {}) => {
   const ids = new Set([runtimeSessionIdFor(intentId)]);
   for (const unit of records.units ?? []) {
     if (typeof unit.sessionId === 'string' && unit.sessionId.length > 0) {
@@ -97,7 +112,25 @@ const collectIntentSessionIds = (intentId, records = {}) => {
       ids.add(laneSessionIdFor(intentId, stage.sectionIndex, stage.unitSlug));
     }
   }
+  for (const compose of records.composes ?? []) {
+    if (compose.composeId) ids.add(composeSessionIdFor(compose.composeId));
+  }
+  if ((records.quorumEdits ?? []).length > 0) ids.add(quorumEditSessionIdFor(intentId));
+  for (const discussionId of discussionIds) {
+    if (discussionId) ids.add(discussionSessionIdFor(intentId, discussionId));
+  }
   return [...ids];
+};
+
+// The intent's discussion threads, read from the graph before the cascade drops
+// them: the threads hanging off the Intent anchor plus any vertex that names
+// the intent directly (a thread whose anchor edge is gone).
+const collectDiscussionIds = async (g, intentId) => {
+  const [anchored, named] = await Promise.all([
+    g.V().has('Intent', 'id', intentId).out('HAS_DISCUSSION').values('id').toList(),
+    g.V().has('Discussion', 'intent_id', intentId).values('id').toList(),
+  ]);
+  return [...new Set([...(anchored ?? []), ...(named ?? [])])];
 };
 
 // The runtime target for the cascade: the META snapshot (runtime + capacity
@@ -224,7 +257,9 @@ const deleteIntentCascade = async ({
   await releaseSessions({
     client: agentcore,
     target,
-    sessionIds: collectIntentSessionIds(intentId, records),
+    sessionIds: collectIntentSessionIds(intentId, records, {
+      discussionIds: await collectDiscussionIds(g, intentId),
+    }),
     cleanupStore: sessionCleanupStore,
     source: 'intent-deletion',
     context: { intentId, projectId: meta?.projectId ?? null },
@@ -293,6 +328,7 @@ const deleteIntentCascade = async ({
 };
 
 export {
+  collectDiscussionIds,
   collectIntentSessionIds,
   deleteIntentCascade,
   retireParkedRun,

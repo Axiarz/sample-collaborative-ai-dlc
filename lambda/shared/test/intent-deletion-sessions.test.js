@@ -1,11 +1,25 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  collectDiscussionIds,
   collectIntentSessionIds,
   deleteIntentCascade,
   laneSessionIdFor,
   runtimeSessionIdFor,
 } from '../intent-deletion.js';
-import { buildStageRow, buildUnitRow } from '../v2-process-keys.js';
+import {
+  buildComposeRow,
+  buildQuorumEditRow,
+  buildStageRow,
+  buildUnitRow,
+} from '../v2-process-keys.js';
+import {
+  composeSessionIdFor,
+  discussionSessionIdFor,
+  quorumEditSessionIdFor,
+} from '../runtime-session-ids.js';
+import { laneSessionIdFor as orchestratorLaneSessionIdFor } from '../../v2-orchestrator/section.js';
+import { quorumEditSessionIdFor as orchestratorQuorumEditSessionIdFor } from '../../v2-orchestrator/quorum-edit.js';
+import { discussionSessionIdFor as discussionsServiceSessionIdFor } from '../../discussions/services.js';
 import { SessionReleaseHandoffError } from '../runtime-session.js';
 
 // Chainable gremlin stub — every step returns the chain; terminal steps
@@ -261,5 +275,148 @@ describe('deleteIntentCascade on the Instances compute type', () => {
     // sessions were released anyway, so a re-run only has this one left.
     expect(store.deleteExecution).not.toHaveBeenCalled();
     expect(sentCommands(agentcore, 'DeleteCapacityProviderSessionCommand')).toHaveLength(4);
+  });
+});
+
+// Graph stub whose `.toList()` answers in call order: the anchored threads,
+// then the threads naming the intent directly.
+const gWithDiscussions = (anchored, named) => {
+  const answers = [anchored, named];
+  const chain = new Proxy(function noop() {}, {
+    get(_target, prop) {
+      if (prop === 'toList') return async () => answers.shift() ?? [];
+      if (prop === 'next') return async () => ({});
+      if (prop === 'then') return undefined;
+      return () => chain;
+    },
+    apply: () => chain,
+  });
+  return chain;
+};
+
+describe('intent-bound auxiliary sessions', () => {
+  const auxRecords = {
+    stages: [],
+    units: [],
+    composes: [
+      buildComposeRow({ executionId: 'int-9', composeId: 'c-1', now: NOW }),
+      buildComposeRow({ executionId: 'int-9', composeId: 'c-2', now: NOW }),
+    ],
+    quorumEdits: [
+      buildQuorumEditRow({
+        executionId: 'int-9',
+        editId: 'e-1',
+        artifactId: 'a-1',
+        changeDescription: 'x',
+        now: NOW,
+      }),
+      buildQuorumEditRow({
+        executionId: 'int-9',
+        editId: 'e-2',
+        artifactId: 'a-1',
+        changeDescription: 'y',
+        now: NOW,
+      }),
+    ],
+  };
+
+  it('producers and teardown derive the same ids (one convention)', () => {
+    expect(orchestratorLaneSessionIdFor('i', 1, 'u')).toBe(laneSessionIdFor('i', 1, 'u'));
+    expect(orchestratorQuorumEditSessionIdFor('i')).toBe(quorumEditSessionIdFor('i'));
+    expect(discussionsServiceSessionIdFor('i', 'd')).toBe(discussionSessionIdFor('i', 'd'));
+  });
+
+  it('collects compose, the one reused Quorum-edit and every discussion session', () => {
+    const ids = collectIntentSessionIds('int-9', auxRecords, { discussionIds: ['d-1', 'd-2'] });
+    expect(ids.toSorted()).toEqual(
+      [
+        runtimeSessionIdFor('int-9'),
+        composeSessionIdFor('c-1'),
+        composeSessionIdFor('c-2'),
+        quorumEditSessionIdFor('int-9'),
+        discussionSessionIdFor('int-9', 'd-1'),
+        discussionSessionIdFor('int-9', 'd-2'),
+      ].toSorted(),
+    );
+  });
+
+  it('adds no Quorum-edit session for an intent that never started an edit', () => {
+    const ids = collectIntentSessionIds('int-9', { composes: [], quorumEdits: [] });
+    expect(ids).toEqual([runtimeSessionIdFor('int-9')]);
+  });
+
+  it('reads discussion threads from the anchor and from threads naming the intent', async () => {
+    expect(
+      (
+        await collectDiscussionIds(
+          gWithDiscussions(['d-1', 'd-2'], ['d-2', 'd-orphan'], 'int-9'),
+          'int-9',
+        )
+      ).toSorted(),
+    ).toEqual(['d-1', 'd-2', 'd-orphan']);
+  });
+
+  it('the cascade releases every auxiliary session before the partition is deleted', async () => {
+    const order = [];
+    const store = {
+      getExecutionRecords: vi.fn().mockResolvedValue(auxRecords),
+      deleteExecution: vi.fn().mockImplementation(async () => order.push('deleteExecution')),
+    };
+    const agentcore = {
+      send: vi.fn().mockImplementation(async (command) => {
+        if (command.constructor.name === 'DeleteCapacityProviderSessionCommand') {
+          order.push(command.input.sessionId);
+        }
+        return {};
+      }),
+    };
+    await deleteIntentCascade({
+      g: gWithDiscussions(['d-1'], []),
+      store,
+      ddb: null,
+      agentcore,
+      intentId: 'int-9',
+      meta: instancesMeta,
+    });
+    expect(order.at(-1)).toBe('deleteExecution');
+    expect(order.slice(0, -1).toSorted()).toEqual(
+      [
+        runtimeSessionIdFor('int-9'),
+        composeSessionIdFor('c-1'),
+        composeSessionIdFor('c-2'),
+        quorumEditSessionIdFor('int-9'),
+        discussionSessionIdFor('int-9', 'd-1'),
+      ].toSorted(),
+    );
+  });
+
+  it('keeps the partition when an auxiliary release cannot be handed off', async () => {
+    const store = {
+      getExecutionRecords: vi.fn().mockResolvedValue(auxRecords),
+      deleteExecution: vi.fn(),
+    };
+    const agentcore = {
+      send: vi.fn().mockImplementation(async (command) => {
+        if (
+          command.constructor.name === 'DeleteCapacityProviderSessionCommand' &&
+          command.input.sessionId === quorumEditSessionIdFor('int-9')
+        ) {
+          throw Object.assign(new Error('boom'), { name: 'InternalServerException' });
+        }
+        return {};
+      }),
+    };
+    await expect(
+      deleteIntentCascade({
+        g: gWithDiscussions([], []),
+        store,
+        ddb: null,
+        agentcore,
+        intentId: 'int-9',
+        meta: instancesMeta,
+        sessionCleanupStore: { enqueue: vi.fn().mockRejectedValue(new Error('queue down')) },
+      }),
+    ).rejects.toBeInstanceOf(SessionReleaseHandoffError);
+    expect(store.deleteExecution).not.toHaveBeenCalled();
   });
 });

@@ -78,6 +78,7 @@ import { runQuorumEdit } from './quorum-edit.js';
 import { buildIntentAttribution } from './pr-attribution.js';
 import { bindGateCallback, ownsAnsweredGate, unparkGate } from './gate-callback.js';
 import { OVERRIDE_REASON_MAX } from '../shared/gate-answer.js';
+import { intentSessionIdFor } from '../shared/runtime-session-ids.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
 // this module implements. Checked against the registry by a test, so a
@@ -127,7 +128,7 @@ const MAX_STAGE_APPROVAL_DETAIL_BYTES = 300 * 1024;
 
 // AgentCore requires a session id >= 33 chars; reuse ONE per intent so the
 // checkout stays warm across init-ws + every run-stage (matches scripts/phaseb.sh).
-const sessionIdFor = (intentId) => `aidlc-intent-${intentId}`.padEnd(33, '0');
+const sessionIdFor = intentSessionIdFor;
 
 // One AgentCore /invocations call. Returns the parsed JSON body the command
 // handler returned (init-ws / run-stage). Throws on a non-2xx transport.

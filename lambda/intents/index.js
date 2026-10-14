@@ -37,6 +37,11 @@ import {
 } from '../shared/environment-snapshot.js';
 import { runtimeTargetInput } from '../shared/runtime-target.js';
 import { SessionReleaseHandoffError, stopSessions } from '../shared/runtime-session.js';
+import {
+  composeSessionIdFor,
+  intentSessionIdFor,
+  laneSessionIdFor,
+} from '../shared/runtime-session-ids.js';
 import { createSessionCleanupStore } from '../shared/session-cleanup-store.js';
 import { createProcessStore, isTransactionConflict } from '../shared/v2-process-store.js';
 import { isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
@@ -322,14 +327,10 @@ const ingestAttachmentUpload = async (event) => {
   }
 };
 const composeReportPrefix = (intentId) => `compose-reports/${intentId}/`;
-const runtimeSessionIdFor = (intentId) => `aidlc-intent-${intentId}`.padEnd(33, '0');
-// Composer one-shots run in a THROWAWAY session keyed by the compose id —
-// stateless, so a fresh microVM (on the CURRENT image) per request is exactly
-// right; see the compose dispatch below for the field incident this avoids.
-const composeSessionIdFor = (composeId) => `aidlc-compose-${composeId}`.padEnd(33, '0');
-// Unit-lane session ids — must mirror v2-orchestrator/section.js laneSessionIdFor.
-const laneSessionIdFor = (intentId, sectionIndex, slug) =>
-  `aidlc-intent-${intentId}-s${sectionIndex}-${slug}`.padEnd(33, '0');
+// Session ids (main, compose, lane) come from shared/runtime-session-ids.js.
+// Composer one-shots run in a THROWAWAY session keyed by the compose id — see
+// the compose dispatch below for the field incident this avoids.
+const runtimeSessionIdFor = intentSessionIdFor;
 const invokeSourceControl = async (input) => {
   if (!SOURCE_CONTROL_FN()) {
     throw Object.assign(new Error('Source-control service is not configured'), {

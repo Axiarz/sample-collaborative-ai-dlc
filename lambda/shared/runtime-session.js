@@ -29,8 +29,12 @@
 //   Run ends (SUCCEEDED / CANCELLED)       stop        retained (rewind relaunches
 //                                                      into the same workspace)
 //   Rewind / relaunch                      stop        retained (re-attached by id)
+//   Compose / discussion assist /          stop at     retained with the intent
+//   Quorum edit (intent-bound, async)      most        (ids derived again at deletion)
 //   Intent permanently deleted             release     deleted with the intent
 //   Environment validation session ends    release     deleted (disposable session)
+//   Project probe (capabilities,           release     deleted right after the probe
+//   verify-mcp, verify-connection)                     (withDisposableSession)
 //
 // Rationale: a workspace is part of the intent's state for as long as the
 // intent exists — a finished run can still be rewound and a parked stage
@@ -42,6 +46,7 @@
 // it would plug in here as a third operation without touching the callers.
 // ---------------------------------------------------------------------------
 
+import { randomUUID } from 'node:crypto';
 import { mapWithConcurrency } from './concurrency.js';
 import { Logger } from '@aws-lambda-powertools/logger';
 import {
@@ -212,11 +217,18 @@ export const releaseSessions = async ({
 // succeeds or the session is confirmed absent; any other failure keeps it and
 // bumps the attempt counter for observability. Unactionable records (no
 // provider identity) are dropped. Never throws.
-export const retryQueuedReleases = async ({ client, cleanupStore }) => {
+export const retryQueuedReleases = async ({ client, cleanupStore, now = Date.now }) => {
   const pending = await cleanupStore.listPending();
   const results = [];
   for (const record of pending) {
     const { sessionId } = record;
+    // Registered BEFORE its session was used (withDisposableSession): the
+    // probe may still be using it. Its own finally releases it; this poller
+    // only takes over once the grace window has passed.
+    if (record.notBefore && Date.parse(record.notBefore) > now()) {
+      results.push({ sessionId, deferred: true });
+      continue;
+    }
     if (!capacityProviderIdFromArn(record.capacityProviderArn)) {
       await cleanupStore.remove(sessionId);
       results.push({ sessionId, dropped: true });
@@ -245,7 +257,65 @@ export const retryQueuedReleases = async ({ client, cleanupStore }) => {
   return results;
 };
 
+// The longest a synchronous probe can hold its session: the Lambda maximum.
+export const DISPOSABLE_SESSION_GRACE_MS = 15 * 60 * 1000;
+
+// A one-shot session (project capability probe, MCP verification, connection
+// verification) with a cleanup owner for its whole life.
+//
+// On microVM targets nothing changes: `use` runs with a fresh id, and the
+// service reaps the session. On the Instances compute type every invoked
+// session gets an EBS volume, so ownership is registered BEFORE the session
+// exists: the release is queued first (deferred by the grace window so the
+// poller does not race the probe), the probe runs, and the probe's own release
+// removes the record. A lost response, a killed Lambda or a failed delete
+// leaves the record, and the environments poller deletes the session once the
+// window has passed. If the record cannot be written, the probe does not run —
+// an unowned session is never created.
+export const withDisposableSession = async (
+  { client, target, cleanupStore, source, context = {}, sessionId = randomUUID(), now = Date.now },
+  use,
+) => {
+  const capacityProviderArn = target?.capacityProviderArn ?? null;
+  if (!capacityProviderArn) return use(sessionId);
+  if (!cleanupStore) throw new SessionReleaseHandoffError([sessionId]);
+  await cleanupStore.enqueue({
+    sessionId,
+    capacityProviderArn,
+    source,
+    reason: 'disposable-session',
+    context,
+    notBefore: new Date(now() + DISPOSABLE_SESSION_GRACE_MS).toISOString(),
+  });
+  try {
+    return await use(sessionId);
+  } finally {
+    await stopSession({ client, target, sessionId });
+    const outcome = await attemptDelete({
+      client,
+      capacityProviderId: capacityProviderIdFromArn(capacityProviderArn),
+      sessionId,
+    });
+    if (outcome.released) {
+      await cleanupStore.remove(sessionId).catch((error) =>
+        logger.warn('Disposable session released; its cleanup record is left to the poller', {
+          sessionId,
+          error: error?.message ?? String(error),
+        }),
+      );
+    } else {
+      logger.warn('Disposable session release failed — the queued record keeps ownership', {
+        sessionId,
+        source,
+        error: outcome.reason,
+      });
+    }
+  }
+};
+
 export default {
+  withDisposableSession,
+  DISPOSABLE_SESSION_GRACE_MS,
   SessionReleaseHandoffError,
   SESSION_ABSENT_ERRORS,
   capacityProviderIdFromArn,

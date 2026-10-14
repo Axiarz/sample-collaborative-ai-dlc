@@ -629,19 +629,37 @@ compute ends, the workspace is retained and re-attached by the next invocation
 of the same session id) from **releasing** it (the workspace is deleted). The
 volume retention policy is explicit and bound to the intent's lifetime:
 
-| Event                                    | Operation   | Workspace volume                                     |
-| ---------------------------------------- | ----------- | ---------------------------------------------------- |
-| A stage is parked / a unit lane finishes | stop        | retained — resume re-attaches it                     |
-| A run ends (`SUCCEEDED` / `CANCELLED`)   | stop        | retained — rewind relaunches into the same workspace |
-| Rewind / relaunch                        | stop        | retained — re-attached by session id                 |
-| The intent is permanently deleted        | **release** | deleted with the intent                              |
-| Environment runtime validation ends      | **release** | deleted (disposable session)                         |
+| Event                                                      | Operation    | Workspace volume                                     |
+| ---------------------------------------------------------- | ------------ | ---------------------------------------------------- |
+| A stage is parked / a unit lane finishes                   | stop         | retained — resume re-attaches it                     |
+| A run ends (`SUCCEEDED` / `CANCELLED`)                     | stop         | retained — rewind relaunches into the same workspace |
+| Rewind / relaunch                                          | stop         | retained — re-attached by session id                 |
+| Compose, discussion assist, Quorum edit                    | stop at most | retained with the intent — the ids are reused        |
+| The intent is permanently deleted                          | **release**  | deleted with the intent                              |
+| Environment runtime validation ends                        | **release**  | deleted (disposable session)                         |
+| A space probe ends (capabilities, MCP or connection check) | **release**  | deleted right after the probe                        |
 
 A workspace is part of the intent's state for as long as the intent exists:
 a finished run can be rewound and a parked stage resumed, and both rely on
 the checkout and conversation state on the volume. On deletion, every
-persisted session of the intent (the main session and all unit-lane sessions,
-including lanes from earlier plans) is stopped and released. A release that
+session of the intent is stopped and released: the main session, all unit-lane
+sessions (including lanes from earlier plans), every compose session, the
+Quorum-edit session and one session per discussion thread. Each of these is
+derived from a record that exists before the session is first invoked (unit,
+compose and Quorum-edit rows, discussion threads), so none is missed. The
+auxiliary sessions are not released earlier because their ids are reused, and
+a deleted Instances session cannot be started again.
+
+Space-level probes (CLI capabilities, **Test** on MCP servers and on an agent
+connection) open a fresh session against the space's environment. On
+Instances the probe first records its cleanup as durable work, deferred by 15
+minutes so the poller does not race the probe, then runs, then deletes the
+session and removes the record. If the response is lost or the delete fails,
+the record stays and the poller deletes the session after the deferral. If
+the record cannot be written, the probe does not run. The fallback
+authentication qualification never opens a session on Instances: it uses the
+authentication support the revision's validation recorded, and asks to
+republish the environment if none was recorded. A release that
 fails for any reason other than the session already being gone is queued as
 durable cleanup work (`SESSION_CLEANUP#` records on the environment registry
 table) and retried by the environments status poller until the volume is gone

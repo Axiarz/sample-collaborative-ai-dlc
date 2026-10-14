@@ -47,6 +47,7 @@ export const createSessionCleanupStore = ({
     source = null,
     reason = null,
     context = {},
+    notBefore = null,
   }) => {
     if (!sessionId || !capacityProviderArn) return null;
     const createdAt = clock();
@@ -60,6 +61,9 @@ export const createSessionCleanupStore = ({
       source,
       reason,
       ...context,
+      // Deferred records (a session registered before its probe ran) are not
+      // retried before this instant; see withDisposableSession.
+      ...(notBefore ? { notBefore } : {}),
       attempts: 0,
       createdAt,
       updatedAt: createdAt,
