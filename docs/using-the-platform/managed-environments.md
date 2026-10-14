@@ -604,7 +604,16 @@ provision an EC2 instance, so a cold start can take several minutes. The revisio
 the instance is up (bounded by `MANAGED_INSTANCES_VALIDATION_MAX_POLLS`,
 30 polls by default). The poll runs every minute and can outlast that
 interval, so each revision's verification is leased to one poll at a time;
-only the lease holder creates, reuses or releases the validation session.
+only the lease holder creates, reuses or releases the validation session. The
+lease holder adopts a session retained by an earlier poll before it does
+anything else, so every way the validation can end, including a failed
+endpoint check, releases that session. Ending a validation is recorded before
+it is irreversible: the outcome is written together with retiring the session
+id (it is never invoked again), then the session is deleted or queued for
+cleanup, then the revision becomes `READY` or `FAILED`. A poll that finds a
+recorded outcome finishes it instead of validating again, so a failed write or
+an interrupted poll never reuses a released session and never loses its
+cleanup.
 
 #### Persistent workspaces and cost
 

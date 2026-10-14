@@ -578,7 +578,7 @@ describe('verification lease (overlapping polls)', () => {
 });
 
 describe('validation session ownership on unexpected failures', () => {
-  it('releases the minted session when a registry write fails mid-validation', async () => {
+  it('keeps a retained session on the row when only the attempt counter write fails', async () => {
     const store = mutableStore({ ...verifyingRevision });
     const original = store.updateRevision.getMockImplementation();
     store.updateRevision.mockImplementation(async (environmentId, revisionId, patch, options) => {
@@ -593,7 +593,42 @@ describe('validation session ownership on unexpected failures', () => {
         return {};
       }),
     };
-    await withEnv(() =>
+    const result = await withEnv(() =>
+      verifyRuntime({
+        store,
+        environment: instancesEnvironment,
+        revision: store.current,
+        controlClient: { send: vi.fn().mockResolvedValue({ status: 'READY' }) },
+        runtimeClient,
+        cleanupStore: cleanupStoreStub(),
+      }),
+    );
+    const invoked = runtimeClient.send.mock.calls.find(
+      (call) => call[0].constructor.name === 'InvokeAgentRuntimeCommand',
+    )[0].input.runtimeSessionId;
+    // The healthy cold-start session stays recoverable: still recorded on the
+    // row (it was persisted before the invoke) and not deleted.
+    expect(result.pending).toBe(true);
+    expect(store.current.status).toBe('VERIFYING');
+    expect(store.current.validationSessionId).toBe(invoked);
+    expect(
+      runtimeClient.send.mock.calls.some(
+        (call) => call[0].constructor.name === 'DeleteCapacityProviderSessionCommand',
+      ),
+    ).toBe(false);
+  });
+
+  it('releases the session when the validation itself throws unexpectedly', async () => {
+    const store = mutableStore({ ...verifyingRevision });
+    const runtimeClient = {
+      send: vi.fn().mockImplementation(async (command) => {
+        if (command.constructor.name === 'InvokeAgentRuntimeCommand') {
+          return { response: { transformToString: async () => 'not json' } };
+        }
+        return {};
+      }),
+    };
+    const result = await withEnv(() =>
       verifyRuntime({
         store,
         environment: instancesEnvironment,
@@ -610,6 +645,8 @@ describe('validation session ownership on unexpected failures', () => {
       (call) => call[0].constructor.name === 'DeleteCapacityProviderSessionCommand',
     );
     expect(deletion[0].input.sessionId).toBe(invoked);
+    expect(result.revision.status).toBe('FAILED');
+    expect(store.current.finalizingValidationSessionId).toBeNull();
   });
 });
 
@@ -649,18 +686,16 @@ describe('validation session ownership when the release cannot be handed off', (
     );
     expect(first.pending).toBe(true);
     const sessionId = deleteFails.send.mock.calls[0][0].input.runtimeSessionId;
-    // Ownership was NOT dropped: the revision still names the session.
+    // Ownership was NOT dropped: the revision still names the session — as a
+    // RETIRED id (never reused), next to the outcome it already decided.
     expect(store.current.status).toBe('VERIFYING');
-    expect(store.current.validationSessionId).toBe(sessionId);
+    expect(store.current.validationSessionId).toBeNull();
+    expect(store.current.finalizingValidationSessionId).toBe(sessionId);
+    expect(store.current.pendingFinalization.status).toBe('READY');
 
-    // Next poll, storage healthy again: same session, released, then READY.
-    const healthy = {
-      send: vi
-        .fn()
-        .mockResolvedValueOnce(capabilities)
-        .mockResolvedValueOnce(deterministic)
-        .mockResolvedValue({}),
-    };
+    // Next poll, storage healthy again: no re-validation, the retired session
+    // is released and the recorded READY applied.
+    const healthy = { send: vi.fn().mockResolvedValue({}) };
     const second = await withEnv(() =>
       verifyRuntime({
         store,
@@ -676,7 +711,14 @@ describe('validation session ownership when the release cannot be handed off', (
       (call) => call[0].constructor.name === 'DeleteCapacityProviderSessionCommand',
     );
     expect(deletion[0].input.sessionId).toBe(sessionId);
+    expect(
+      healthy.send.mock.calls.some(
+        (call) => call[0].constructor.name === 'InvokeAgentRuntimeCommand',
+      ),
+    ).toBe(false);
     expect(store.current.validationSessionId).toBeNull();
+    expect(store.current.finalizingValidationSessionId).toBeNull();
+    expect(store.current.pendingFinalization).toBeNull();
   });
 
   it('does not fail the revision on a validation failure whose release cannot be handed off', async () => {
@@ -706,6 +748,258 @@ describe('validation session ownership when the release cannot be handed off', (
     );
     expect(result.pending).toBe(true);
     expect(store.current.status).toBe('VERIFYING');
-    expect(store.current.validationSessionId).toBe('managed-environment-r-1-persisted-session');
+    expect(store.current.finalizingValidationSessionId).toBe(
+      'managed-environment-r-1-persisted-session',
+    );
+    expect(store.current.pendingFinalization.status).toBe('FAILED');
+  });
+});
+
+// Finalization recoverability: every sequence below interrupts the
+// record -> release -> apply transition somewhere and asserts that (a) no
+// verifier ever invokes a session that was handed to release, and (b) the
+// session keeps a cleanup owner until it is gone.
+describe('validation finalization survives failures and retries', () => {
+  const RETAINED = 'managed-environment-r-1-retained-session-0000';
+  const named = (call) => call[0].constructor.name;
+  const invokedIds = (client) =>
+    client.send.mock.calls
+      .filter((call) => named(call) === 'InvokeAgentRuntimeCommand')
+      .map((call) => call[0].input.runtimeSessionId);
+  const deletedIds = (client) =>
+    client.send.mock.calls
+      .filter((call) => named(call) === 'DeleteCapacityProviderSessionCommand')
+      .map((call) => call[0].input.sessionId);
+
+  // A store whose updateRevision honors fromStatus (like the real one) and
+  // can fail selected writes, either before or after applying them.
+  const faultyStore = (initial) => {
+    const store = mutableStore(initial);
+    const faults = [];
+    store.failNext = (match, { applied = false } = {}) => faults.push({ match, applied });
+    const apply = store.updateRevision.getMockImplementation();
+    store.updateRevision.mockImplementation(async (environmentId, revisionId, patch, options) => {
+      if (options?.fromStatus && store.current.status !== options.fromStatus) {
+        throw Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
+      }
+      const index = faults.findIndex((fault) => fault.match(patch));
+      if (index >= 0) {
+        const [fault] = faults.splice(index, 1);
+        if (fault.applied) await apply(environmentId, revisionId, patch, options);
+        throw Object.assign(new Error('write failed'), { name: 'InternalServerError' });
+      }
+      return apply(environmentId, revisionId, patch, options);
+    });
+    return store;
+  };
+  const endpointDenied = () => ({
+    send: vi.fn().mockImplementation(async (command) => {
+      if (command.constructor.name === 'GetAgentRuntimeEndpointCommand') {
+        throw Object.assign(new Error('not authorized'), { name: 'AccessDeniedException' });
+      }
+      return { status: 'READY' };
+    }),
+  });
+  const healthyControl = () => ({ send: vi.fn().mockResolvedValue({ status: 'READY' }) });
+  const succeedingRuntime = ({ deleteError } = {}) => {
+    const [capabilities, deterministic] = validationOk();
+    let invokes = 0;
+    return {
+      send: vi.fn().mockImplementation(async (command) => {
+        if (command.constructor.name === 'InvokeAgentRuntimeCommand') {
+          invokes += 1;
+          return invokes % 2 === 1 ? capabilities : deterministic;
+        }
+        if (command.constructor.name === 'DeleteCapacityProviderSessionCommand' && deleteError) {
+          throw deleteError();
+        }
+        return {};
+      }),
+    };
+  };
+  const notFound = () => Object.assign(new Error('gone'), { name: 'ResourceNotFoundException' });
+  const poll = (store, { controlClient = healthyControl(), runtimeClient, cleanupStore }) =>
+    withEnv(() =>
+      verifyRuntime({
+        store,
+        environment: instancesEnvironment,
+        revision: store.current,
+        controlClient,
+        runtimeClient,
+        cleanupStore: cleanupStore ?? cleanupStoreStub(),
+      }),
+    );
+  const isReadyWrite = (patch) => patch.status === 'READY';
+  const isRecordWrite = (patch) =>
+    Object.hasOwn(patch, 'pendingFinalization') && patch.pendingFinalization;
+
+  it('adopts a retained session before the endpoint check, so a denied check still releases it', async () => {
+    const store = faultyStore({ ...verifyingRevision, validationSessionId: RETAINED });
+    const runtimeClient = succeedingRuntime();
+    const result = await poll(store, { controlClient: endpointDenied(), runtimeClient });
+    expect(result.revision.status).toBe('FAILED');
+    expect(deletedIds(runtimeClient)).toEqual([RETAINED]);
+    expect(invokedIds(runtimeClient)).toEqual([]);
+  });
+
+  it('keeps the adopted session owned when that release also fails twice (delete + enqueue)', async () => {
+    const store = faultyStore({ ...verifyingRevision, validationSessionId: RETAINED });
+    const failingQueue = {
+      ...cleanupStoreStub(),
+      enqueue: vi.fn().mockRejectedValue(new Error('queue down')),
+    };
+    const first = await poll(store, {
+      controlClient: endpointDenied(),
+      runtimeClient: succeedingRuntime({ deleteError: deleteFailure }),
+      cleanupStore: failingQueue,
+    });
+    expect(first.pending).toBe(true);
+    expect(store.current).toMatchObject({
+      status: 'VERIFYING',
+      validationSessionId: null,
+      finalizingValidationSessionId: RETAINED,
+      pendingFinalization: { status: 'FAILED' },
+    });
+
+    // Next poll: the endpoint is fine now, but the decided outcome wins and
+    // the retired id is released, never invoked.
+    const runtimeClient = succeedingRuntime();
+    const second = await poll(store, { runtimeClient });
+    expect(second.revision.status).toBe('FAILED');
+    expect(deletedIds(runtimeClient)).toEqual([RETAINED]);
+    expect(invokedIds(runtimeClient)).toEqual([]);
+    expect(store.current.finalizingValidationSessionId).toBeNull();
+  });
+
+  it('does not reuse a released session when the READY write fails, and recovers READY', async () => {
+    const store = faultyStore({ ...verifyingRevision, validationSessionId: RETAINED });
+    store.failNext(isReadyWrite);
+    const first = await poll(store, { runtimeClient: succeedingRuntime() });
+    expect(first.pending).toBe(true);
+    expect(store.current).toMatchObject({
+      status: 'VERIFYING',
+      validationSessionId: null,
+      finalizingValidationSessionId: RETAINED,
+      pendingFinalization: { status: 'READY' },
+    });
+
+    // The session was already deleted: the retry sees it absent.
+    const runtimeClient = succeedingRuntime({ deleteError: notFound });
+    const second = await poll(store, { runtimeClient });
+    expect(second.revision.status).toBe('READY');
+    expect(second.revision.verification.status).toBe('PASSED');
+    expect(invokedIds(runtimeClient)).toEqual([]);
+    expect(store.updateRevision).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ validationSessionId: expect.any(String) }),
+      expect.anything(),
+    );
+  });
+
+  it('treats an uncertain outcome write (applied, then errored) as recoverable without releasing', async () => {
+    const store = faultyStore({ ...verifyingRevision, validationSessionId: RETAINED });
+    store.failNext(isRecordWrite, { applied: true });
+    const firstClient = succeedingRuntime();
+    const first = await poll(store, { runtimeClient: firstClient });
+    expect(first.pending).toBe(true);
+    // Nothing irreversible happened in the poll that saw the error.
+    expect(deletedIds(firstClient)).toEqual([]);
+
+    const runtimeClient = succeedingRuntime();
+    const second = await poll(store, { runtimeClient });
+    expect(second.revision.status).toBe('READY');
+    expect(deletedIds(runtimeClient)).toEqual([RETAINED]);
+    expect(invokedIds(runtimeClient)).toEqual([]);
+  });
+
+  it('a failed (not applied) outcome write leaves the session reusable and re-validates', async () => {
+    const store = faultyStore({ ...verifyingRevision, validationSessionId: RETAINED });
+    store.failNext(isRecordWrite);
+    const firstClient = succeedingRuntime();
+    expect((await poll(store, { runtimeClient: firstClient })).pending).toBe(true);
+    expect(deletedIds(firstClient)).toEqual([]);
+    expect(store.current.validationSessionId).toBe(RETAINED);
+
+    const runtimeClient = succeedingRuntime();
+    const second = await poll(store, { runtimeClient });
+    expect(second.revision.status).toBe('READY');
+    expect(invokedIds(runtimeClient)).toEqual([RETAINED, RETAINED]);
+    expect(deletedIds(runtimeClient)).toEqual([RETAINED]);
+  });
+
+  it('resumes a finalization interrupted between record and release (poll terminated)', async () => {
+    const store = faultyStore({
+      ...verifyingRevision,
+      finalizingValidationSessionId: RETAINED,
+      pendingFinalization: {
+        status: 'FAILED',
+        failure: { reason: 'runtime_validation_failed', detail: 'x', failedAt: 'now' },
+      },
+    });
+    const runtimeClient = succeedingRuntime();
+    const result = await poll(store, { runtimeClient });
+    expect(result.revision.status).toBe('FAILED');
+    expect(result.revision.failure.detail).toBe('x');
+    expect(deletedIds(runtimeClient)).toEqual([RETAINED]);
+    expect(invokedIds(runtimeClient)).toEqual([]);
+  });
+
+  it('a concurrent queue cleanup of a retired session never races a verifier using it', async () => {
+    // Poll 1: delete fails, the release is queued (queue owns it), then the
+    // READY write fails. The revision keeps the id RETIRED.
+    const store = faultyStore({ ...verifyingRevision, validationSessionId: RETAINED });
+    const queued = [];
+    const queue = {
+      ...cleanupStoreStub(),
+      enqueue: vi.fn().mockImplementation(async (record) => queued.push(record)),
+      listPending: vi.fn().mockImplementation(async () => queued),
+      remove: vi.fn().mockImplementation(async (sessionId) => {
+        queued.splice(
+          queued.findIndex((item) => item.sessionId === sessionId),
+          1,
+        );
+      }),
+    };
+    store.failNext(isReadyWrite);
+    await poll(store, {
+      runtimeClient: succeedingRuntime({ deleteError: deleteFailure }),
+      cleanupStore: queue,
+    });
+    expect(queued.map((item) => item.sessionId)).toEqual([RETAINED]);
+    expect(store.current.finalizingValidationSessionId).toBe(RETAINED);
+
+    // The queue retry and the next verifier run concurrently.
+    const shared = succeedingRuntime();
+    let deleted = false;
+    shared.send.mockImplementation(async (command) => {
+      if (command.constructor.name === 'DeleteCapacityProviderSessionCommand') {
+        if (deleted) throw notFound();
+        deleted = true;
+        return {};
+      }
+      return {};
+    });
+    const [, verified] = await Promise.all([
+      retryQueuedReleases({ client: shared, cleanupStore: queue }),
+      poll(store, { runtimeClient: shared, cleanupStore: queue }),
+    ]);
+    expect(verified.revision.status).toBe('READY');
+    expect(invokedIds(shared)).toEqual([]);
+    expect(queued).toEqual([]);
+  });
+
+  it('healthy validation is unchanged: one session, released once, READY', async () => {
+    const store = faultyStore({ ...verifyingRevision });
+    const runtimeClient = succeedingRuntime();
+    const result = await poll(store, { runtimeClient });
+    expect(result.revision.status).toBe('READY');
+    const [session] = invokedIds(runtimeClient);
+    expect(deletedIds(runtimeClient)).toEqual([session]);
+    expect(store.current).toMatchObject({
+      validationSessionId: null,
+      finalizingValidationSessionId: null,
+      pendingFinalization: null,
+    });
   });
 });

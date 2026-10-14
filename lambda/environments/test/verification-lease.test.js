@@ -12,6 +12,8 @@ import {
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { createEnvironmentStore } from '../store.js';
 import { verifyRuntime } from '../status.js';
+import { createSessionCleanupStore } from '../../shared/session-cleanup-store.js';
+import { retryQueuedReleases } from '../../shared/runtime-session.js';
 
 const TABLE = `env-registry-lease-${process.pid}-${Date.now()}`;
 const client = new DynamoDBClient({
@@ -241,5 +243,104 @@ describe('verification lease on the real store', () => {
     expect(
       await store.acquireVerificationLease('x86-build', 'r-ready', { owner: 'p', ttlMs: 60_000 }),
     ).toBeNull();
+  });
+
+  it('a session whose READY write failed is never reused while the real queue deletes it', async () => {
+    await putVerifyingRevision('r-final');
+    const queue = createSessionCleanupStore({ ddb, tableName: TABLE });
+    const capabilities = JSON.stringify({ ok: true, clis: ['claude'] });
+    const deterministic = JSON.stringify({
+      ok: true,
+      nonce: 'check-r-final',
+      compatibilityVersion: '1',
+      nonRoot: true,
+    });
+    let invokes = 0;
+    const firstRuntime = {
+      send: vi.fn().mockImplementation(async (command) => {
+        const name = command.constructor.name;
+        if (name === 'InvokeAgentRuntimeCommand') {
+          invokes += 1;
+          const body = invokes === 1 ? capabilities : deterministic;
+          return { response: { transformToString: async () => body } };
+        }
+        if (name === 'DeleteCapacityProviderSessionCommand') {
+          throw Object.assign(new Error('internal'), { name: 'InternalServerException' });
+        }
+        return {};
+      }),
+    };
+    // The READY write is the one that fails (the queue write and the outcome
+    // record go through).
+    const flakyStore = {
+      ...store,
+      updateRevision: async (environmentId, revisionId, patch, options) => {
+        if (patch.status === 'READY') {
+          throw Object.assign(new Error('throttled'), {
+            name: 'ProvisionedThroughputExceededException',
+          });
+        }
+        return store.updateRevision(environmentId, revisionId, patch, options);
+      },
+    };
+    const initial = await readRevision('r-final');
+    const first = await withEnv(() =>
+      verifyRuntime({
+        store: flakyStore,
+        environment,
+        revision: initial,
+        controlClient,
+        runtimeClient: firstRuntime,
+        cleanupStore: queue,
+      }),
+    );
+    expect(first.pending).toBe(true);
+    const session = firstRuntime.send.mock.calls.find(
+      (call) => call[0].constructor.name === 'InvokeAgentRuntimeCommand',
+    )[0].input.runtimeSessionId;
+    const afterFirst = await readRevision('r-final');
+    expect(afterFirst).toMatchObject({
+      status: 'VERIFYING',
+      validationSessionId: null,
+      finalizingValidationSessionId: session,
+    });
+    expect((await queue.listPending()).map((item) => item.sessionId)).toContain(session);
+
+    // Queue retry and the next verifier run at the same time against the
+    // real table. The verifier must not invoke the retired session.
+    let deleted = false;
+    const shared = {
+      send: vi.fn().mockImplementation(async (command) => {
+        if (command.constructor.name === 'DeleteCapacityProviderSessionCommand') {
+          if (deleted)
+            throw Object.assign(new Error('gone'), { name: 'ResourceNotFoundException' });
+          deleted = true;
+        }
+        return {};
+      }),
+    };
+    const [, verified] = await Promise.all([
+      retryQueuedReleases({ client: shared, cleanupStore: queue }),
+      withEnv(() =>
+        verifyRuntime({
+          store,
+          environment,
+          revision: afterFirst,
+          controlClient,
+          runtimeClient: shared,
+          cleanupStore: queue,
+        }),
+      ),
+    ]);
+    expect(verified.revision.status).toBe('READY');
+    expect(
+      shared.send.mock.calls.filter(
+        (call) => call[0].constructor.name === 'InvokeAgentRuntimeCommand',
+      ),
+    ).toEqual([]);
+    const final = await readRevision('r-final');
+    expect(final.finalizingValidationSessionId ?? null).toBeNull();
+    expect(final.pendingFinalization ?? null).toBeNull();
+    expect((await queue.listPending()).map((item) => item.sessionId)).not.toContain(session);
   });
 });
