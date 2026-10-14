@@ -436,17 +436,10 @@ jobs:
             exit 1
           fi
 
-          mapfile -d '' -t package_plans < <(
-            find "$PWD/terraform/builds" \
-              -maxdepth 1 -type f -name '*.plan.json' -print0
-          )
-          if (( ${#package_plans[@]} == 0 )); then
-            echo "Terraform did not generate any Lambda package plans." >&2
-            exit 1
-          fi
-
-          for package_plan in "${package_plans[@]}"; do
-            relative_plan="builds/$(basename "$package_plan")"
+          found_package_plan=false
+          while IFS= read -r -d '' package_plan; do
+            found_package_plan=true
+            relative_plan="${package_plan#"$PWD/terraform/"}"
             echo "Building Lambda package from $relative_plan"
             (
               cd terraform
@@ -464,7 +457,12 @@ jobs:
               echo "Lambda package was not created: terraform/$package_file" >&2
               exit 1
             fi
-          done
+          done < <(find "$PWD/terraform/builds" -type f -name '*.plan.json' -print0)
+
+          if [[ "$found_package_plan" == false ]]; then
+            echo "Terraform did not generate any Lambda package plans." >&2
+            exit 1
+          fi
 
           # The package content hash includes the source directory. Remove
           # generated bundles so the final plan hashes the clean release source
@@ -483,6 +481,16 @@ jobs:
 
       - name: Apply infrastructure
         run: |
+          set -euo pipefail
+          # Inspect the final plan: a newly resolved filename must already exist
+          # before apply can modify any resources.
+          plan_json="$(mktemp "$RUNNER_TEMP/aidlc-packages.XXXXXX")"
+          trap 'rm -f "$plan_json"' EXIT
+          terraform -chdir=terraform show -json "$AIDLC_PLAN_FILE" > "$plan_json"
+          (
+            cd terraform
+            node ../scripts/inspect-terraform-plan.mjs "$plan_json" --require-lambda-packages
+          )
           ./scripts/deploy-terraform.sh "$TF_ENVIRONMENT" \
             --phase apply \
             --plan-file "$AIDLC_PLAN_FILE"
