@@ -80,17 +80,60 @@ export const incompleteSectionRepair = (meta, records, plan) => {
   };
 };
 
-export const repairPreviewToken = (meta, records, preview) =>
-  createHash('sha256')
+export const repairPreviewToken = (meta, records, preview) => {
+  const orphaned = preview.kind === 'orphaned-lanes';
+  const pendingStages = new Set(
+    (records.humanTasks ?? [])
+      .filter((gate) => gate.status === 'pending')
+      .map((gate) => gate.stageInstanceId),
+  );
+  const repairable = new Set([
+    'READY',
+    'RUNNING',
+    'PR_DRAFT',
+    'RECONCILING',
+    'PR_READY',
+    'ADDRESSING_FEEDBACK',
+    'MERGING',
+    'FAILED',
+    'BLOCKED',
+  ]);
+  return createHash('sha256')
     .update(
       JSON.stringify({
         run: meta.orchestratorRunId ?? null,
-        status: meta.status,
-        updatedAt: meta.updatedAt,
+        status: orphaned && ['RUNNING', 'WAITING'].includes(meta.status) ? 'ACTIVE' : meta.status,
+        ...(orphaned ? {} : { updatedAt: meta.updatedAt }),
         plan: records.unitPlan,
-        units: records.units,
-        stages: records.stages,
+        units: orphaned
+          ? (records.units ?? [])
+              .filter((unit) => Number(unit.sectionIndex) === preview.sectionIndex)
+              .map((unit) => ({
+                slug: unit.slug,
+                sectionIndex: unit.sectionIndex,
+                branch: unit.branch,
+                state: repairable.has(unit.state) ? 'repairable' : unit.state,
+                completionSkip: unit.completionSkip,
+              }))
+          : records.units,
+        // Output, metrics and completed sibling stages do not change which orphaned
+        // waits are being repaired. Callback/attempt identity and new human gates do.
+        stages: orphaned
+          ? (records.stages ?? [])
+              .filter(
+                (stage) =>
+                  stage.unitSlug &&
+                  stage.state === 'WAITING_FOR_HUMAN' &&
+                  !pendingStages.has(stage.stageInstanceId),
+              )
+              .map((stage) => ({
+                stageInstanceId: stage.stageInstanceId,
+                attempt: stage.attempt,
+                stageCallbackId: stage.stageCallbackId,
+              }))
+          : records.stages,
         preview,
       }),
     )
     .digest('hex');
+};

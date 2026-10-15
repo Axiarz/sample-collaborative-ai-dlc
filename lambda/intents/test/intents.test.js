@@ -6840,6 +6840,78 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
     expect(orchestratorInvokes()).toHaveLength(0);
   });
 
+  it.each(['progress', 'run', 'plan', 'candidate', 'decision', 'gate'])(
+    'checks material orphan-preview changes while allowing sibling %s',
+    async (change) => {
+      const { sub, projectId, intent, pk } = await falseSuccess();
+      const meta = procStore.get(keyOf(pk, 'META'));
+      meta.status = 'RUNNING';
+      const plan = procStore.get(keyOf(pk, 'UNITPLAN'));
+      plan.walkingSkeleton = 'foundation';
+      plan.units.push({ slug: 'sibling', dependsOn: ['foundation'] });
+      procStore.get(keyOf(pk, 'UNIT#S1#feature')).state = 'RUNNING';
+      procStore.set(keyOf(pk, 'UNIT#S1#sibling'), {
+        pk,
+        sk: 'UNIT#S1#sibling',
+        slug: 'sibling',
+        sectionIndex: 1,
+        state: 'RUNNING',
+      });
+      seedStageRow(intent.id, 'cg', 'feature', 'WAITING_FOR_HUMAN', 1);
+      seedStageRow(intent.id, 'cg', 'sibling', 'RUNNING', 1);
+      if (change === 'progress') {
+        const sk = 'UNITPR#S1#sibling#owner%2Frepo';
+        procStore.set(keyOf(pk, sk), {
+          pk,
+          sk,
+          type: 'UnitPr',
+          sectionIndex: 1,
+          unitSlug: 'sibling',
+          repository: 'owner/repo',
+          number: 12,
+          state: 'DRAFT',
+        });
+        sourceControlOperationHandler = () => {
+          meta.updatedAt = new Date(Date.now() + 2000).toISOString();
+          return { state: 'open', draft: true, sourceBranch: 'aidlc/feature--sibling' };
+        };
+      }
+      const { preview } = JSON.parse(
+        (await repair(sub, projectId, intent.id, { preview: true })).body,
+      );
+      if (change === 'progress') {
+        meta.updatedAt = new Date(Date.now() + 1).toISOString();
+        meta.status = 'WAITING';
+        Object.assign(procStore.get(keyOf(pk, `STAGE#${siOf('cg', 'sibling', 1)}`)), {
+          state: 'SUCCEEDED',
+          updatedAt: meta.updatedAt,
+          elapsedMs: 2000,
+        });
+        procStore.get(keyOf(pk, 'UNIT#S1#sibling')).updatedAt = meta.updatedAt;
+      }
+      if (change === 'run') meta.orchestratorRunId = 'replacement';
+      if (change === 'plan') plan.units[1].dependsOn = [];
+      if (change === 'candidate') procStore.get(keyOf(pk, 'UNIT#S1#sibling')).state = 'MERGED';
+      if (change === 'decision') plan.autonomyMode = 'gated';
+      if (change === 'gate')
+        seedGate(intent.id, 'new-question', {
+          status: 'pending',
+          stageInstanceId: siOf('cg', 'feature', 1),
+        });
+      const result = await repair(sub, projectId, intent.id, {
+        previewToken: preview.previewToken,
+      });
+      expect(result.statusCode).toBe(change === 'progress' ? 202 : 409);
+      expect(orchestratorInvokes()).toHaveLength(change === 'progress' ? 1 : 0);
+      if (change === 'progress')
+        expect(procStore.get(keyOf(pk, `STAGE#${siOf('cg', 'sibling', 1)}`))).toMatchObject({
+          state: 'SUCCEEDED',
+          attempt: 0,
+        });
+      else expect(archiveArtifactsSpy).not.toHaveBeenCalled();
+    },
+  );
+
   it('repairs orphaned parallel waits while preserving merged units', async () => {
     const sub = `u-${randomUUID()}`;
     const projectId = await seedV2Project(sub);

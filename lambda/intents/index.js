@@ -4481,15 +4481,27 @@ export const handler = async (event, context) => {
         priorDurableExecutionArn = listed.DurableExecutions?.[0]?.DurableExecutionArn ?? null;
       }
 
+      // Re-read after provider checks, immediately before the CAS. Output-only
+      // META updates during those reads must not starve a reviewed orphan repair.
+      const claimMeta =
+        preview.kind === 'orphaned-lanes'
+          ? await store.getExecution(intentId, { consistentRead: true })
+          : meta;
+      if (!claimMeta || repairPreviewToken(claimMeta, records, preview) !== previewToken) {
+        return response(409, {
+          error: 'Execution changed. Refresh the recovery preview.',
+          code: 'repair_preview_changed',
+        });
+      }
       const repairRunId = `retired-${randomBytes(8).toString('hex')}`;
       try {
         await store.updateExecution({
           executionId: intentId,
           projectId,
           status: 'FAILED',
-          fromStatus: meta.status,
+          fromStatus: claimMeta.status,
           ifOrchestratorRunId: meta.orchestratorRunId,
-          ifUpdatedAt: meta.updatedAt,
+          ifUpdatedAt: claimMeta.updatedAt,
           startedAt: meta.startedAt,
           pendingHumanTaskId: null,
           resumeRequired: null,
