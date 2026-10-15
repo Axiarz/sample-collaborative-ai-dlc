@@ -62,7 +62,9 @@ longer than the API worker's lifetime. If the worker dies without running its
 catch, preview becomes available after expiry; confirmation claims the old run
 conditionally and resumes that saved section and skeleton choice. A handled
 failure permits an immediate fresh preview. Generic start cannot bypass an
-unfinished repair. A late owner cannot clear its successor's lease or relaunch.
+unfinished repair, including the CREATED handoff after launch acknowledgement.
+The guard retires when the new orchestrator claims a different run token. A late
+owner cannot clear its successor's lease or relaunch.
 Integrated unit rows and their completed stages are
 never reset by this flow. Missing/unstarted lanes may resume from the section
 boundary; completed stages of unfinished lanes are preserved.

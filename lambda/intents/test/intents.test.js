@@ -6865,6 +6865,50 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
     expect(orchestratorInvokes()).toHaveLength(1);
   });
 
+  it('keeps the reviewed repair guard until the new orchestrator claims its run', async () => {
+    const { sub, projectId, intent, pk } = await falseSuccess();
+    const { preview } = JSON.parse(
+      (await repair(sub, projectId, intent.id, { preview: true })).body,
+    );
+    expect(
+      (
+        await repair(sub, projectId, intent.id, {
+          previewToken: preview.previewToken,
+          walkingSkeleton: 'foundation',
+        })
+      ).statusCode,
+    ).toBe(202);
+    const meta = procStore.get(keyOf(pk, 'META'));
+    expect(meta).toMatchObject({
+      status: 'CREATED',
+      repairPlan: { walkingSkeleton: 'foundation', preview: { fromStageId: 'cg' } },
+    });
+    const start = await handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intent.id}/start`,
+      pathParameters: { projectId, intentId: intent.id },
+      body: '{}',
+      ...claims(sub),
+    });
+    expect(start.statusCode).toBe(409);
+    expect(orchestratorInvokes()).toHaveLength(1);
+    meta.repairStartedAt = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    const resumed = await repair(sub, projectId, intent.id, { preview: true });
+    expect(resumed.statusCode).toBe(200);
+    expect(JSON.parse(resumed.body).preview).toMatchObject({
+      fromStageId: 'cg',
+      skeletonCandidates: ['foundation'],
+    });
+    Object.assign(meta, { status: 'RUNNING', orchestratorRunId: 'claimed-new-run' });
+    const detail = await handler({
+      httpMethod: 'GET',
+      path: `/projects/${projectId}/intents/${intent.id}`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+    expect(JSON.parse(detail.body).repairStatus).toBeNull();
+  });
+
   it('takes over an expired repair without its catch running and fences the late worker', async () => {
     const { sub, projectId, intent, pk } = await falseSuccess();
     const { preview } = JSON.parse(

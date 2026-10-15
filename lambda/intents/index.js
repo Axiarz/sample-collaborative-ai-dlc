@@ -4793,17 +4793,9 @@ export const handler = async (event, context) => {
             },
             { durableExecutionName },
           );
-          await store
-            .updateExecution({
-              executionId: intentId,
-              ifOrchestratorRunId: repairRunId,
-              repairPlan: null,
-              repairStartedAt: null,
-            })
-            .catch((error) => {
-              if (error?.name !== 'ConditionalCheckFailedException')
-                logger.error('Repair lease cleanup failed', error);
-            });
+          // Keep the reviewed repair guard through CREATED handoff. The new
+          // orchestrator's run claim retires it by changing orchestratorRunId;
+          // an acknowledgement alone does not prove that ownership transferred.
           if (invoked?.durableExecutionArn) {
             await store
               .updateExecution({
