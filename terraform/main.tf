@@ -66,6 +66,13 @@ locals {
   dns_suffix              = data.aws_partition.current.dns_suffix
   powertools_service_name = "collaborative-aidlc"
 
+  # Use the existing application release version as the SDK application ID.
+  # Powertools appends ~43 chars to AWS_SDK_UA_APP_ID at import unless the value
+  # already contains "/PTEnv/", which would exceed the SDK's 50-char limit and
+  # log a warning on every SDK call. Remove the suffix once Powertools leaves room.
+  # See https://github.com/aws-powertools/powertools-lambda-typescript/issues/5815
+  aws_sdk_ua_app_id = "Collaborative_AI-DLC-${jsondecode(file("${path.module}/../package.json")).version}/PTEnv/"
+
   # Bedrock inference may live outside the deployment region (regional API keys
   # or model access). The runtime CLIs and the model picker share this value.
   bedrock_region = coalesce(var.bedrock_region, var.aws_region)
@@ -304,6 +311,7 @@ module "waf" {
 module "auth" {
   source = "./modules/auth"
 
+  aws_sdk_ua_app_id       = local.aws_sdk_ua_app_id
   project_name            = var.project_name
   environment             = var.environment
   powertools_service_name = local.powertools_service_name
@@ -462,6 +470,7 @@ module "neptune" {
 module "lambda" {
   source = "./modules/api/lambda"
 
+  aws_sdk_ua_app_id           = local.aws_sdk_ua_app_id
   project_name                = var.project_name
   environment                 = var.environment
   powertools_service_name     = local.powertools_service_name
@@ -545,9 +554,7 @@ module "lambda" {
 module "api" {
   source = "./modules/api"
 
-
-  v2_executions_table_name = module.agentcore.v2_executions_table_name
-
+  aws_sdk_ua_app_id                        = local.aws_sdk_ua_app_id
   project_name                             = var.project_name
   environment                              = var.environment
   powertools_service_name                  = local.powertools_service_name
@@ -612,6 +619,7 @@ module "api" {
   agentcore_runtime_arn                    = module.agentcore.runtime_arn
   bedrock_region                           = local.bedrock_region
   agent_credential_grant_secret_param_name = aws_ssm_parameter.agent_credential_grant_secret.name
+  v2_executions_table_name                 = module.agentcore.v2_executions_table_name
   environment_registry_table_name          = module.dynamodb.environment_registry_table_name
   runtime_compatibility_version            = module.agentcore.runtime_compatibility_version
   private_subnet_ids                       = module.networking.private_subnet_ids
@@ -631,6 +639,7 @@ module "api" {
 module "realtime" {
   source = "./modules/realtime"
 
+  aws_sdk_ua_app_id       = local.aws_sdk_ua_app_id
   project_name            = var.project_name
   environment             = var.environment
   powertools_service_name = local.powertools_service_name
@@ -653,6 +662,7 @@ module "realtime" {
 module "yjs_server" {
   source = "./modules/realtime/yjs-server"
 
+  aws_sdk_ua_app_id             = local.aws_sdk_ua_app_id
   project_name                  = var.project_name
   environment                   = var.environment
   powertools_service_name       = local.powertools_service_name
@@ -683,6 +693,7 @@ module "yjs_server" {
 module "agentcore" {
   source = "./modules/compute/agentcore"
 
+  aws_sdk_ua_app_id           = local.aws_sdk_ua_app_id
   project_name                = var.project_name
   environment                 = var.environment
   powertools_service_name     = local.powertools_service_name
@@ -727,6 +738,7 @@ module "agentcore" {
 module "managed_environments" {
   source = "./modules/compute/managed-environments"
 
+  aws_sdk_ua_app_id             = local.aws_sdk_ua_app_id
   project_name                  = var.project_name
   environment                   = var.environment
   powertools_service_name       = local.powertools_service_name
