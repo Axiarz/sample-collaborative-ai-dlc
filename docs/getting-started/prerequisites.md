@@ -168,10 +168,12 @@ organization policies must permit this token request. Tokens last 12 hours.
 See AWS's [authentication guide](https://docs.aws.amazon.com/AmazonECR/latest/public/public-registry-auth.html)
 and [GetAuthorizationToken permissions](https://docs.aws.amazon.com/AmazonECRPublic/latest/APIReference/API_GetAuthorizationToken.html).
 
-The installer and `deploy-terraform.sh` acquire a fresh token automatically
-before apply; no Docker login or additional configuration is needed. Authentication
-failure stops deployment before apply or retired-task changes. Keep BuildKit
-enabled: the locked provider's legacy builder does not forward this auth session.
+Automatic Public ECR authentication applies to the updated deployment script and
+reusable deployment workflow. Managed installations of older tagged releases still
+use their bundled deployment scripts and do not receive this authentication
+automatically. On paths using this authentication, a failure stops deployment
+before apply or retired-task changes. Keep BuildKit enabled: the locked provider's
+legacy builder does not forward this auth session.
 
 ### KMS permissions for infrastructure encryption
 
