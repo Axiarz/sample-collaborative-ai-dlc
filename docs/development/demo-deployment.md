@@ -102,6 +102,15 @@ functions and configuration-only updates do not require their old local ZIPs.
 The final plan hashes the clean release source and apply reuses the built
 packages. Source changes still produce and deploy new content-addressed archives.
 
+The pre-apply validator comes from the immutable executing workflow commit
+(`github.workflow_sha`), independently of the release tag or deployment commit.
+Before configuring AWS credentials, the workflow uses checkout's read-only Git
+access to fetch that exact commit and extract the standalone inspector into the
+runner's temporary directory. The deployment checkout stays on the selected
+release, and archive paths are checked relative to its Terraform directory.
+Manual deployments of older releases therefore retain the package and protected
+resource guards even when their bundled inspector predates the package-check mode.
+
 ## Deployment concurrency
 
 The reusable workflow first resolves `TF_STATE_BUCKET`, `TF_STATE_KEY`, and
