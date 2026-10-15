@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { stubPublicEcr } from './helpers/public-ecr.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const inspector = join(root, 'scripts/inspect-terraform-plan.mjs');
@@ -208,6 +209,10 @@ const olderReleaseDeployment = (t) => {
   const origin = fixture(t);
   const relativeInspector = 'scripts/inspect-terraform-plan.mjs';
   mkdirSync(join(origin, 'scripts'));
+  for (const file of ['lambda/agentcore/Dockerfile', 'lambda/yjs-server/Dockerfile']) {
+    mkdirSync(dirname(join(origin, file)), { recursive: true });
+    copyFileSync(join(root, file), join(origin, file));
+  }
   // Snapshot from v2.2.0 (bc988d0eaaca752d9add2d67b2c861841a363227).
   copyFileSync(
     join(root, 'scripts/test/fixtures/inspect-terraform-plan-v2.2.0.mjs'),
@@ -222,7 +227,7 @@ const olderReleaseDeployment = (t) => {
   git(origin, 'config', 'user.name', 'Deployment test');
   git(origin, 'config', 'user.email', 'deployment-test@example.com');
   const commit = (message) => {
-    git(origin, 'add', 'scripts');
+    git(origin, 'add', 'scripts', 'lambda');
     git(origin, '-c', 'commit.gpgsign=false', 'commit', '-m', message);
     return git(origin, 'rev-parse', 'HEAD');
   };
@@ -240,9 +245,17 @@ const olderReleaseDeployment = (t) => {
 
   // The loader must fetch the workflow commit, even if not already present.
   copyFileSync(inspector, join(origin, relativeInspector));
+  copyFileSync(
+    join(root, 'scripts/with-public-ecr-auth.mjs'),
+    join(origin, 'scripts/with-public-ecr-auth.mjs'),
+  );
   const workflowSha = commit('Workflow with package validation');
   // A newer main must not supply the validator.
   writeFileSync(join(origin, relativeInspector), 'throw new Error("Loaded mutable main");\n');
+  writeFileSync(
+    join(origin, 'scripts/with-public-ecr-auth.mjs'),
+    'throw new Error("Loaded mutable auth helper");\n',
+  );
   commit('Newer main');
   assert.match(
     workflowStepSource('Load workflow plan validator'),
@@ -256,6 +269,7 @@ const olderReleaseDeployment = (t) => {
   );
 
   mkdirSync(join(directory, 'bin'));
+  stubPublicEcr(join(directory, 'bin'));
   writeFileSync(
     join(directory, 'bin/terraform'),
     '#!/bin/bash\nset -eu\n[[ "$1" == -chdir=terraform && "$2" == show && "$3" == -json && "$4" == "$AIDLC_PLAN_FILE" ]]\ncat "$MOCK_PLAN_JSON"\n',
@@ -264,6 +278,9 @@ const olderReleaseDeployment = (t) => {
   const finalPlan = join(directory, 'final-plan.json');
   const env = {
     PATH: `${join(directory, 'bin')}:${process.env.PATH}`,
+    DOCKER_CONFIG: join(directory, 'docker'),
+    DOCKER_BUILDKIT: '1',
+    ECR_TEST_LOG: join(directory, 'auth-events'),
     MOCK_PLAN_JSON: finalPlan,
     WORKFLOW_SHA: workflowSha,
     // The triggering/deployment SHA is deliberately different from the workflow.
@@ -276,6 +293,7 @@ const olderReleaseDeployment = (t) => {
 const loadValidator = ({ directory, env, releaseSha, relativeInspector }) => {
   const result = runStep('Load workflow plan validator', directory, env);
   assert.equal(result.status, 0, result.stderr);
+  assert.ok(existsSync(join(directory, 'tmp/aidlc-plan-validator/with-public-ecr-auth.mjs')));
   assert.equal(git(directory, 'rev-parse', 'HEAD'), releaseSha);
   assert.equal(git(directory, 'status', '--porcelain', '--untracked-files=no'), '');
   assert.equal(
@@ -356,4 +374,18 @@ test('older release deployment still rejects protected-resource destruction befo
   assert.equal(result.status, 1);
   assert.match(result.stderr, /protected persistent resources would be destroyed/);
   assert.deepEqual(readdirSync(join(directory, 'tmp')), ['aidlc-plan-validator']);
+});
+
+test('workflow-sourced auth blocks an older release apply when Public ECR access fails', (t) => {
+  for (const failure of [{ ECR_TEST_LOGIN_FAIL: '1' }, { ECR_TEST_HTTP_STATUS: '429' }]) {
+    const deployment = olderReleaseDeployment(t);
+    const { directory, finalPlan, env } = deployment;
+    loadValidator(deployment);
+    writeJson(finalPlan, { resource_changes: [] });
+    const result = runStep('Apply infrastructure', directory, { ...env, ...failure });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Public ECR (login failed|manifest check failed)/);
+    assert.ok(!existsSync(join(directory, 'tmp/applied')));
+    assert.equal(git(directory, 'rev-parse', 'HEAD'), deployment.releaseSha);
+  }
 });

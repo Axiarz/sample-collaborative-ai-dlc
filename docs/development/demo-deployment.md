@@ -111,6 +111,21 @@ release, and archive paths are checked relative to its Terraform directory.
 Manual deployments of older releases therefore retain the package and protected
 resource guards even when their bundled inspector predates the package-check mode.
 
+The same immutable workflow commit supplies `with-public-ecr-auth.mjs`. After
+the package checks and before invoking the selected release's apply script, it
+authenticates to Public ECR in `us-east-1`, checks the two pinned base-image
+manifests from the deployment checkout, and provides an isolated `DOCKER_CONFIG`
+through apply. This also protects older releases whose deploy script predates
+Public ECR authentication. It leaves release sources and private ECR push
+credentials unchanged. Both deployment roles need the
+[Public ECR token permissions](../getting-started/prerequisites.md#public-ecr-permissions-for-container-builds);
+the workflow does not modify their policies.
+
+The manifest check is an early access check, not a full layer download or
+evidence that the deployed build will succeed. See
+[base-image authentication](../getting-started/setup.md#public-ecr-base-image-authentication)
+for token cleanup, direct Terraform use, limits and the private-cache option.
+
 ## Deployment concurrency
 
 The reusable workflow first resolves `TF_STATE_BUCKET`, `TF_STATE_KEY`, and
