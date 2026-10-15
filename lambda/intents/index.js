@@ -4980,19 +4980,30 @@ export const handler = async (event, context) => {
       // already superseded by the first cleanup step, with no action capable
       // of waking it. FAILED remains rewindable, so a repeated request can
       // safely finish an interrupted reset.
-      await store.updateExecution({
-        executionId: intentId,
-        projectId,
-        status: 'FAILED',
-        fromStatus: priorStatus,
-        startedAt: meta.startedAt,
-        pendingHumanTaskId: null,
-        resumeRequired: null,
-        failureReason: 'rewind_in_progress',
-        completedAt: null,
-        ifOrchestratorRunId: meta.orchestratorRunId,
-        orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
-      });
+      try {
+        await store.updateExecution({
+          executionId: intentId,
+          projectId,
+          status: 'FAILED',
+          fromStatus: priorStatus,
+          startedAt: meta.startedAt,
+          pendingHumanTaskId: null,
+          resumeRequired: null,
+          failureReason: 'rewind_in_progress',
+          completedAt: null,
+          ifOrchestratorRunId: meta.orchestratorRunId,
+          orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
+        });
+      } catch (error) {
+        if (error?.name === 'ConditionalCheckFailedException') {
+          return response(409, {
+            error:
+              'Execution changed while preparing rewind. Refresh and review the restart point again.',
+            code: 'execution_changed',
+          });
+        }
+        throw error;
+      }
       // Retire a parked run first so the woken orchestrator exits quietly (its
       // gate is superseded) instead of racing the relaunch.
       await retireParkedRun(intentId, `rewound to ${fromStageId}`);

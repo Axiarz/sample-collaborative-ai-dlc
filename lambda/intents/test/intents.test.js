@@ -6589,6 +6589,45 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
     expect(orchestratorInvokes()).toHaveLength(1);
   });
 
+  it.each(['ownership race', 'storage failure'])(
+    'stops rewind after a retirement %s',
+    async (failure) => {
+      const { sub, projectId, intent, pk } = await falseSuccess();
+      seedGate(intent.id, 'keep-pending', { status: 'pending' });
+      if (failure === 'ownership race') {
+        archiveArtifactsSpy.mockImplementationOnce(async () => {
+          procStore.get(keyOf(pk, 'META')).orchestratorRunId = 'concurrent-run';
+          return [];
+        });
+      } else {
+        ddbMock
+          .on(UpdateCommand, {
+            Key: { pk, sk: 'META' },
+            ExpressionAttributeValues: { ':ifOrid': 'finished-run' },
+          })
+          .rejects(new Error('storage unavailable'));
+      }
+      const result = await handler({
+        httpMethod: 'POST',
+        path: `/projects/${projectId}/intents/${intent.id}/rewind`,
+        pathParameters: { projectId, intentId: intent.id },
+        body: JSON.stringify({ fromStageId: 'cg' }),
+        ...claims(sub),
+      });
+      expect(result.statusCode).toBe(failure === 'ownership race' ? 409 : 500);
+      if (failure === 'ownership race')
+        expect(JSON.parse(result.body).code).toBe('execution_changed');
+      expect(procStore.get(keyOf(pk, 'HUMAN#keep-pending')).status).toBe('pending');
+      expect(procStore.get(keyOf(pk, `STAGE#${siOf('cg', 'foundation', 1)}`))).toMatchObject({
+        state: 'SUCCEEDED',
+        attempt: 0,
+      });
+      expect(procStore.get(keyOf(pk, 'UNIT#S1#foundation')).state).toBe('MERGED');
+      expect(agentcoreMock.commandCalls(StopRuntimeSessionCommand)).toHaveLength(0);
+      expect(orchestratorInvokes()).toHaveLength(0);
+    },
+  );
+
   it('ordinary rewind explicitly clears a prior omission without changing the answered gate', async () => {
     const { sub, projectId, intent, pk } = await falseSuccess();
     procStore.get(keyOf(pk, 'UNIT#S1#feature')).completionSkip = {
