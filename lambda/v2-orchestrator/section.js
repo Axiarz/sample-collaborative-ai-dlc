@@ -57,6 +57,8 @@ import {
   skeletonCeremonyDisabled,
   skeletonProblem,
   unitPlanIdentity,
+  unitCompletion,
+  completionMessage,
 } from '../shared/unit-completion.js';
 import { stageIsNoopForUnit } from '../shared/unit-kind-pruning.js';
 import { buildIntentAttribution } from './pr-attribution.js';
@@ -464,6 +466,7 @@ export const runParallelSection = async (segment, toolkit) => {
   const unitPlan = await ctx.step(`load-unit-plan-${sk}`, () =>
     store.getUnitPlan(executionId, { consistentRead: true }),
   );
+  if (completionPolicyVersion >= 2) toolkit.completionUnitPlan = unitPlan;
   if (!unitPlan || (unitPlan.units ?? []).length === 0) {
     return await fail(
       'unit_plan_missing',
@@ -532,6 +535,26 @@ export const runParallelSection = async (segment, toolkit) => {
   const persistedUnits = await ctx.step(`load-unit-states-${sk}`, () =>
     store.listUnits(executionId, { consistentRead: checkedCompletion }),
   );
+  if (completionPolicyVersion >= 2) {
+    let initial;
+    try {
+      initial = await ctx.step(`load-completion-v2-${sk}`, async () => {
+        const records = await store.getCompletionRecords(executionId);
+        if (records.meta?.orchestratorRunId !== runId) return { state: 'retired' };
+        return unitCompletion(records, [segment.index]);
+      });
+    } catch {
+      return fail(
+        'completion_unverified',
+        'Existing unit integration evidence could not be read. Work is preserved.',
+      );
+    }
+    if (initial.state === 'retired') return { ok: false, reason: 'retired', intentId };
+    // A historical aggregate label is insufficient to release dependencies.
+    // Unfinished lanes may execute; uncertain or contradictory integration may not.
+    if (initial.state === 'unknown' || initial.unresolved.some((unit) => unit.state === 'MERGED'))
+      return fail('completion_unverified', completionMessage(initial));
+  }
   const persistedBySlug = new Map(
     (persistedUnits ?? [])
       .filter((row) => Number(row.sectionIndex) === Number(segment.index))
@@ -1672,6 +1695,8 @@ export const runParallelSection = async (segment, toolkit) => {
       let depState = laneState.get(dep);
       if (lanePromises.has(dep)) {
         const settled = await lanePromises.get(dep).catch(() => ({ state: 'FAILED' }));
+        if (completionPolicyVersion >= 2 && settled?.state === 'TERMINAL')
+          return { slug, state: 'TERMINAL', value: settled.value };
         depState = settled?.state;
       }
       if (depState !== 'MERGED') {
@@ -2017,6 +2042,7 @@ export const runParallelSection = async (segment, toolkit) => {
                 intentId,
                 executionId,
                 unitSlug: slug,
+                ...(completionPolicyVersion >= 2 ? { sectionIndex: segment.index } : {}),
                 repos: cloneBase.repos,
                 unitBranch,
                 intentBranch,
@@ -2085,22 +2111,61 @@ export const runParallelSection = async (segment, toolkit) => {
           stageId: 'merge-lane',
           reason: merge?.reason ?? 'merge_failed',
           detail: merge?.detail ?? null,
+          integrationResults: merge?.results,
         });
       }
-      await laneCtx.step(`unit-merged-${sk}-${slug}${rTag}`, async () => {
-        try {
-          await store.updateUnitState({
-            executionId,
-            sectionIndex: segment.index,
-            slug,
-            state: 'MERGED',
-            fromStates: ['MERGING', 'RUNNING'],
-            fields: { mergedAt: true },
-          });
-        } catch {
-          /* tolerated */
-        }
-      });
+      const integrationRecorded = await laneCtx.step(
+        `unit-merged-${sk}-${slug}${rTag}`,
+        async () => {
+          try {
+            const saved = await store.updateUnitState({
+              executionId,
+              sectionIndex: segment.index,
+              slug,
+              state: 'MERGED',
+              fromStates: ['MERGING', 'RUNNING'],
+              ...(completionPolicyVersion >= 2
+                ? { ifOrchestratorRunId: runId, ifUnitPlan: unitPlan }
+                : {}),
+              fields: {
+                mergedAt: true,
+                ...(completionPolicyVersion >= 2
+                  ? {
+                      integrationResults: (merge.results ?? []).map(({ repo, merged, reason }) => ({
+                        repo,
+                        merged: merged ?? false,
+                        ...(reason ? { reason } : {}),
+                      })),
+                    }
+                  : {}),
+              },
+            });
+            if (completionPolicyVersion >= 2 && !saved)
+              throw new Error('Unit integration write was not accepted');
+            return true;
+          } catch (error) {
+            if (completionPolicyVersion < 2) return true; // frozen legacy behavior
+            const records = await store.getCompletionRecords(executionId);
+            if (
+              records.meta?.orchestratorRunId !== runId ||
+              unitPlanIdentity(records.unitPlan) !== unitPlanIdentity(unitPlan)
+            )
+              return false;
+            const row = records.units.find(
+              (unit) => unit.sectionIndex === segment.index && unit.slug === slug,
+            );
+            const completion = unitCompletion(records, [segment.index]);
+            if (
+              row?.state === 'MERGED' &&
+              !completion.unresolved.some((unit) => unit.slug === slug)
+            )
+              return true;
+            throw error;
+          }
+        },
+      );
+      if (integrationRecorded === false)
+        return { slug, state: 'TERMINAL', value: { ok: false, reason: 'retired', intentId } };
       await emitEvent(
         laneCtx,
         `unit-merged-event-${sk}-${slug}${rTag}`,
@@ -2126,7 +2191,12 @@ export const runParallelSection = async (segment, toolkit) => {
     }
   };
 
-  const laneFailed = async (laneCtx, slug, round, { stageId, reason, detail }) => {
+  const laneFailed = async (
+    laneCtx,
+    slug,
+    round,
+    { stageId, reason, detail, integrationResults },
+  ) => {
     const rTag = round > 0 ? `-r${round}` : '';
     await laneCtx.step(`unit-failed-${sk}-${slug}${rTag}`, async () => {
       try {
@@ -2135,7 +2205,23 @@ export const runParallelSection = async (segment, toolkit) => {
           sectionIndex: segment.index,
           slug,
           state: 'FAILED',
-          fields: { failureReason: `${stageId}: ${reason}${detail ? ` (${detail})` : ''}` },
+          ...(completionPolicyVersion >= 2
+            ? { ifOrchestratorRunId: runId, ifUnitPlan: unitPlan }
+            : {}),
+          fields: {
+            failureReason: `${stageId}: ${reason}${detail ? ` (${detail})` : ''}`,
+            ...(completionPolicyVersion >= 2 && integrationResults
+              ? {
+                  integrationResults: integrationResults.map(
+                    ({ repo, merged, reason: repoReason }) => ({
+                      repo,
+                      merged: merged ?? false,
+                      ...(repoReason ? { reason: repoReason } : {}),
+                    }),
+                  ),
+                }
+              : {}),
+          },
         });
       } catch {
         /* lane bookkeeping must never mask the failure */
@@ -2461,14 +2547,46 @@ export const runParallelSection = async (segment, toolkit) => {
     (s) =>
       (skeletonCeremonyOff || s !== skeleton) && laneState.get(s) !== 'MERGED' && !skipped.has(s),
   );
-  const validateCompletion = () => {
+  const validateCompletion = async () => {
+    if (completionPolicyVersion >= 2) {
+      let completion;
+      try {
+        completion = await ctx.step(`section-completion-v2-${sk}`, async () => {
+          const records = await store.getCompletionRecords(executionId);
+          if (records.meta?.orchestratorRunId !== runId) return { state: 'retired' };
+          if (unitPlanIdentity(records.unitPlan) !== unitPlanIdentity(unitPlan))
+            return {
+              state: 'unknown',
+              reason: 'unit_plan_changed_after_section',
+              integrated: 0,
+              total: unitPlan.units.length,
+              skipped: 0,
+              unresolved: [],
+            };
+          return unitCompletion(records, [segment.index]);
+        });
+      } catch {
+        return fail(
+          'completion_unverified',
+          `Section ${segment.index} completion evidence could not be read. Work is preserved.`,
+        );
+      }
+      if (completion.state === 'retired') return { ok: false, reason: 'retired', intentId };
+      return ['complete', 'partial'].includes(completion.state)
+        ? null
+        : fail(
+            completion.state === 'unknown' ? 'completion_unverified' : 'section_incomplete',
+            completionMessage(completion),
+          );
+    }
+    // Frozen policy-1 histories keep the original operation sequence and decision.
     const unresolved = laneOrder.filter(
       (slug) => laneState.get(slug) !== 'MERGED' && !skipped.has(slug),
     );
     return checkedCompletion && unresolved.length
       ? fail(
           'section_incomplete',
-          `Section ${segment.index} still has unresolved units: ${unresolved.join(', ')}. Review recovery before continuing.`,
+          `Section ${segment.index} still has unresolved units: ${unresolved.join(', ')}. Review the remaining work before continuing.`,
         )
       : null;
   };

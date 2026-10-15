@@ -797,35 +797,23 @@ export interface IntentDetail {
   /** Composer sessions (scope/grid proposals + authoritative validation). */
   composes?: ComposeSession[];
   unitPlan?: IntentUnitPlan | null;
-  sectionRecovery?: { eligible: boolean; reason: string | null } | null;
-  repairStatus?: 'in-progress' | 'interrupted' | null;
   unitCompletion?: {
-    state: 'complete' | 'partial' | 'incomplete';
+    state: 'complete' | 'partial' | 'incomplete' | 'unknown' | 'aborted';
+    reason?: string | null;
     total: number;
     integrated: number;
     skipped: number;
-    unresolved: { sectionIndex: number; slug: string; state: UnitState }[];
+    unresolved: {
+      sectionIndex: number;
+      slug: string;
+      state: UnitState | 'UNKNOWN' | 'MISSING';
+      reason?: string;
+    }[];
     legacyPartial: boolean;
   } | null;
   units?: IntentUnit[];
   unitPrs?: IntentUnitPr[];
   feedbackBatches?: IntentFeedbackBatch[];
-}
-
-export interface IntentRepairPreview {
-  previewToken: string;
-  kind: 'incomplete-section' | 'orphaned-lanes';
-  sectionIndex: number;
-  fromStageId: string;
-  laneSlugs: string[];
-  preservedSlugs: string[];
-  rerunSharedStages: string[];
-  skeletonProblem: string | null;
-  skeletonCandidates: string[];
-  walkingSkeleton: string | null;
-  branch: string;
-  approvals: string;
-  pullRequests: { repository: string; number: string | number; url: string }[];
 }
 
 export interface IntentRepairResult {
@@ -1212,17 +1200,8 @@ export const intentsService = {
       `/projects/${projectId}/intents/${intentId}/rewind`,
       input,
     ),
-  previewRepair: (projectId: string, intentId: string) =>
-    api.post<{ preview: IntentRepairPreview }>(
-      `/projects/${projectId}/intents/${intentId}/repair`,
-      { preview: true },
-    ),
-  repair: (
-    projectId: string,
-    intentId: string,
-    input?: { previewToken: string; walkingSkeleton?: string },
-  ) =>
-    api.post<IntentRepairResult>(`/projects/${projectId}/intents/${intentId}/repair`, input ?? {}),
+  repair: (projectId: string, intentId: string) =>
+    api.post<IntentRepairResult>(`/projects/${projectId}/intents/${intentId}/repair`, {}),
   // Re-attempt the durable callback for an already-recorded gate answer
   // (`intent.resumeRequired`). Idempotent: `resumed: false` means there was
   // nothing left to resume, which is a success, not an error.

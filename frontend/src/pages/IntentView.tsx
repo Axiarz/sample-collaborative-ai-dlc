@@ -133,10 +133,6 @@ export default function IntentView() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmRepair, setConfirmRepair] = useState(false);
-  const [repairPreview, setRepairPreview] = useState<
-    import('@/services/intents').IntentRepairPreview | null
-  >(null);
-  const [repairSkeleton, setRepairSkeleton] = useState('');
   const [repairing, setRepairing] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [resumeNotice, setResumeNotice] = useState<{
@@ -274,36 +270,14 @@ export default function IntentView() {
     }
   };
 
-  const previewRepair = async () => {
-    setRepairing(true);
-    setActionError(null);
-    setRepairPreview(null);
-    try {
-      const { preview } = await intentsService.previewRepair(projectId, intentId);
-      setRepairPreview(preview);
-      setRepairSkeleton(preview.skeletonCandidates[0] ?? '');
-      setConfirmRepair(true);
-    } catch (err) {
-      setDismissedError(null);
-      setActionError(err instanceof Error ? err.message : 'Failed to preview recovery');
-    } finally {
-      setRepairing(false);
-    }
-  };
-
   const handleRepair = async () => {
-    if (!repairPreview) return;
     setRepairing(true);
     setActionError(null);
     try {
-      await intentsService.repair(projectId, intentId, {
-        previewToken: repairPreview.previewToken,
-        ...(repairPreview.skeletonProblem ? { walkingSkeleton: repairSkeleton } : {}),
-      });
+      await intentsService.repair(projectId, intentId);
       setConfirmRepair(false);
       await reload();
     } catch (err) {
-      setConfirmRepair(false);
       setDismissedError(null);
       setActionError(err instanceof Error ? err.message : 'Failed to repair intent');
     } finally {
@@ -368,18 +342,12 @@ export default function IntentView() {
   }
 
   const intent = detail.intent;
+  const completion = detail.unitCompletion;
+  const terminalCompletion = intent.status === 'SUCCEEDED' ? completion?.state : null;
   const laneWaits = deriveLaneWaits(detail.stages, gates);
   const recoveryWaits = Object.values(laneWaits).filter((wait) => wait.kind === 'recovery');
-  const terminalIncomplete =
-    ['SUCCEEDED', 'FAILED'].includes(intent.status) &&
-    detail.unitCompletion?.state === 'incomplete' &&
-    detail.sectionRecovery?.eligible === true;
-  const terminalPartial =
-    intent.status === 'SUCCEEDED' && detail.unitCompletion?.state === 'partial';
   const needsLaneRepair =
-    Boolean(detail.repairStatus) ||
-    terminalIncomplete ||
-    (recoveryWaits.length > 0 && ['RUNNING', 'WAITING', 'FAILED'].includes(intent.status));
+    recoveryWaits.length > 0 && ['RUNNING', 'WAITING', 'FAILED'].includes(intent.status);
   const error = actionError ?? loadError;
   const visibleError = error && error !== dismissedError ? errorMessage(error) : null;
   const isDraft = intent.status === 'DRAFT';
@@ -451,11 +419,13 @@ export default function IntentView() {
           </h1>
           {TERMINAL_STATUSES.has(intent.status) && (
             <Badge variant="outline" className="text-[10px] shrink-0">
-              {terminalIncomplete
+              {terminalCompletion === 'incomplete'
                 ? 'Incomplete work'
-                : terminalPartial
-                  ? 'Partial delivery'
-                  : intent.status}
+                : terminalCompletion === 'unknown'
+                  ? 'Completion unverified'
+                  : terminalCompletion === 'partial'
+                    ? 'Partial delivery'
+                    : intent.status}
             </Badge>
           )}
           <MethodologyReleaseBadge release={intent.methodologyRelease ?? null} />
@@ -617,36 +587,45 @@ export default function IntentView() {
         </div>
       )}
 
+      {terminalCompletion && terminalCompletion !== 'complete' && (
+        <div className="rounded border border-agent-error/30 px-3 py-3 text-sm" role="status">
+          <p>
+            {terminalCompletion === 'partial'
+              ? 'Partial delivery was explicitly accepted. Integrated work and the recorded omissions are preserved.'
+              : terminalCompletion === 'unknown'
+                ? 'Completion could not be verified. Review the recorded work and available evidence before publishing.'
+                : 'The recorded success has unfinished current-plan work. Review the remaining units before publishing.'}
+          </p>
+          <p>
+            {completion?.integrated} of {completion?.total} units verified integrated;{' '}
+            {completion?.skipped} explicitly omitted.
+          </p>
+          {completion?.unresolved.slice(0, 12).map((unit) => (
+            <p key={`${unit.sectionIndex}/${unit.slug}`}>
+              Section {unit.sectionIndex}/{unit.slug}: {unit.reason ?? unit.state}
+            </p>
+          ))}
+          {terminalCompletion !== 'partial' && (
+            <p>
+              Automatic continuation of finished incomplete intents is not supported. Ordinary
+              rewind reruns the affected work.
+            </p>
+          )}
+        </div>
+      )}
+
       {needsLaneRepair && (
         <div className="rounded border border-agent-error/30 bg-agent-error/[0.06] px-3 py-3 text-sm">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <div className="flex items-center gap-1.5 font-medium text-agent-error">
                 <TriangleAlert className="h-4 w-4" />
-                {detail.repairStatus
-                  ? detail.repairStatus === 'in-progress'
-                    ? 'Recovery is in progress'
-                    : 'Recovery was interrupted'
-                  : terminalIncomplete
-                    ? 'Current plan has unfinished work'
-                    : 'Parallel execution needs recovery'}
+                Parallel execution needs recovery
               </div>
               <p className="mt-1 text-[12px] text-muted-foreground">
-                {detail.repairStatus ? (
-                  detail.repairStatus === 'in-progress' ? (
-                    'Wait for recovery to finish. If the worker stops, a fresh preview becomes available after its five-minute recovery window.'
-                  ) : (
-                    'Preview recovery again to continue the saved recovery plan. Integrated work and the reviewed section boundary are preserved.'
-                  )
-                ) : terminalIncomplete ? (
-                  `${detail.unitCompletion?.integrated} of ${detail.unitCompletion?.total} units integrated. The recorded completion did not finish the current plan. Preview recovery to preserve integrated work and continue the remaining units.`
-                ) : (
-                  <>
-                    {recoveryWaits.length} lane{recoveryWaits.length === 1 ? ' is' : 's are'} parked
-                    without an answerable question. Merged units are safe; active lanes must be
-                    replayed from the section boundary.
-                  </>
-                )}
+                {recoveryWaits.length} lane{recoveryWaits.length === 1 ? ' is' : 's are'} parked
+                without an answerable question. Merged units are safe; active lanes must be replayed
+                from the section boundary.
               </p>
             </div>
             {canRepair && (
@@ -655,25 +634,19 @@ export default function IntentView() {
                 size="sm"
                 variant="outline"
                 className="shrink-0 gap-1.5"
-                disabled={repairing || detail.repairStatus === 'in-progress'}
-                onClick={() => void previewRepair()}
+                disabled={repairing}
+                onClick={() => setConfirmRepair(true)}
               >
                 {repairing ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 ) : (
                   <Wrench className="h-3.5 w-3.5" />
                 )}
-                Preview recovery
+                Repair execution
               </Button>
             )}
           </div>
         </div>
-      )}
-      {terminalPartial && (
-        <p className="rounded border p-3 text-sm">
-          Partial delivery was explicitly accepted. Some current-plan work was omitted; integrated
-          work is on the intent branch. The final pull request has its own review and merge status.
-        </p>
       )}
 
       {/* The answer is already recorded; only its durable callback failed, so one
@@ -965,69 +938,23 @@ export default function IntentView() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Review recovery</AlertDialogTitle>
+            <AlertDialogTitle>Repair parallel execution</AlertDialogTitle>
             <AlertDialogDescription>
-              Continue unfinished work on the existing intent branch. Original events, accepted
-              answers and integrated code are preserved. Completed lane stages are reused;
-              unfinished stages resume. This starts a new execution run with the original workflow
-              and runtime settings.
+              This stops the orphaned execution, preserves merged units, archives active lane
+              artifacts, resets active lanes and their draft pull requests, then relaunches the
+              affected section.
             </AlertDialogDescription>
           </AlertDialogHeader>
-          {repairPreview && (
-            <div className="max-h-[50vh] space-y-3 overflow-y-auto text-sm">
-              <p>
-                <strong>Preserved units:</strong>{' '}
-                {repairPreview.preservedSlugs.join(', ') || 'None integrated yet'}.
-              </p>
-              <p>
-                <strong>Units to continue:</strong> {repairPreview.laneSlugs.join(', ')}.
-              </p>
-              <p>
-                <strong>Shared stages to rerun:</strong>{' '}
-                {repairPreview.rerunSharedStages.join(', ') || 'None reset by this recovery'}.
-              </p>
-              <p>{repairPreview.approvals}</p>
-              {repairPreview.skeletonProblem && (
-                <label className="block space-y-2">
-                  <span>{repairPreview.skeletonProblem}</span>
-                  <span className="block font-medium">Walking skeleton</span>
-                  <select
-                    className="w-full rounded border bg-background p-2"
-                    aria-label="Walking skeleton"
-                    value={repairSkeleton}
-                    onChange={(event) => setRepairSkeleton(event.target.value)}
-                  >
-                    {repairPreview.skeletonCandidates.map((slug) => (
-                      <option key={slug} value={slug}>
-                        {slug}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              )}
-              <p>
-                <strong>Delivery:</strong> Remaining implementation is added to{' '}
-                <code>{repairPreview.branch}</code>.
-                {repairPreview.pullRequests.length > 0
-                  ? ` This expands the existing open PR ${repairPreview.pullRequests.map((pr) => `#${pr.number}`).join(', ')}; it does not stay limited to the currently integrated units.`
-                  : ' This preview has not verified a final pull request. Final delivery follows the original PR strategy; it may create or reuse pull requests.'}
-              </p>
-            </div>
-          )}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={repairing}>Cancel</AlertDialogCancel>
             <AlertDialogAction
-              disabled={
-                repairing ||
-                !repairPreview ||
-                (Boolean(repairPreview?.skeletonProblem) && !repairSkeleton)
-              }
+              disabled={repairing}
               onClick={(event) => {
                 event.preventDefault();
                 void handleRepair();
               }}
             >
-              {repairing ? 'Starting recovery…' : 'Confirm and continue'}
+              {repairing ? 'Repairing…' : 'Repair execution'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

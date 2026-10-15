@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { __durableHandler } from '../index.js';
+import { __durableHandler } from './fixtures/completion-handler.js';
 import { promoteUnits } from '../../agentcore/commands/promote-units.js';
 import dependentSkeletonPlan from './fixtures/dependent-skeleton-plan.json';
 
@@ -1882,6 +1882,10 @@ describe('WP5 — parallel sections: lanes, skeleton, ladder, halt-and-ask', () 
 
     // Complete the missing lane instance → rewind proceeds straight to bt.
     rows[planStageInstanceId('aidlc-v2@1', 'cg', 'billing', 1)] = doneRow;
+    deps.store.listUnits = vi.fn(async () => [
+      { sectionIndex: 1, slug: 'auth', state: 'MERGED' },
+      { sectionIndex: 1, slug: 'billing', state: 'MERGED' },
+    ]);
     invokes.length = 0;
     ctx = makeCtx();
     deps.invokeRuntime = makeRuntime(ctx, sectionScript);

@@ -7,7 +7,7 @@ import {
   LocalDurableTestRunner,
   WaitingOperationStatus,
 } from '@aws/durable-execution-sdk-js-testing';
-import { __durableHandler } from '../index.js';
+import { __durableHandler } from './fixtures/completion-handler.js';
 import { initLane, mergeLane } from '../../agentcore/commands/lane.js';
 import { resolveConflict } from '../../agentcore/commands/resolve-conflict.js';
 import { runGit, commitAndPushAll, fetchOrigin } from '../../agentcore/git-engine.js';

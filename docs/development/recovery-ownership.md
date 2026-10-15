@@ -32,66 +32,32 @@ worker preserves its structured failure, while durable dispatch and callback
 reconciliation remain the recovery backstop. These guards protect process state;
 they do not undo provider requests or Git operations already in flight.
 
-## Incomplete terminal sections
+## Completion boundaries
 
-Lane repair also supports a terminal execution whose active plan contains
-unfinished work. Ordinary rewind resets all affected unit rows, including
-integrated lanes; use the reviewed **Preview recovery** flow when that code must
-be preserved.
+New histories capture completion policy 2 in the existing `load-meta` result.
+The shared unit-completion evaluator validates the pinned, resolved workflow's
+expected sections, current-plan units, repository integration evidence and scoped
+human omissions. Section fan-in and final success use the same evaluator against
+persisted process state. Missing rows, unfinished work and partial integrations
+cannot pass; missing provenance, read failures and ambiguous legacy omissions
+remain unverified. Serial workflows and sections excluded by approved workflow
+scope/composition remain valid.
 
-`POST .../intents/{intentId}/repair` with `{"preview":true}` is read-only. The
-owner/admin preview loads the pinned workflow, identifies one incomplete section,
-lists preserved and unfinished units and downstream shared stages to rerun, and
-checks recorded final PRs with the provider. A closed/merged final PR blocks this
-recovery. If success, delivery events or completed shared stages indicate final
-delivery may have run but the final PR projection is missing, recovery refuses
-with `repair_delivery_unverified`. Missing graph data is not proof of no PR;
-provider read failures remain separate errors. Confirmation sends the preview token and, when necessary, an explicitly
-selected dependency-free `walkingSkeleton`. A materially changed preview returns 409. Orphaned-lane previews ignore routine sibling progress and output timestamps;
-run, plan, candidate integration, skip decisions and orphaned gate identity still
-invalidate them. Admission re-reads META and the relevant execution records after
-provider checks, immediately before its conditional claim, and preserves sibling
-stages that completed during those checks.
-Legacy unit rows without a section mapping remain readable, but this recovery
-refuses them rather than guessing which integrated work to preserve.
+Required integration writes are not best-effort. A lost response is reconciled
+from persisted state; an unrecorded integration stops the lane before dependent
+work can proceed. Final status and its completion receipt commit together under
+run, status, META revision and unit-plan conditions. Initial publication rechecks
+completion before opening a PR. These checks never rerun models or repair rows.
+Old marker-absent and completion-policy-1 histories retain their saved operation
+sequence and terminal step. Saved historical successes are never rewritten.
 
-Retirement compares the prior status, run token and update timestamp. Stage
-resets, unit updates and replacement skeleton decisions check the recovery run
-token in the same DynamoDB transaction as the write. A concurrent confirmation
-cannot relaunch a second run. Rewind/recompose cannot steal that retirement
-token. Repair stores its reviewed plan and a five-minute `repairStartedAt` lease,
-longer than the API worker's lifetime. If the worker dies without running its
-catch, preview becomes available after expiry; confirmation claims the old run
-conditionally and resumes that saved section and skeleton choice. A handled
-failure permits an immediate fresh preview. Generic start cannot bypass an
-unfinished repair, including the CREATED handoff after launch acknowledgement.
-The guard retires when the new orchestrator claims a different run token. A late
-owner cannot clear its successor's lease or relaunch.
-Integrated unit rows and their completed stages are
-never reset by this flow. Missing/unstarted lanes may resume from the section
-boundary; completed stages of unfinished lanes are preserved.
+A terminal success with unfinished or unverified work is shown honestly in the
+intent detail. Accepted omissions remain partial delivery, not execution defects.
+This release does not add automatic preservation-and-continuation recovery for
+finished incomplete intents. Existing orphan-lane/PR-review repair and ordinary
+rewind remain supported; rewind resets affected lanes, including integrated work,
+and clears omission receipts for the work explicitly being retried. Original
+answers and events remain historical. Preserve runtime and methodology pins.
 
-New human skips persist a per-unit `completionSkip` receipt tied to the unit-plan
-identity and answered gate. Original events and answers remain immutable.
-A SUCCEEDED intent is admitted only for actual incomplete-section recovery;
-historical PR-review rows cannot reopen completed or accepted partial delivery.
-Legacy skips without receipts are shown as accepted partial delivery when the
-current run's answered halt gate records that choice; they are not silently
-reinterpreted as false success.
-
-## Deployment and durable compatibility
-
-Deploy the orchestrator, intents API, AgentCore image and frontend together.
-The first existing `load-meta` step captures `completionPolicyVersion: 1` for new
-histories. A pre-change checkpoint lacks that marker and retains its previous
-operation sequence. The frozen load-meta replay fixture covers this boundary.
-Changing a Lambda alias does not rewrite a finished version-pinned execution or
-repair its stored success.
-
-Recovery launches a new durable history through the configured orchestrator
-target. The original methodology, credential binding, repositories, model
-choices and runtime ARN/endpoint remain pinned. Before approving production
-recovery, verify that this launch target and the captured runtime endpoint serve
-the fixed release. Do not change execution pins or patch DynamoDB rows to force
-the new behavior. Starting the recovery and deploying the release are separate
-operator actions.
+Deploy the runtime, orchestrator, intents API and frontend from the same release.
+No automatic production audit, status migration or runtime repinning is performed.

@@ -133,6 +133,23 @@ const retryTransactionConflicts = (client) => ({
   },
 });
 
+const snapshotCondition = (row, fields) => {
+  if (!row) return { ConditionExpression: 'attribute_not_exists(pk)' };
+  const names = {};
+  const values = {};
+  const conditions = fields.map((field, index) => {
+    names[`#s${index}`] = field;
+    if (row[field] === undefined) return `attribute_not_exists(#s${index})`;
+    values[`:s${index}`] = row[field];
+    return `#s${index} = :s${index}`;
+  });
+  return {
+    ConditionExpression: `attribute_exists(pk) AND ${conditions.join(' AND ')}`,
+    ExpressionAttributeNames: names,
+    ...(Object.keys(values).length ? { ExpressionAttributeValues: values } : {}),
+  };
+};
+
 const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
   if (!client) throw new Error('createProcessStore requires a DynamoDB DocumentClient');
   const ddb = retryTransactionConflicts(client);
@@ -142,7 +159,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
 
   // Used by recovery's retired owner as well as active section decisions.
   // The token check and row mutation must commit together.
-  const updateForRun = async (executionId, runId, params) => {
+  const updateForRun = async (executionId, runId, params, ifUnitPlan) => {
     const { ReturnValues: _returnValues, ...update } = params;
     await transact([
       {
@@ -153,6 +170,22 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
           ExpressionAttributeValues: { ':run': runId },
         },
       },
+      ...(ifUnitPlan === undefined
+        ? []
+        : [
+            {
+              ConditionCheck: {
+                TableName: table(),
+                Key: unitPlanKey(executionId),
+                ...snapshotCondition(ifUnitPlan, [
+                  'units',
+                  'sourceArtifactId',
+                  'producedByStageInstanceId',
+                  'promotedAt',
+                ]),
+              },
+            },
+          ]),
       { Update: update },
     ]);
     const { Item } = await ddb.send(
@@ -421,6 +454,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     fromStatus = null,
     ifOrchestratorRunId = null,
     ifUpdatedAt,
+    ifUnitPlan,
     ifPendingHumanTaskId,
     ownership = null,
     additionalWrites = [],
@@ -437,8 +471,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     startedAt,
     completedAt,
     failureReason,
-    repairStartedAt,
-    repairPlan,
+    completionValidation,
     failure,
     startedBy,
     starterName,
@@ -531,17 +564,13 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       sets.push('completedAt = :ca');
       values[':ca'] = completedAt;
     }
+    if (completionValidation !== undefined) {
+      sets.push('completionValidation = :completionValidation');
+      values[':completionValidation'] = completionValidation;
+    }
     if (failureReason !== undefined) {
       sets.push('failureReason = :fr');
       values[':fr'] = failureReason;
-    }
-    if (repairStartedAt !== undefined) {
-      sets.push('repairStartedAt = :repairStartedAt');
-      values[':repairStartedAt'] = repairStartedAt;
-    }
-    if (repairPlan !== undefined) {
-      sets.push('repairPlan = :repairPlan');
-      values[':repairPlan'] = repairPlan;
     }
     if (failure !== undefined) {
       if (
@@ -786,18 +815,40 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
         ...scopeActivityWrites(table(), [row], { includePlatform: true }),
       );
     }
+    const planWrites =
+      ifUnitPlan === undefined
+        ? []
+        : [
+            {
+              ConditionCheck: {
+                TableName: table(),
+                Key: unitPlanKey(executionId),
+                ...snapshotCondition(ifUnitPlan, [
+                  'units',
+                  'batches',
+                  'sourceArtifactId',
+                  'producedByStageInstanceId',
+                  'walkingSkeleton',
+                  'skipMatrix',
+                  'autonomyMode',
+                  'promotedAt',
+                  'updatedAt',
+                ]),
+              },
+            },
+          ];
     if (ownership) {
       await writeStageAttempt({
         executionId,
         ownership,
-        writes: [...additionalWrites, ...credentialWrites, { Update: params }],
+        writes: [...additionalWrites, ...planWrites, ...credentialWrites, { Update: params }],
       });
       // Transactions cannot return ALL_NEW; read the committed row instead.
       return getExecution(executionId, { consistentRead: true });
     }
-    if (additionalWrites.length) {
+    if (additionalWrites.length || planWrites.length) {
       const { ReturnValues: _returnValues, ...update } = params;
-      await transact([...additionalWrites, ...credentialWrites, { Update: update }]);
+      await transact([...additionalWrites, ...planWrites, ...credentialWrites, { Update: update }]);
       return getExecution(executionId, { consistentRead: true });
     }
     if (credentialBinding !== undefined) {
@@ -2132,6 +2183,56 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     return items;
   };
 
+  // Completion does not need outputs, model prompts, metrics or graph state.
+  // Bound every read, including a single unusually large execution. A limit is
+  // explicitly unverified; callers must never treat the prefix as a clean run.
+  const getCompletionRecords = async (
+    executionId,
+    { maxRecords = 2000, includeStages = false } = {},
+  ) => {
+    if (!Number.isInteger(maxRecords) || maxRecords < 2 || maxRecords > 10000) {
+      throw new Error('Completion record limit must be 2..10000');
+    }
+    const meta = await getExecution(executionId, { consistentRead: true });
+    const unitPlan = await getUnitPlan(executionId, { consistentRead: true });
+    const records = {
+      meta,
+      unitPlan,
+      units: [],
+      unitPrs: [],
+      humanTasks: [],
+      stages: [],
+      truncated: false,
+    };
+    let remaining = maxRecords - 2;
+    for (const [field, prefix] of [
+      ['units', 'UNIT#'],
+      ['unitPrs', 'UNITPR#'],
+      ['humanTasks', 'HUMAN#'],
+      ...(includeStages ? [['stages', 'STAGE#']] : []),
+    ]) {
+      let cursor;
+      do {
+        const page = await ddb.send(
+          new QueryCommand({
+            TableName: table(),
+            KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+            ExpressionAttributeValues: { ':pk': executionPk(executionId), ':prefix': prefix },
+            ConsistentRead: true,
+            Limit: Math.min(remaining + 1, 100),
+            ExclusiveStartKey: cursor,
+          }),
+        );
+        const items = page.Items ?? [];
+        records[field].push(...items.slice(0, remaining));
+        if (items.length > remaining) return { ...records, truncated: true };
+        remaining -= items.length;
+        cursor = page.LastEvaluatedKey;
+      } while (cursor);
+    }
+    return records;
+  };
+
   const listActiveExecutions = async ({ limit = Infinity } = {}) => {
     const items = [];
     let ExclusiveStartKey;
@@ -2380,6 +2481,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     fromStates = null,
     fields = {},
     ifOrchestratorRunId = null,
+    ifUnitPlan,
   }) => {
     if (!UNIT_STATES.includes(state)) throw new Error(`invalid unit state: ${state}`);
     const ts = now();
@@ -2429,7 +2531,8 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       });
     }
     try {
-      if (ifOrchestratorRunId) return await updateForRun(executionId, ifOrchestratorRunId, params);
+      if (ifOrchestratorRunId)
+        return await updateForRun(executionId, ifOrchestratorRunId, params, ifUnitPlan);
       const { Attributes } = await ddb.send(new UpdateCommand(params));
       return Attributes;
     } catch (e) {
@@ -3362,6 +3465,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     appendOutput,
     getOutputs,
     listProjectExecutions,
+    getCompletionRecords,
     listActiveExecutions,
     listStaleActiveExecutions,
     patchExecutionConfig,
