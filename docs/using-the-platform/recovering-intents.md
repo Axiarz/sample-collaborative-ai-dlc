@@ -78,6 +78,10 @@ state.
 
 ## Continue an incomplete parallel section
 
+Section recovery is available only when every upstream stage is complete or
+explicitly skipped. If an earlier stage failed, retry that stage first; section
+recovery does not bypass its work.
+
 1. Open the intent and choose **Preview recovery** (owner/admin). This step does
    not start work. The preview lists units preserved, units to continue and shared
    stages that will rerun.

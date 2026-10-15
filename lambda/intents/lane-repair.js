@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { stageInstanceId } from '../shared/v2-execution-plan.js';
 import {
   activePlanUnits,
   effectiveSkeleton,
@@ -19,6 +20,31 @@ export const activeRepair = (meta, now = Date.now()) =>
   pendingRepair(meta) &&
   (meta.failureReason === 'lane_repair_in_progress' || meta.status === 'CREATED') &&
   Date.parse(meta.repairStartedAt ?? meta.updatedAt) + REPAIR_LEASE_MS > now;
+
+// Match the orchestrator's rewind-upstream-check, including every instance of
+// earlier parallel stages. Missing rows are not completed work.
+export const upstreamRecoveryProblem = (meta, records, plan, fromStageId) => {
+  const index = plan.stages.findIndex((stage) => stage.stageId === fromStageId);
+  if (index < 0) return fromStageId;
+  const namespace = plan.namespace ?? `${meta.workflowId}@${meta.workflowVersion}`;
+  const rows = new Map((records.stages ?? []).map((row) => [row.stageInstanceId, row]));
+  for (const stage of plan.stages.slice(0, index)) {
+    const slugs =
+      stage.parallelSection != null
+        ? (records.unitPlan?.units ?? []).map((unit) => unit.slug)
+        : [null];
+    if (!slugs.length) return stage.stageId;
+    for (const slug of slugs) {
+      const id =
+        slug === null
+          ? (stage.stageInstanceId ?? stageInstanceId(namespace, stage.stageId))
+          : stageInstanceId(namespace, stage.stageId, slug, stage.parallelSection);
+      if (!['SUCCEEDED', 'SKIPPED'].includes(rows.get(id)?.state))
+        return `${stage.stageId}${slug ? ` [unit ${slug}]` : ''}`;
+    }
+  }
+  return null;
+};
 
 // Narrow extension of lane repair: terminal executions with unfinished active
 // plan work. Rewind deliberately resets integrated lanes and is not equivalent.
@@ -55,6 +81,12 @@ export const incompleteSectionRepair = (meta, records, plan) => {
     (stage) => Number(stage.parallelSection) === sectionIndex,
   );
   const fromStageId = sectionStages[0].stageId;
+  const upstream = upstreamRecoveryProblem(meta, records, plan, fromStageId);
+  if (upstream)
+    return {
+      error: `Complete or retry upstream stage ${upstream} before recovering this section.`,
+      code: 'rewind_upstream_incomplete',
+    };
   const rerunSharedStages = plan.stages
     .slice(plan.stages.indexOf(sectionStages[0]))
     .filter((stage) => stage.parallelSection == null)

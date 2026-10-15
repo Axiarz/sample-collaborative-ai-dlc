@@ -372,7 +372,8 @@ export default function IntentView() {
   const recoveryWaits = Object.values(laneWaits).filter((wait) => wait.kind === 'recovery');
   const terminalIncomplete =
     ['SUCCEEDED', 'FAILED'].includes(intent.status) &&
-    detail.unitCompletion?.state === 'incomplete';
+    detail.unitCompletion?.state === 'incomplete' &&
+    detail.sectionRecovery?.eligible === true;
   const terminalPartial =
     intent.status === 'SUCCEEDED' && detail.unitCompletion?.state === 'partial';
   const needsLaneRepair =

@@ -6626,6 +6626,36 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
     expect(lambdaMock.commandCalls(StopDurableExecutionCommand)).toHaveLength(0);
   });
 
+  it.each(['missing', 'FAILED', 'PENDING', 'RUNNING', 'SUCCEEDED', 'SKIPPED'])(
+    'requires completed upstream stages before recovery (%s)',
+    async (state) => {
+      const { sub, projectId, intent, pk } = await falseSuccess();
+      procStore.get(keyOf(pk, 'META')).status = 'FAILED';
+      const upstreamKey = keyOf(pk, `STAGE#${siOf('units-gen')}`);
+      if (state === 'missing') procStore.delete(upstreamKey);
+      else procStore.get(upstreamKey).state = state;
+      const eligible = ['SUCCEEDED', 'SKIPPED'].includes(state);
+      const detail = await handler({
+        httpMethod: 'GET',
+        path: `/projects/${projectId}/intents/${intent.id}`,
+        pathParameters: { projectId, intentId: intent.id },
+        ...claims(sub),
+      });
+      expect(detail.statusCode).toBe(200);
+      expect(JSON.parse(detail.body).sectionRecovery.eligible).toBe(eligible);
+      expect(JSON.parse(detail.body).intent.status).toBe('FAILED');
+      const preview = await repair(sub, projectId, intent.id, { preview: true });
+      expect(preview.statusCode).toBe(eligible ? 200 : 409);
+      if (!eligible) {
+        expect(JSON.parse(preview.body).code).toBe('rewind_upstream_incomplete');
+        expect((await repair(sub, projectId, intent.id)).statusCode).toBe(409);
+        expect(archiveArtifactsSpy).not.toHaveBeenCalled();
+        expect(orchestratorInvokes()).toHaveLength(0);
+        expect(procStore.get(keyOf(pk, 'UNIT#S1#foundation')).state).toBe('MERGED');
+      }
+    },
+  );
+
   it('rejects stale previews and dependent selections before changing terminal work', async () => {
     const { sub, projectId, intent, pk } = await falseSuccess();
     const { preview } = JSON.parse(
@@ -7203,6 +7233,7 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
       status: 'RUNNING',
       durableExecutionArn: 'arn:aws:lambda:eu-central-1:123:durable-execution:old',
     });
+    seedStageRow(intent.id, 'units-gen');
     seedStageRow(intent.id, 'cg', 'asset-containment', 'WAITING_FOR_HUMAN', 1);
     procStore.set(keyOf(`EXEC#${intent.id}`, 'UNIT#S1#asset-containment'), {
       pk: `EXEC#${intent.id}`,

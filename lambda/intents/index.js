@@ -42,6 +42,7 @@ import {
   repairPreviewToken,
   activeRepair,
   pendingRepair,
+  upstreamRecoveryProblem,
 } from './lane-repair.js';
 import { SessionReleaseHandoffError, stopSessions } from '../shared/runtime-session.js';
 import {
@@ -4211,7 +4212,8 @@ export const handler = async (event, context) => {
       }
       const incompleteRepair =
         savedRepair?.preview ?? incompleteSectionRepair(meta, records, planResult.plan);
-      if (incompleteRepair?.error) return response(409, { error: incompleteRepair.error });
+      if (incompleteRepair?.error)
+        return response(409, { error: incompleteRepair.error, code: incompleteRepair.code });
       const pendingByStage = new Map(
         (records.humanTasks ?? [])
           .filter((gate) => gate.status === 'pending' && gate.stageInstanceId)
@@ -4298,6 +4300,17 @@ export const handler = async (event, context) => {
       if (sectionStages.length === 0) {
         return response(409, { error: `Parallel section ${sectionIndex} is not in the plan` });
       }
+      const upstream = upstreamRecoveryProblem(
+        meta,
+        records,
+        planResult.plan,
+        sectionStages[0].stageId,
+      );
+      if (upstream)
+        return response(409, {
+          error: `Complete or retry upstream stage ${upstream} before recovering this section.`,
+          code: 'rewind_upstream_incomplete',
+        });
       const planNamespace =
         planResult.plan.namespace ?? `${meta.workflowId}@${meta.workflowVersion}`;
       const sectionInstances = sectionStages.flatMap((stage) =>
@@ -5506,6 +5519,27 @@ export const handler = async (event, context) => {
       if (!records.meta || records.meta.projectId !== projectId) {
         return response(404, { error: 'Intent not found' });
       }
+      const completion = unitCompletion(records);
+      let sectionRecovery = null;
+      if (
+        ['SUCCEEDED', 'FAILED'].includes(records.meta.status) &&
+        completion?.state === 'incomplete'
+      ) {
+        const resolved = await intentMethodology.loadPlan(records.meta).catch((error) => {
+          logger.error('Recovery eligibility plan read failed', error);
+          return { valid: false };
+        });
+        const candidate =
+          resolved.valid && resolved.plan
+            ? incompleteSectionRepair(records.meta, records, resolved.plan)
+            : null;
+        sectionRecovery = {
+          eligible: Boolean(candidate && !candidate.error),
+          reason:
+            candidate?.error ??
+            (!candidate ? 'The pinned plan cannot establish a recoverable section.' : null),
+        };
+      }
       const artifacts = await fetchArtifacts(g, intentId);
       const pullRequests = await fetchPullRequests(g, intentId);
       const stagesByInstance = new Map(
@@ -5583,7 +5617,8 @@ export const handler = async (event, context) => {
         // + the live UNIT lane rows, so the UI can render the lane board and
         // attribute per-unit stage instances. Both null/empty pre-promotion.
         unitPlan: mapUnitPlan(records.unitPlan),
-        unitCompletion: unitCompletion(records),
+        unitCompletion: completion,
+        sectionRecovery,
         units: (records.units ?? []).map(mapUnit),
         unitPrs: (records.unitPrs ?? []).map(mapUnitPr),
         feedbackBatches: (records.feedbackBatches ?? []).map(mapFeedbackBatch),

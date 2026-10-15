@@ -1030,6 +1030,7 @@ describe('IntentView', () => {
   it('explains incomplete terminal work, previews preserved code and confirms expansion of the existing PR', async () => {
     get.mockResolvedValue({
       ...baseDetail({ status: 'SUCCEEDED' }),
+      sectionRecovery: { eligible: true, reason: null },
       unitCompletion: {
         state: 'incomplete',
         total: 11,
@@ -1076,6 +1077,38 @@ describe('IntentView', () => {
     });
   });
 
+  it('keeps an upstream failure honest and offers its existing stage retry', async () => {
+    compiled.mockResolvedValue({
+      graph: { nodes: [{ stageId: 'analyze', phasePath: '01', order: 0 }], edges: [] },
+    });
+    rewind.mockResolvedValue({});
+    get.mockResolvedValue({
+      ...baseDetail({ status: 'FAILED' }),
+      sectionRecovery: {
+        eligible: false,
+        reason: 'Complete or retry upstream stage analyze before recovering this section.',
+      },
+      unitCompletion: {
+        state: 'incomplete',
+        total: 2,
+        integrated: 0,
+        skipped: 0,
+        unresolved: [],
+        legacyPartial: false,
+      },
+      stages: [
+        { stageInstanceId: 'analyze-instance', stageId: 'analyze', state: 'FAILED', attempt: 1 },
+      ],
+    });
+    renderAt();
+    expect(await screen.findByText('FAILED')).toBeInTheDocument();
+    expect(screen.queryByText('Incomplete work')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Preview recovery' })).not.toBeInTheDocument();
+    await userEvent.click(await screen.findByRole('button', { name: 'Retry Analyze' }));
+    expect(rewind).toHaveBeenCalledWith('p1', 'i1', { fromStageId: 'analyze' });
+    expect(previewRepair).not.toHaveBeenCalled();
+  });
+
   it('identifies explicitly accepted partial delivery without offering to undo it', async () => {
     get.mockResolvedValue({
       ...baseDetail({ status: 'SUCCEEDED' }),
@@ -1097,6 +1130,7 @@ describe('IntentView', () => {
   it('returns to a visible explanation and a fresh preview after a stale confirmation', async () => {
     get.mockResolvedValue({
       ...baseDetail({ status: 'SUCCEEDED' }),
+      sectionRecovery: { eligible: true, reason: null },
       unitCompletion: {
         state: 'incomplete',
         total: 2,
