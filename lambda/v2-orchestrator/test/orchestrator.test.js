@@ -2539,26 +2539,55 @@ describe('WP5 — engine-gate decisions', () => {
     ).toContain('11/11');
   });
 
-  it('does not let blocked-only lanes reach shared work without an explicit outcome', async () => {
-    unitPlanRow = {
-      units: [{ slug: 'blocked', dependsOn: ['missing-prerequisite'] }],
-      batches: [['blocked']],
-      walkingSkeleton: 'blocked',
-      autonomyMode: 'autonomous',
-    };
-    const plan = SECTION_PLAN();
-    plan.plan.stages
-      .filter((stage) => stage.parallelSection === 1)
-      .forEach((stage) => {
-        stage.policy = { skeleton: 'off' };
+  it.each([false, true])(
+    'counts disjoint halt outcomes and prevents unresolved completion (failed prerequisite: %s)',
+    async (failedPrerequisite) => {
+      unitPlanRow = {
+        units: [
+          ...(failedPrerequisite ? [{ slug: 'prerequisite', dependsOn: [] }] : []),
+          {
+            slug: 'blocked',
+            dependsOn: [failedPrerequisite ? 'prerequisite' : 'missing-prerequisite'],
+          },
+        ],
+        batches: [failedPrerequisite ? ['prerequisite', 'blocked'] : ['blocked']],
+        walkingSkeleton: 'blocked',
+        autonomyMode: 'autonomous',
+      };
+      const plan = SECTION_PLAN();
+      plan.plan.stages
+        .filter((stage) => stage.parallelSection === 1)
+        .forEach((stage) => {
+          stage.policy = { skeleton: 'off' };
+        });
+      deps.loadPlan.mockResolvedValue(plan);
+      const answered = gateReads({ 'eg-halt': { answer: { decision: 'abort' } } });
+      deps.store.getHumanTask = vi.fn(async (executionId, id) => {
+        if (
+          id.startsWith('eg-halt') &&
+          !deps.store.createHumanTask.mock.calls.some(([gate]) => gate.humanTaskId === id)
+        )
+          return null;
+        return answered(executionId, id);
       });
-    deps.loadPlan.mockResolvedValue(plan);
-    deps.store.getHumanTask = gateReads({ 'eg-halt': { answer: { decision: 'abort' } } });
-    const result = await start();
-    expect(result).toMatchObject({ ok: false, reason: 'section_aborted' });
-    expect(stageStarts().some((payload) => payload.stageId === 'bt')).toBe(false);
-    expect(deps.openPr).not.toHaveBeenCalled();
-  });
+      if (failedPrerequisite)
+        deps.invokeRuntime = makeRuntime(ctx, (payload) =>
+          payload.stageId === 'cg' && payload.unitSlug === 'prerequisite'
+            ? { ok: false, state: 'FAILED', reason: 'sensor_blocked' }
+            : sectionScript(payload),
+        );
+      const result = await start();
+      expect(result).toMatchObject({ ok: false, reason: 'section_aborted' });
+      expect(stageStarts().some((payload) => payload.stageId === 'bt')).toBe(false);
+      expect(deps.openPr).not.toHaveBeenCalled();
+      const halt = deps.store.createHumanTask.mock.calls
+        .map(([gate]) => gate)
+        .find((gate) => gate.humanTaskId.startsWith('eg-halt'));
+      expect(halt.prompt).toContain(
+        `${failedPrerequisite ? 1 : 0} failed, 1 blocked, 0 integrated`,
+      );
+    },
+  );
 
   it('halt-and-ask RETRY re-runs the failed lane under fresh round identities and completes the run', async () => {
     let cgBillingAttempts = 0;

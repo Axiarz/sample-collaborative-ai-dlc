@@ -2180,9 +2180,6 @@ export const runParallelSection = async (segment, toolkit) => {
     return { terminal };
   };
 
-  const blocked = () =>
-    [...laneState.entries()].filter(([, s]) => s === 'BLOCKED').map(([slug]) => slug);
-
   // Halt-and-ask (stage-protocol.md): wait for all lanes (done by the caller),
   // preserve successes (pushed work + MERGED lanes), ask retry / skip / abort.
   // An unparseable answer RE-ASKS (fresh gate, one human answer per attempt)
@@ -2191,6 +2188,12 @@ export const runParallelSection = async (segment, toolkit) => {
   // deterministic fallback is abort (audited), never an unbounded hot loop.
   // Returns 'retry' | 'skip' | a terminal value (abort/retired).
   const haltAndAsk = async (round, failedSlugs, idSuffix = '') => {
+    const unresolvedStates = [...laneState.entries()]
+      .filter(([slug, state]) => state !== 'MERGED' && !skipped.has(slug))
+      .map(([, state]) => state);
+    const failedCount = unresolvedStates.filter((state) => state === 'FAILED').length;
+    const blockedCount = unresolvedStates.filter((state) => state === 'BLOCKED').length;
+    const otherCount = unresolvedStates.length - failedCount - blockedCount;
     const detailLines = failedSlugs.map((slug) => {
       const row = laneState.get(slug);
       return `- ${slug}: ${row === 'FAILED' ? 'failed' : row}`;
@@ -2200,9 +2203,9 @@ export const runParallelSection = async (segment, toolkit) => {
         name: `halt-${sk}${idSuffix}-r${round}${attempt ? `-a${attempt}` : ''}`,
         sectionIndex: segment.index,
         prompt: [
-          `Unresolved work in section ${segment.index} (${failedSlugs.length} unit(s) need a decision, ${blocked().length} blocked, ${
+          `Unresolved work in section ${segment.index} (${failedCount} failed, ${blockedCount} blocked${otherCount ? `, ${otherCount} other unresolved` : ''}, ${
             [...laneState.values()].filter((s) => s === 'MERGED').length
-          } merged).`,
+          } integrated).`,
           ...detailLines,
           '',
           'All pushed work is preserved on the unit branches. Choose:',
