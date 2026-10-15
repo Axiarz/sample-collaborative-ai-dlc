@@ -6931,6 +6931,61 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
     expect(procStore.get(keyOf(pk, 'UNIT#S1#foundation')).state).toBe('MERGED');
   });
 
+  it.each(['success', 'opened event', 'completed stage', 'skipped stage', 'tracker receipt'])(
+    'refuses missing final-PR projection after %s',
+    async (evidence) => {
+      const { sub, projectId, intent, pk } = await falseSuccess();
+      await g.V().has('PullRequest', 'id', `pr-${intent.id}`).drop().next();
+      const meta = procStore.get(keyOf(pk, 'META'));
+      meta.status = evidence === 'success' ? 'SUCCEEDED' : 'FAILED';
+      procStore.get(keyOf(pk, `STAGE#${siOf('bt')}`)).state =
+        evidence === 'completed stage'
+          ? 'SUCCEEDED'
+          : evidence === 'skipped stage'
+            ? 'SKIPPED'
+            : 'PENDING';
+      if (evidence === 'opened event')
+        procStore.set(keyOf(pk, 'EVENT#delivery'), {
+          pk,
+          sk: 'EVENT#delivery',
+          eventType: 'v2.pr.opened',
+        });
+      if (evidence === 'tracker receipt')
+        procStore.set(keyOf(pk, 'TRACKERSYNC'), {
+          pk,
+          sk: 'TRACKERSYNC',
+          pullRequests: [{ repoId: 'owner/repo', prNumber: 533 }],
+        });
+      const before = structuredClone([...procStore.entries()]);
+      for (const input of [{ preview: true }, {}]) {
+        const result = await repair(sub, projectId, intent.id, input);
+        expect(result.statusCode).toBe(409);
+        expect(JSON.parse(result.body).code).toBe('repair_delivery_unverified');
+      }
+      expect([...procStore.entries()]).toEqual(before);
+      expect(archiveArtifactsSpy).not.toHaveBeenCalled();
+      expect(orchestratorInvokes()).toHaveLength(0);
+    },
+  );
+
+  it('distinguishes pre-delivery recovery from a provider verification failure', async () => {
+    const { sub, projectId, intent, pk } = await falseSuccess();
+    sourceControlOperationHandler = () => {
+      throw new Error('provider unavailable');
+    };
+    const unavailable = await repair(sub, projectId, intent.id, { preview: true });
+    expect(unavailable.statusCode).toBe(502);
+    expect(JSON.parse(unavailable.body).code).toBe('provider_reconciliation_failed');
+    await g.V().has('PullRequest', 'id', `pr-${intent.id}`).drop().next();
+    procStore.get(keyOf(pk, 'META')).status = 'FAILED';
+    procStore.get(keyOf(pk, `STAGE#${siOf('bt')}`)).state = 'PENDING';
+    const beforeDelivery = await repair(sub, projectId, intent.id, { preview: true });
+    expect(beforeDelivery.statusCode).toBe(200);
+    expect(JSON.parse(beforeDelivery.body).preview.pullRequests).toEqual([]);
+    expect(archiveArtifactsSpy).not.toHaveBeenCalled();
+    expect(orchestratorInvokes()).toHaveLength(0);
+  });
+
   it('refuses a closed or merged final PR and enforces owner access for preview and recovery', async () => {
     const { sub, projectId, intent } = await falseSuccess();
     sourceControlOperationHandler = () => ({ state: 'merged', sourceBranch: 'aidlc/feature' });

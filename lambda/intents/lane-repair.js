@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { stageInstanceId } from '../shared/v2-execution-plan.js';
+import { eventTypeOf } from '../shared/v2-process-keys.js';
 import {
   activePlanUnits,
   effectiveSkeleton,
@@ -44,6 +45,34 @@ export const upstreamRecoveryProblem = (meta, records, plan, fromStageId) => {
     }
   }
   return null;
+};
+
+// A missing best-effort graph projection does not prove that no final PR was
+// created. Success precedes the engine's final PR step; completed shared work
+// and durable delivery events also require verification after an interruption.
+export const finalDeliveryMayHaveRun = (meta, records, plan) => {
+  const eventTypes = (records.events ?? []).map(eventTypeOf);
+  if (
+    records.trackerSync?.pullRequests?.length ||
+    eventTypes.some((type) => ['v2.pr.opened', 'v2.pr.recorded'].includes(type))
+  )
+    return true;
+  if (Array.isArray(meta.repos) && meta.repos.length === 0) return false;
+  if (
+    meta.status === 'SUCCEEDED' ||
+    eventTypes.some((type) => type === 'v2.execution.succeeded' || type?.startsWith('v2.pr.'))
+  )
+    return true;
+  const last = plan.stages.at(-1);
+  return (
+    last?.parallelSection == null &&
+    (records.stages ?? []).some(
+      (stage) =>
+        stage.stageId === last?.stageId &&
+        !stage.unitSlug &&
+        ['SUCCEEDED', 'SKIPPED'].includes(stage.state),
+    )
+  );
 };
 
 // Narrow extension of lane repair: terminal executions with unfinished active

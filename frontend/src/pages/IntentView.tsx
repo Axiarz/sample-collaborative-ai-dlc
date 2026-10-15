@@ -1010,7 +1010,7 @@ export default function IntentView() {
                 <code>{repairPreview.branch}</code>.
                 {repairPreview.pullRequests.length > 0
                   ? ` This expands the existing open PR ${repairPreview.pullRequests.map((pr) => `#${pr.number}`).join(', ')}; it does not stay limited to the currently integrated units.`
-                  : ' Existing unit pull requests are reused. Final delivery follows the original PR strategy.'}
+                  : ' This preview has not verified a final pull request. Final delivery follows the original PR strategy; it may create or reuse pull requests.'}
               </p>
             </div>
           )}

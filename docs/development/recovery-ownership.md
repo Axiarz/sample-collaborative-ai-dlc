@@ -43,7 +43,10 @@ be preserved.
 owner/admin preview loads the pinned workflow, identifies one incomplete section,
 lists preserved and unfinished units and downstream shared stages to rerun, and
 checks recorded final PRs with the provider. A closed/merged final PR blocks this
-recovery. Confirmation sends the preview token and, when necessary, an explicitly
+recovery. If success, delivery events or completed shared stages indicate final
+delivery may have run but the final PR projection is missing, recovery refuses
+with `repair_delivery_unverified`. Missing graph data is not proof of no PR;
+provider read failures remain separate errors. Confirmation sends the preview token and, when necessary, an explicitly
 selected dependency-free `walkingSkeleton`. A materially changed preview returns 409. Orphaned-lane previews ignore routine sibling progress and output timestamps;
 run, plan, candidate integration, skip decisions and orphaned gate identity still
 invalidate them. Admission re-reads META immediately before its conditional claim.

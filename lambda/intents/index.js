@@ -43,6 +43,7 @@ import {
   activeRepair,
   pendingRepair,
   upstreamRecoveryProblem,
+  finalDeliveryMayHaveRun,
 } from './lane-repair.js';
 import { SessionReleaseHandoffError, stopSessions } from '../shared/runtime-session.js';
 import {
@@ -4361,7 +4362,18 @@ export const handler = async (event, context) => {
       const finalPrs = [];
       try {
         if (incompleteRepair) {
-          for (const pr of await fetchPullRequests(g, intentId)) {
+          const recordedFinalPrs = await fetchPullRequests(g, intentId);
+          if (
+            recordedFinalPrs.length === 0 &&
+            finalDeliveryMayHaveRun(meta, records, planResult.plan)
+          ) {
+            return response(409, {
+              error:
+                'Final delivery may already have run, but its pull request record is unavailable. Verify the intent branch’s pull requests before recovering.',
+              code: 'repair_delivery_unverified',
+            });
+          }
+          for (const pr of recordedFinalPrs) {
             if (!pr.repository || pr.prNumber == null || pr.branch !== meta.branch) {
               throw new Error('The recorded final pull request cannot be verified');
             }

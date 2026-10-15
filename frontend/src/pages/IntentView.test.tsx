@@ -1003,6 +1003,10 @@ describe('IntentView', () => {
     expect(screen.getByText('Needs recovery')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Preview recovery' }));
     expect(await screen.findByText('Review recovery')).toBeInTheDocument();
+    expect(
+      screen.getByText(/This preview has not verified a final pull request/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Existing unit pull requests are reused/)).not.toBeInTheDocument();
     expect(repair).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('button', { name: 'Confirm and continue' }));
     expect(repair).toHaveBeenCalledWith('p1', 'i1', { previewToken: 'preview-token' });
