@@ -2218,6 +2218,16 @@ describe('runStage — fresh run persists the CLI session + parks on a pending g
       'credential_quota_exhausted',
     ],
     [
+      'kiro',
+      { type: 'runError', data: { stage: 'prompt', message: '403: insufficient credits' } },
+      'credential_quota_exhausted',
+    ],
+    [
+      'kiro',
+      { type: 'runError', data: { stage: 'prompt', message: 'ThrottlingException: retry later' } },
+      'cli_nonzero_exit',
+    ],
+    [
       'claude',
       { type: 'result', subtype: 'success', is_error: true, result: 'Invalid API key' },
       'credential_invalid',
@@ -3368,16 +3378,29 @@ describe('runStage — Kiro store sync (restore before spawn, persist after)', (
   const parkedKiroStore = () =>
     spyStore({
       // No createdAt → age unknown → treated as recent → recoverable.
-      humanTask: { humanTaskId: 'q-1', status: 'answered', answer: { freeText: 'go' } },
+      humanTask: {
+        humanTaskId: 'q-1',
+        status: 'answered',
+        answer: { freeText: 'Keep the approved storage contract' },
+      },
       stage: { cli: 'kiro', cliSessionId: 'kiro-7' },
     });
   // Answers --list-sessions with `sessions`; every other spawn is the CLI run.
-  const resumeSpawn = (sessions, calls) => (command, args) => {
-    calls.push(args);
-    return args.includes('--list-sessions')
-      ? kiroChild({ stdout: kiroListing(sessions) })
-      : kiroChild({ stdout: kiroStream('kiro-new') });
-  };
+  const resumeSpawn =
+    (sessions, calls, prompts = []) =>
+    (command, args) => {
+      calls.push(args);
+      return args.includes('--list-sessions')
+        ? kiroChild({ stdout: kiroListing(sessions) })
+        : {
+            ...kiroChild({
+              stdout: kiroStream(
+                args.includes('--resume-id') ? args[args.indexOf('--resume-id') + 1] : 'kiro-new',
+              ),
+            }),
+            stdin: { end: (text) => text && prompts.push(String(text)) },
+          };
+    };
   const recovered = (deps) =>
     deps.store.calls.some((c) => c[0] === 'appendEvent' && c[1].type === 'v2.stage.recovered');
 
@@ -3393,6 +3416,7 @@ describe('runStage — Kiro store sync (restore before spawn, persist after)', (
     const res = await runStage({ ...baseArgs, requestedCli: 'kiro', resumeFrom: 'q-1' }, deps);
     expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED', cli: 'kiro' });
     expect(recovered(deps)).toBe(false);
+    expect(sessionIds(deps)).toEqual(['kiro-7']);
     const run = calls.find((args) => !args.includes('--list-sessions'));
     expect(run.slice(run.indexOf('--resume-id'), run.indexOf('--resume-id') + 2)).toEqual([
       '--resume-id',
@@ -3406,10 +3430,11 @@ describe('runStage — Kiro store sync (restore before spawn, persist after)', (
   ])('recovers %s by re-running fresh with the answer', async (_label, sessions) => {
     // The pinned v2 engine cannot load it, so a --resume-id would exit non-zero.
     const calls = [];
+    const prompts = [];
     const deps = baseDeps({
       availableClis: ['kiro'],
       env: kiroStoreEnv,
-      spawnFn: resumeSpawn(sessions, calls),
+      spawnFn: resumeSpawn(sessions, calls, prompts),
       restoreKiroStore: async () => true,
       store: parkedKiroStore(),
     });
@@ -3418,6 +3443,10 @@ describe('runStage — Kiro store sync (restore before spawn, persist after)', (
     expect(recovered(deps)).toBe(true);
     const run = calls.find((args) => !args.includes('--list-sessions'));
     expect(run).not.toContain('--resume-id');
+    expect(prompts.join('\n')).toContain('Keep the approved storage contract');
+    expect(
+      deps.store.calls.filter((c) => c[0] === 'appendEvent' && c[1].type === 'v2.stage.recovered'),
+    ).toHaveLength(1);
     // The fresh conversation's streamed id replaces the unusable one.
     expect(sessionIds(deps)).toContain('kiro-new');
   });
@@ -3426,26 +3455,13 @@ describe('runStage — Kiro store sync (restore before spawn, persist after)', (
     (capture = true, prompts = []) =>
     (_command, args) => {
       if (args.includes('--list-sessions')) {
-        return {
-          ...okSpawn(),
-          stdout: {
-            on: (event, cb) =>
-              event === 'data' &&
-              cb(
-                Buffer.from(
-                  JSON.stringify(
-                    capture
-                      ? [{ cwd: '/ws', sessions: [{ sessionId: 'kiro-new', updatedAt: 'T' }] }]
-                      : [],
-                  ),
-                ),
-              ),
-          },
-        };
+        return kiroChild({
+          stdout: kiroListing(capture ? [{ sessionId: 'kiro-new', source: 'v2' }] : []),
+        });
       }
       prompts.push(args.join(' '));
       return {
-        ...okSpawn(),
+        ...kiroChild({ stdout: capture ? kiroStream('kiro-new') : '' }),
         stdin: {
           end: (text) => {
             if (text) prompts.push(String(text));
@@ -4976,16 +4992,18 @@ describe('runStage — unit lanes (docs/v2-parallel.md WP4)', () => {
     const exhausted = unitDeps({
       store,
       availableClis: ['kiro'],
-      spawnFn: (_command, argv) => ({
-        on: (event, cb) => event === 'close' && setImmediate(() => cb(1)),
-        stdin: { end() {} },
-        stderr: {
-          on: (event, cb) =>
-            event === 'data' &&
-            !argv.includes('--list-sessions') &&
-            cb(Buffer.from('403: insufficient credits')),
-        },
-      }),
+      spawnFn: (_command, argv) =>
+        argv.includes('--list-sessions')
+          ? kiroChild({
+              stdout: kiroListing([{ sessionId: 'session-billing', source: 'v2' }]),
+            })
+          : kiroChild({
+              exitCode: 1,
+              stdout: kiroStream('session-billing', [
+                'runError',
+                { stage: 'prompt', message: '403: insufficient credits' },
+              ]),
+            }),
     });
     const failed = await runStage(args, exhausted);
     expect(failed).toMatchObject({ ok: false, reason: 'credential_quota_exhausted' });
@@ -4999,7 +5017,15 @@ describe('runStage — unit lanes (docs/v2-parallel.md WP4)', () => {
       unitDeps({
         store,
         availableClis: ['kiro'],
-        spawnFn: () => ({ ...okSpawn(), stdin: { end: (text) => prompts.push(text) } }),
+        spawnFn: (_command, argv) =>
+          argv.includes('--list-sessions')
+            ? kiroChild({
+                stdout: kiroListing([{ sessionId: 'session-billing', source: 'v2' }]),
+              })
+            : {
+                ...kiroChild({ stdout: kiroStream('session-billing') }),
+                stdin: { end: (text) => prompts.push(text) },
+              },
       }),
     );
     expect(retried).toMatchObject({ ok: true, state: 'SUCCEEDED', unitSlug: 'billing' });
