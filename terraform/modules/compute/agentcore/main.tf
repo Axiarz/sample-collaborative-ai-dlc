@@ -29,6 +29,8 @@ terraform {
 }
 
 provider "docker" {
+  # Private ECR push auth. Buildx source pulls instead read DOCKER_CONFIG, set
+  # by scripts/with-public-ecr-auth.mjs for both ARM64 and optional AMD64 builds.
   # Support for Podman via DOCKER_HOST environment variable (e.g., unix:///path/to/podman.sock)
   # If DOCKER_HOST is not set, defaults to the standard Docker socket
   registry_auth {
