@@ -123,21 +123,23 @@ export const promoteUnits = async (payload, deps) => {
     // batch (batches are sorted). The fan-out approval can override.
     // Consistent: a stale read would drop decisions the fan-out approval saved.
     const existingPlan = await store.getUnitPlan(executionId, { consistentRead: true });
+    const priorSkeleton = existingPlan?.walkingSkeleton;
+    const priorProblem =
+      priorSkeleton == null ? null : skeletonProblem({ units, batches }, priorSkeleton);
+    const walkingSkeleton = priorProblem
+      ? effectiveSkeleton({ units, batches })
+      : effectiveSkeleton({ units, batches, walkingSkeleton: priorSkeleton });
     const plan = await store.putUnitPlan({
       executionId,
       units,
       batches,
       sourceArtifactId: artifact.id ?? null,
       producedByStageInstanceId: stageInstanceId,
-      // Preserve previously captured human decisions across a re-promotion —
-      // a rewind re-produces the DAG, not the humans' skip/skeleton/autonomy
-      // answers (the unit-DAG stage's gate re-confirms them on re-approval).
+      // Keep valid choices across re-promotion. A regenerated DAG can rename
+      // or add dependencies to the old skeleton; choose a valid default BEFORE
+      // the normal fan-out approval, preserving the original answer in history.
       skipMatrix: existingPlan?.skipMatrix ?? {},
-      walkingSkeleton: effectiveSkeleton({
-        units,
-        batches,
-        walkingSkeleton: existingPlan?.walkingSkeleton,
-      }),
+      walkingSkeleton,
       autonomyMode: existingPlan?.autonomyMode ?? null,
     });
     const sync = await store.syncUnitRows({
@@ -146,8 +148,12 @@ export const promoteUnits = async (payload, deps) => {
       batches,
       sectionIndexes,
     });
-    // A new DAG can invalidate a captured choice. Preserve the decision for
-    // explicit re-approval and surface the dependency before it can execute.
+    if (priorProblem)
+      await event(
+        'v2.units.skeleton_reselected',
+        `${priorProblem} Regenerated DAG default: ${walkingSkeleton}; review it at fan-out approval.`,
+      );
+    // Execution still rejects invalid choices in an already approved plan.
     const selectionProblem = skeletonProblem(plan);
     if (selectionProblem) await event('v2.units.decisions_invalid', selectionProblem);
 

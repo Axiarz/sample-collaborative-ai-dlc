@@ -75,8 +75,10 @@ use the active unit plan; retained rows from earlier plans remain history.
 
 A walking skeleton must be a dependency-free unit in the current DAG. A missing
 choice receives a dependency-free default before approval. Re-promotion retains
-captured human choices and reports any newly invalid dependency; approval and
-execution reject an invalid effective choice. A workflow with `skeleton: off`
+valid captured choices. If the regenerated DAG renames that unit or gives it
+dependencies, promotion records the change and offers a new dependency-free
+default at the normal fan-out approval. Original answers remain in history.
+Execution still rejects invalid choices in an already approved plan. A workflow with `skeleton: off`
 still runs all units, without the solo-first ceremony.
 
 Shared stages and successful completion require every active-plan lane to be

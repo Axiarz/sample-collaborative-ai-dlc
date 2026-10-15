@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { __durableHandler } from '../index.js';
+import { promoteUnits } from '../../agentcore/commands/promote-units.js';
 import dependentSkeletonPlan from './fixtures/dependent-skeleton-plan.json';
 
 // The orchestrator's control flow is driven through an injected `deps` bag and a
@@ -2506,6 +2507,66 @@ describe('WP5 — engine-gate decisions', () => {
     ).toBe(false);
     expect(unitPlanRow.walkingSkeleton).toBe('notification-core');
   });
+
+  it.each([
+    ['renamed-unit', false],
+    ['billing', false],
+    ['billing', true],
+  ])(
+    'plain approval executes a regenerated DAG after old skeleton %s becomes invalid (ceremony off: %s)',
+    async (oldSkeleton, ceremonyOff) => {
+      unitPlanRow.walkingSkeleton = oldSkeleton;
+      if (ceremonyOff) {
+        const plan = SECTION_PLAN();
+        plan.plan.stages
+          .filter((stage) => stage.parallelSection === 1)
+          .forEach((stage) => {
+            stage.policy = { skeleton: 'off' };
+          });
+        deps.loadPlan.mockResolvedValue(plan);
+      }
+      const graph = {
+        lookupArtifacts: async () => [
+          {
+            id: 'regenerated',
+            content:
+              '```yaml\nunits:\n  - name: auth\n    depends_on: []\n  - name: billing\n    depends_on: [auth]\n```',
+          },
+        ],
+        mirrorUnitDag: async () => ({}),
+      };
+      deps.invokeRuntime = makeRuntime(ctx, async (payload) => {
+        if (payload.command !== 'promote-units') return sectionScript(payload);
+        return promoteUnits(payload, {
+          store: {
+            ...deps.store,
+            putUnitPlan: async (plan) => {
+              unitPlanRow = plan;
+              return plan;
+            },
+            syncUnitRows: async () => ({ created: [], preserved: [], orphaned: [] }),
+          },
+          openGraph: async () => ({}),
+          createWriter: () => graph,
+        });
+      });
+      const result = await start();
+      expect(result.ok).toBe(true);
+      expect(unitPlanRow.walkingSkeleton).toBe('auth');
+      if (ceremonyOff)
+        expect(
+          deps.store.getHumanTask.mock.calls.some(([, id]) => id.startsWith('eg-skeleton')),
+        ).toBe(false);
+      expect(
+        invokes
+          .filter((payload) => payload.command === 'merge-lane')
+          .map((payload) => payload.unitSlug),
+      ).toEqual(['auth', 'billing']);
+      expect(
+        deps.store.updateExecution.mock.calls.some(([input]) => input.status === 'SUCCEEDED'),
+      ).toBe(true);
+    },
+  );
 
   it('does not execute a different default when an approved fan-out decision cannot be saved', async () => {
     deps.store.updateUnitPlanDecisions.mockRejectedValue(new Error('decision store unavailable'));
