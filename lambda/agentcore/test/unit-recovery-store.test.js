@@ -90,3 +90,55 @@ it('admits one recovery owner and atomically fences stale unit, plan and stage w
     }),
   ).toBeNull();
 });
+
+it('claims a stale repair once and rejects late cleanup and a racing generic start', async () => {
+  const executionId = randomUUID();
+  await store.createExecution({ executionId, intentId: executionId, projectId: 'project' });
+  await store.updateExecution({
+    executionId,
+    status: 'FAILED',
+    orchestratorRunId: 'lost-worker',
+    failureReason: 'lane_repair_in_progress',
+    repairStartedAt: '2020-01-01T00:00:00.000Z',
+    repairPlan: { owner: 'lost-worker', sectionIndex: 1, walkingSkeleton: 'foundation' },
+  });
+  const old = await store.getExecution(executionId, { consistentRead: true });
+  const takeover = (owner) =>
+    store.updateExecution({
+      executionId,
+      fromStatus: 'FAILED',
+      ifOrchestratorRunId: old.orchestratorRunId,
+      ifUpdatedAt: old.updatedAt,
+      orchestratorRunId: owner,
+      repairStartedAt: new Date().toISOString(),
+      repairPlan: { ...old.repairPlan, owner },
+    });
+  const results = await Promise.allSettled([takeover('successor-a'), takeover('successor-b')]);
+  expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+  await expect(
+    store.updateExecution({
+      executionId,
+      fromStatus: 'FAILED',
+      ifOrchestratorRunId: old.orchestratorRunId,
+      ifUpdatedAt: old.updatedAt,
+      status: 'CREATED',
+      failureReason: null,
+    }),
+  ).rejects.toMatchObject({ name: 'ConditionalCheckFailedException' });
+  await expect(
+    store.updateExecution({
+      executionId,
+      ifOrchestratorRunId: old.orchestratorRunId,
+      failureReason: 'lane_repair_failed',
+      repairPlan: null,
+    }),
+  ).rejects.toMatchObject({ name: 'ConditionalCheckFailedException' });
+  await expect(
+    store.deleteWorkflowCheckpoint(executionId, {
+      ifOrchestratorRunId: old.orchestratorRunId,
+    }),
+  ).rejects.toMatchObject({ name: 'ConditionalCheckFailedException' });
+  const current = await store.getExecution(executionId, { consistentRead: true });
+  expect(current.repairPlan.owner).toBe(current.orchestratorRunId);
+  expect(current.failureReason).toBe('lane_repair_in_progress');
+});

@@ -797,6 +797,7 @@ export interface IntentDetail {
   /** Composer sessions (scope/grid proposals + authoritative validation). */
   composes?: ComposeSession[];
   unitPlan?: IntentUnitPlan | null;
+  repairStatus?: 'in-progress' | 'interrupted' | null;
   unitCompletion?: {
     state: 'complete' | 'partial' | 'incomplete';
     total: number;

@@ -383,8 +383,22 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     return Item ?? null;
   };
 
-  const deleteWorkflowCheckpoint = async (executionId) => {
+  const deleteWorkflowCheckpoint = async (executionId, { ifOrchestratorRunId } = {}) => {
     if (!executionId) throw new Error('deleteWorkflowCheckpoint requires executionId');
+    if (ifOrchestratorRunId) {
+      await transact([
+        {
+          ConditionCheck: {
+            TableName: table(),
+            Key: executionMetaKey(executionId),
+            ConditionExpression: 'orchestratorRunId = :run',
+            ExpressionAttributeValues: { ':run': ifOrchestratorRunId },
+          },
+        },
+        { Delete: { TableName: table(), Key: workflowCheckpointKey(executionId) } },
+      ]);
+      return null;
+    }
     const { Attributes } = await ddb.send(
       new DeleteCommand({
         TableName: table(),
@@ -423,6 +437,8 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     startedAt,
     completedAt,
     failureReason,
+    repairStartedAt,
+    repairPlan,
     failure,
     startedBy,
     starterName,
@@ -518,6 +534,14 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     if (failureReason !== undefined) {
       sets.push('failureReason = :fr');
       values[':fr'] = failureReason;
+    }
+    if (repairStartedAt !== undefined) {
+      sets.push('repairStartedAt = :repairStartedAt');
+      values[':repairStartedAt'] = repairStartedAt;
+    }
+    if (repairPlan !== undefined) {
+      sets.push('repairPlan = :repairPlan');
+      values[':repairPlan'] = repairPlan;
     }
     if (failure !== undefined) {
       if (
@@ -1385,6 +1409,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     humanTaskId,
     supersededBy = null,
     ownership = null,
+    ifOrchestratorRunId = null,
   }) => {
     const ts = now();
     try {
@@ -1417,6 +1442,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
         await writeStageAttempt({ executionId, ownership, writes: [{ Update: input }] });
         return getHumanTask(executionId, humanTaskId, { consistentRead: true });
       }
+      if (ifOrchestratorRunId) return updateForRun(executionId, ifOrchestratorRunId, input);
       const { Attributes } = await ddb.send(new UpdateCommand(input));
       return Attributes;
     } catch (e) {
@@ -2470,6 +2496,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     repository,
     state,
     fromStates = null,
+    ifOrchestratorRunId = null,
     fields = {},
   }) => {
     if (state !== undefined && !UNIT_PR_STATES.includes(state)) {
@@ -2520,6 +2547,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
         params.ExpressionAttributeValues[`:from${index}`] = value;
       });
     }
+    if (ifOrchestratorRunId) return updateForRun(executionId, ifOrchestratorRunId, params);
     try {
       const { Attributes } = await ddb.send(new UpdateCommand(params));
       return Attributes;

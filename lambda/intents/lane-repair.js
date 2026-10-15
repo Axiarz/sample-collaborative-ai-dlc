@@ -7,6 +7,19 @@ import {
   unitCompletion,
 } from '../shared/unit-completion.js';
 
+// Longer than the intents Lambda's 120-second lifetime. A killed worker cannot
+// renew this lease; its successor must still claim the exact old run atomically.
+export const REPAIR_LEASE_MS = 5 * 60 * 1000;
+export const pendingRepair = (meta) =>
+  Boolean(
+    (meta.repairPlan && meta.repairPlan.owner === meta.orchestratorRunId) ||
+    meta.failureReason === 'lane_repair_in_progress',
+  );
+export const activeRepair = (meta, now = Date.now()) =>
+  pendingRepair(meta) &&
+  (meta.failureReason === 'lane_repair_in_progress' || meta.status === 'CREATED') &&
+  Date.parse(meta.repairStartedAt ?? meta.updatedAt) + REPAIR_LEASE_MS > now;
+
 // Narrow extension of lane repair: terminal executions with unfinished active
 // plan work. Rewind deliberately resets integrated lanes and is not equivalent.
 export const incompleteSectionRepair = (meta, records, plan) => {

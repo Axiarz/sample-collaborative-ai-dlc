@@ -52,8 +52,13 @@ Retirement compares the prior status, run token and update timestamp. Stage
 resets, unit updates and replacement skeleton decisions check the recovery run
 token in the same DynamoDB transaction as the write. A concurrent confirmation
 cannot relaunch a second run. Rewind/recompose cannot steal that retirement
-token. Interrupted cleanup leaves recoverable FAILED state; review a fresh
-preview before retrying. Integrated unit rows and their completed stages are
+token. Repair stores its reviewed plan and a five-minute `repairStartedAt` lease,
+longer than the API worker's lifetime. If the worker dies without running its
+catch, preview becomes available after expiry; confirmation claims the old run
+conditionally and resumes that saved section and skeleton choice. A handled
+failure permits an immediate fresh preview. Generic start cannot bypass an
+unfinished repair. A late owner cannot clear its successor's lease or relaunch.
+Integrated unit rows and their completed stages are
 never reset by this flow. Missing/unstarted lanes may resume from the section
 boundary; completed stages of unfinished lanes are preserved.
 

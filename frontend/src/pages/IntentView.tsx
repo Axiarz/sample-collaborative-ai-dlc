@@ -376,6 +376,7 @@ export default function IntentView() {
   const terminalPartial =
     intent.status === 'SUCCEEDED' && detail.unitCompletion?.state === 'partial';
   const needsLaneRepair =
+    Boolean(detail.repairStatus) ||
     terminalIncomplete ||
     (recoveryWaits.length > 0 && ['RUNNING', 'WAITING', 'FAILED'].includes(intent.status));
   const error = actionError ?? loadError;
@@ -621,12 +622,22 @@ export default function IntentView() {
             <div className="min-w-0">
               <div className="flex items-center gap-1.5 font-medium text-agent-error">
                 <TriangleAlert className="h-4 w-4" />
-                {terminalIncomplete
-                  ? 'Current plan has unfinished work'
-                  : 'Parallel execution needs recovery'}
+                {detail.repairStatus
+                  ? detail.repairStatus === 'in-progress'
+                    ? 'Recovery is in progress'
+                    : 'Recovery was interrupted'
+                  : terminalIncomplete
+                    ? 'Current plan has unfinished work'
+                    : 'Parallel execution needs recovery'}
               </div>
               <p className="mt-1 text-[12px] text-muted-foreground">
-                {terminalIncomplete ? (
+                {detail.repairStatus ? (
+                  detail.repairStatus === 'in-progress' ? (
+                    'Wait for recovery to finish. If the worker stops, a fresh preview becomes available after its five-minute recovery window.'
+                  ) : (
+                    'Preview recovery again to continue the saved recovery plan. Integrated work and the reviewed section boundary are preserved.'
+                  )
+                ) : terminalIncomplete ? (
                   `${detail.unitCompletion?.integrated} of ${detail.unitCompletion?.total} units integrated. The recorded completion did not finish the current plan. Preview recovery to preserve integrated work and continue the remaining units.`
                 ) : (
                   <>
@@ -643,7 +654,7 @@ export default function IntentView() {
                 size="sm"
                 variant="outline"
                 className="shrink-0 gap-1.5"
-                disabled={repairing}
+                disabled={repairing || detail.repairStatus === 'in-progress'}
                 onClick={() => void previewRepair()}
               >
                 {repairing ? (

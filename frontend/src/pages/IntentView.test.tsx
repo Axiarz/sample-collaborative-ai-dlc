@@ -1008,6 +1008,25 @@ describe('IntentView', () => {
     expect(repair).toHaveBeenCalledWith('p1', 'i1', { previewToken: 'preview-token' });
   });
 
+  it.each(['in-progress', 'interrupted'] as const)(
+    'shows a %s repair on a stranded launch',
+    async (repairStatus) => {
+      get.mockResolvedValue({ ...baseDetail({ status: 'CREATED' }), repairStatus });
+      renderAt();
+      const button = await screen.findByRole('button', { name: 'Preview recovery' });
+      if (repairStatus === 'in-progress') {
+        expect(button).toBeDisabled();
+        expect(screen.getByText(/five-minute recovery window/)).toBeInTheDocument();
+      } else {
+        expect(button).toBeEnabled();
+        expect(screen.getByText(/continue the saved recovery plan/)).toBeInTheDocument();
+        await userEvent.click(button);
+        expect(previewRepair).toHaveBeenCalledWith('p1', 'i1');
+      }
+      expect(repair).not.toHaveBeenCalled();
+    },
+  );
+
   it('explains incomplete terminal work, previews preserved code and confirms expansion of the existing PR', async () => {
     get.mockResolvedValue({
       ...baseDetail({ status: 'SUCCEEDED' }),

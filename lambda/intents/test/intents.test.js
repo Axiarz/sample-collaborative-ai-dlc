@@ -6647,6 +6647,72 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
     expect(orchestratorInvokes()).toHaveLength(1);
   });
 
+  it('takes over an expired repair without its catch running and fences the late worker', async () => {
+    const { sub, projectId, intent, pk } = await falseSuccess();
+    const { preview } = JSON.parse(
+      (await repair(sub, projectId, intent.id, { preview: true })).body,
+    );
+    let releaseOldWorker;
+    let reachedCleanup;
+    const cleanupStarted = new Promise((resolve) => {
+      reachedCleanup = resolve;
+    });
+    archiveArtifactsSpy.mockImplementationOnce(() => {
+      reachedCleanup();
+      return new Promise((resolve) => {
+        releaseOldWorker = resolve;
+      });
+    });
+    const first = repair(sub, projectId, intent.id, {
+      previewToken: preview.previewToken,
+      walkingSkeleton: 'foundation',
+    });
+    await cleanupStarted;
+    const locked = procStore.get(keyOf(pk, 'META'));
+    expect(locked).toMatchObject({
+      failureReason: 'lane_repair_in_progress',
+      repairPlan: {
+        walkingSkeleton: 'foundation',
+        preview: { fromStageId: 'cg', sectionIndex: 1 },
+      },
+    });
+    expect((await repair(sub, projectId, intent.id, { preview: true })).statusCode).toBe(409);
+    const start = () =>
+      handler({
+        httpMethod: 'POST',
+        path: `/projects/${projectId}/intents/${intent.id}/start`,
+        pathParameters: { projectId, intentId: intent.id },
+        body: '{}',
+        ...claims(sub),
+      });
+    expect((await start()).statusCode).toBe(409);
+    locked.repairStartedAt = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    expect((await start()).statusCode).toBe(409);
+    const retryPreview = JSON.parse(
+      (await repair(sub, projectId, intent.id, { preview: true })).body,
+    ).preview;
+    expect(retryPreview).toMatchObject({
+      fromStageId: 'cg',
+      laneSlugs: ['feature'],
+      preservedSlugs: ['foundation'],
+      skeletonCandidates: ['foundation'],
+    });
+    expect(
+      (
+        await repair(sub, projectId, intent.id, {
+          previewToken: retryPreview.previewToken,
+          walkingSkeleton: 'foundation',
+        })
+      ).statusCode,
+    ).toBe(202);
+    const afterTakeover = structuredClone([...procStore.entries()]);
+    releaseOldWorker([]);
+    expect((await first).statusCode).toBe(409);
+    expect([...procStore.entries()]).toEqual(afterTakeover);
+    expect(orchestratorInvokes()).toHaveLength(1);
+    expect(procStore.get(keyOf(pk, 'UNIT#S1#foundation')).state).toBe('MERGED');
+  });
+
   it('refuses a closed or merged final PR and enforces owner access for preview and recovery', async () => {
     const { sub, projectId, intent } = await falseSuccess();
     sourceControlOperationHandler = () => ({ state: 'merged', sourceBranch: 'aidlc/feature' });

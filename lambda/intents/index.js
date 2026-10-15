@@ -36,8 +36,13 @@ import {
   resolveEnvironmentSnapshot,
 } from '../shared/environment-snapshot.js';
 import { runtimeTargetInput } from '../shared/runtime-target.js';
-import { unitCompletion, skeletonProblem } from '../shared/unit-completion.js';
-import { incompleteSectionRepair, repairPreviewToken } from './lane-repair.js';
+import { unitCompletion, skeletonProblem, unitPlanIdentity } from '../shared/unit-completion.js';
+import {
+  incompleteSectionRepair,
+  repairPreviewToken,
+  activeRepair,
+  pendingRepair,
+} from './lane-repair.js';
 import { SessionReleaseHandoffError, stopSessions } from '../shared/runtime-session.js';
 import {
   composeSessionIdFor,
@@ -1789,12 +1794,14 @@ export const handler = async (event, context) => {
     if (
       intentId &&
       (httpMethod === 'DELETE' ||
-        (httpMethod === 'POST' && /\/(rewind|recompose|cancel)$/.test(path ?? '')))
+        (httpMethod === 'POST' && /\/(rewind|recompose|cancel|start)$/.test(path ?? '')))
     ) {
       const current = await store.getExecution(intentId, { consistentRead: true });
-      if (current?.projectId === projectId && current.failureReason === 'lane_repair_in_progress') {
+      if (current?.projectId === projectId && pendingRepair(current)) {
         return response(409, {
-          error: 'Recovery is in progress. Refresh before changing this execution.',
+          error: activeRepair(current)
+            ? 'Recovery is in progress. Refresh before changing this execution.'
+            : 'Recovery was interrupted. Use Preview recovery to finish the reviewed recovery plan.',
           code: 'repair_in_progress',
         });
       }
@@ -3156,6 +3163,12 @@ export const handler = async (event, context) => {
       if (!meta || meta.projectId !== projectId) {
         return response(404, { error: 'Intent not found' });
       }
+      if (pendingRepair(meta)) {
+        return response(409, {
+          error: 'Use Preview recovery to finish the saved recovery plan.',
+          code: 'repair_in_progress',
+        });
+      }
       // Startable states: a fresh DRAFT, a FAILED run the user wants to retry, or
       // a CREATED run whose hand-off never reached a live orchestrator (stranded —
       // see the rollback below). init-ws is idempotent in the runtime, so a restart
@@ -3286,6 +3299,8 @@ export const handler = async (event, context) => {
           projectId,
           status: 'CREATED',
           fromStatus: priorStatus,
+          ifOrchestratorRunId: meta.orchestratorRunId,
+          ifUpdatedAt: meta.updatedAt,
           ifAttachmentRevision: Number(meta.attachmentRevision ?? 0),
           startedAt: meta.startedAt,
           durableExecutionName,
@@ -4156,12 +4171,15 @@ export const handler = async (event, context) => {
       if (!meta || meta.projectId !== projectId) {
         return response(404, { error: 'Intent not found' });
       }
-      if (!['RUNNING', 'WAITING', 'FAILED', 'SUCCEEDED'].includes(meta.status)) {
+      if (
+        !['RUNNING', 'WAITING', 'FAILED', 'SUCCEEDED'].includes(meta.status) &&
+        !(meta.status === 'CREATED' && pendingRepair(meta))
+      ) {
         return response(409, {
           error: `Intent is ${meta.status}; no active run can be repaired`,
         });
       }
-      if (meta.failureReason === 'lane_repair_in_progress') {
+      if (activeRepair(meta)) {
         return response(409, {
           error: 'Recovery is already in progress; refresh before retrying.',
           code: 'repair_in_progress',
@@ -4180,7 +4198,15 @@ export const handler = async (event, context) => {
           errors: planResult.errors ?? [],
         });
       }
-      const incompleteRepair = incompleteSectionRepair(meta, records, planResult.plan);
+      const savedRepair =
+        meta.repairPlan?.owner === meta.orchestratorRunId ? meta.repairPlan : null;
+      if (savedRepair && savedRepair.planIdentity !== unitPlanIdentity(records.unitPlan)) {
+        return response(409, {
+          error: 'The reviewed recovery plan changed; review the execution plan before continuing.',
+        });
+      }
+      const incompleteRepair =
+        savedRepair?.preview ?? incompleteSectionRepair(meta, records, planResult.plan);
       if (incompleteRepair?.error) return response(409, { error: incompleteRepair.error });
       const pendingByStage = new Map(
         (records.humanTasks ?? [])
@@ -4416,6 +4442,14 @@ export const handler = async (event, context) => {
           code: 'repair_preview_changed',
         });
       }
+      if (
+        savedRepair?.walkingSkeleton &&
+        repairInput.walkingSkeleton !== savedRepair.walkingSkeleton
+      ) {
+        return response(409, {
+          error: 'Resume the saved walking-skeleton decision shown in the recovery preview.',
+        });
+      }
       if (incompleteRepair?.skeletonProblem) {
         const problem = skeletonProblem(
           records.unitPlan,
@@ -4456,6 +4490,18 @@ export const handler = async (event, context) => {
           pendingHumanTaskId: null,
           resumeRequired: null,
           failureReason: 'lane_repair_in_progress',
+          repairStartedAt: new Date().toISOString(),
+          repairPlan: {
+            owner: repairRunId,
+            planIdentity: unitPlanIdentity(records.unitPlan),
+            preview: {
+              ...preview,
+              ...(repairInput.walkingSkeleton
+                ? { skeletonCandidates: [repairInput.walkingSkeleton] }
+                : {}),
+            },
+            walkingSkeleton: repairInput.walkingSkeleton ?? null,
+          },
           completedAt: null,
           orchestratorRunId: repairRunId,
         });
@@ -4466,7 +4512,16 @@ export const handler = async (event, context) => {
           code: 'repair_preview_changed',
         });
       }
+      const assertRepairOwner = async () => {
+        const current = await store.getExecution(intentId, { consistentRead: true });
+        if (current?.orchestratorRunId !== repairRunId || !activeRepair(current)) {
+          throw Object.assign(new Error('Recovery ownership changed. Refresh the preview.'), {
+            name: 'ConditionalCheckFailedException',
+          });
+        }
+      };
       try {
+        await assertRepairOwner();
         if (priorDurableExecutionArn) {
           try {
             await lambdaClient.send(
@@ -4505,6 +4560,7 @@ export const handler = async (event, context) => {
           }
         }
 
+        await assertRepairOwner();
         const archivedArtifacts = await archiveArtifactsForStages({
           g,
           intentId,
@@ -4513,11 +4569,13 @@ export const handler = async (event, context) => {
           reason: repairReason,
           actor: responder.displayName || responder.sub,
         });
-        await retireParkedRun(intentId, repairReason);
+        await assertRepairOwner();
+        await retireParkedRun(intentId, repairReason, repairRunId);
         await stopRuntimeSessions(intentId, meta, {
           sectionIndexes: [sectionIndex],
           unitSlugs: repairSlugs,
         });
+        await assertRepairOwner();
         if (incompleteRepair?.skeletonProblem) {
           await store.updateUnitPlanDecisions({
             executionId: intentId,
@@ -4574,6 +4632,7 @@ export const handler = async (event, context) => {
             state = stillReady ? 'READY' : 'DRAFT';
           }
           return store.updateUnitPr({
+            ifOrchestratorRunId: repairRunId,
             executionId: intentId,
             sectionIndex,
             slug: pr.unitSlug,
@@ -4651,7 +4710,8 @@ export const handler = async (event, context) => {
 
         const fromStageId = sectionStages[0].stageId;
         const durableExecutionName = durableExecutionNameForIntent(intentId);
-        await store.deleteWorkflowCheckpoint(intentId);
+        await assertRepairOwner();
+        await store.deleteWorkflowCheckpoint(intentId, { ifOrchestratorRunId: repairRunId });
         const updated = await store.updateExecution({
           executionId: intentId,
           projectId,
@@ -4675,6 +4735,7 @@ export const handler = async (event, context) => {
           ...mcpLaunch.update,
         });
         try {
+          await assertRepairOwner();
           const invoked = await invokeOrchestrator(
             {
               action: 'start',
@@ -4684,11 +4745,23 @@ export const handler = async (event, context) => {
             },
             { durableExecutionName },
           );
+          await store
+            .updateExecution({
+              executionId: intentId,
+              ifOrchestratorRunId: repairRunId,
+              repairPlan: null,
+              repairStartedAt: null,
+            })
+            .catch((error) => {
+              if (error?.name !== 'ConditionalCheckFailedException')
+                logger.error('Repair lease cleanup failed', error);
+            });
           if (invoked?.durableExecutionArn) {
             await store
               .updateExecution({
                 executionId: intentId,
                 durableExecutionArn: invoked.durableExecutionArn,
+                ifOrchestratorRunId: repairRunId,
               })
               .catch((error) => logger.error('Repair durable execution ARN stamp failed', error));
           }
@@ -4698,6 +4771,7 @@ export const handler = async (event, context) => {
             projectId,
             status: 'FAILED',
             fromStatus: 'CREATED',
+            ifOrchestratorRunId: repairRunId,
             startedAt: meta.startedAt,
             pendingHumanTaskId: null,
             failureReason: 'lane_repair_relaunch_failed',
@@ -4723,6 +4797,12 @@ export const handler = async (event, context) => {
             failureReason: 'lane_repair_failed',
           })
           .catch(() => {});
+        if (error?.name === 'ConditionalCheckFailedException') {
+          return response(409, {
+            error: 'Recovery ownership changed. Refresh the preview.',
+            code: 'repair_preview_changed',
+          });
+        }
         logger.error('Lane repair failed', error);
         return response(502, {
           error:
@@ -5405,6 +5485,11 @@ export const handler = async (event, context) => {
       const priceFor = await getPriceResolver();
       return response(200, {
         intent: mapIntent(records.meta),
+        repairStatus: pendingRepair(records.meta)
+          ? activeRepair(records.meta)
+            ? 'in-progress'
+            : 'interrupted'
+          : null,
         stages: records.stages.map(mapStage),
         // Activity feed: lifecycle events (workspace init, failures, completion)
         // newest-last in emit order, so the UI can show what's happening — init-ws
@@ -6469,7 +6554,7 @@ const runScheduledMaintenance = async (event = {}) => {
 // sees `superseded`, and exits WITHOUT touching META (docs/v2-steering.md), so
 // the retire can never race the relaunch. Best-effort per gate: a gate answered
 // concurrently is simply left alone.
-const retireParkedRun = async (executionId, reason) => {
+const retireParkedRun = async (executionId, reason, ifOrchestratorRunId = null) => {
   const records = await store.getExecutionRecords(executionId, { includeOutputs: false });
   const pending = (records.humanTasks ?? []).filter((h) => h.status === 'pending');
   for (const gate of pending) {
@@ -6478,6 +6563,7 @@ const retireParkedRun = async (executionId, reason) => {
         executionId,
         humanTaskId: gate.humanTaskId,
         supersededBy: reason,
+        ifOrchestratorRunId,
       })
       .catch((err) => {
         logger.error('Gate supersede failed', err);
