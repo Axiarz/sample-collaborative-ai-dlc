@@ -5428,6 +5428,38 @@ describe('DELETE /projects/{id}/intents/{intentId}', () => {
       .next();
   };
 
+  it('guards intent deletion during repair without intercepting nested DELETE routes', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const pk = `EXEC#${intent.id}`;
+    Object.assign(procStore.get(keyOf(pk, 'META')), {
+      status: 'FAILED',
+      failureReason: 'lane_repair_in_progress',
+      repairStartedAt: new Date().toISOString(),
+    });
+    const root = await del(sub, projectId, intent.id);
+    expect(root.statusCode).toBe(409);
+    expect(JSON.parse(root.body).code).toBe('repair_in_progress');
+    const nested = await handler({
+      httpMethod: 'DELETE',
+      path: `/projects/${projectId}/intents/${intent.id}/attachments/a1`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+    expect(nested.statusCode).toBe(409);
+    expect(JSON.parse(nested.body).error).toBe('Attachments can only be changed while DRAFT');
+    const unknown = await handler({
+      httpMethod: 'DELETE',
+      path: `/projects/${projectId}/intents/${intent.id}/unknown`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+    expect(unknown.statusCode).toBeGreaterThanOrEqual(400);
+    expect(JSON.parse(unknown.body).code).not.toBe('repair_in_progress');
+    expect(procStore.get(keyOf(pk, 'META')).failureReason).toBe('lane_repair_in_progress');
+  });
+
   it('deletes a DRAFT intent (no Neptune anchor yet) — 204 and the META row is gone', async () => {
     const sub = `u-${randomUUID()}`;
     const projectId = await seedV2Project(sub);

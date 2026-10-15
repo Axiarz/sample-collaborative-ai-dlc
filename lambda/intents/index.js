@@ -1791,11 +1791,15 @@ export const handler = async (event, context) => {
 
     const auth = await authorize(g, projectId, sub, response);
     if (auth.res) return auth.res;
-    if (
-      intentId &&
-      (httpMethod === 'DELETE' ||
-        (httpMethod === 'POST' && /\/(rewind|recompose|cancel|start)$/.test(path ?? '')))
-    ) {
+    const deletesIntent = Boolean(
+      intentId && httpMethod === 'DELETE' && path?.endsWith(`/intents/${intentId}`),
+    );
+    const changesExecution =
+      httpMethod === 'POST' &&
+      ['rewind', 'recompose', 'cancel', 'start'].some((action) =>
+        path?.endsWith(`/intents/${intentId}/${action}`),
+      );
+    if (intentId && (deletesIntent || changesExecution)) {
       const current = await store.getExecution(intentId, { consistentRead: true });
       if (current?.projectId === projectId && pendingRepair(current)) {
         return response(409, {
@@ -4019,7 +4023,7 @@ export const handler = async (event, context) => {
       return response(200, mapIntent(updated));
     }
 
-    if (intentId && httpMethod === 'DELETE') {
+    if (deletesIntent) {
       const meta = await store.getExecution(intentId);
       if (!meta || meta.projectId !== projectId) {
         return response(404, { error: 'Intent not found' });
