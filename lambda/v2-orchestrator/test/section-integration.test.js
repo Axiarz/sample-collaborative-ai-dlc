@@ -295,7 +295,9 @@ const makeWorld = ({ remote, unitPlan, fileFor, beforeStage = null, conflictAgen
 // wait for the row to appear, flip it, complete its durable callback.
 const answerEngineGate = async (world, prefix, patch = { status: 'answered' }) => {
   let id;
-  for (let i = 0; i < 400 && !id; i++) {
+  // Real Git and durable callbacks can exceed 10s under concurrent test load.
+  // Keep the wait bounded within the existing 120s test deadline.
+  for (let i = 0; i < 1200 && !id; i++) {
     id = [...world.gates.keys()].find((k) => k.startsWith(prefix));
     if (!id) await new Promise((r) => setTimeout(r, 25));
   }
@@ -455,7 +457,7 @@ describe('WP8 fixture 2 — forced merge conflict → halt-and-ask SKIP (real gi
           : { name: 'shared.txt', content: `${slug} version\n` },
       beforeStage: async (payload, w) => {
         if (payload.unitSlug !== 'c') return;
-        for (let i = 0; i < 400 && !w.unitStates.includes('b:MERGED'); i++) {
+        for (let i = 0; i < 1200 && !w.unitStates.includes('b:MERGED'); i++) {
           await new Promise((r) => setTimeout(r, 25));
         }
       },
@@ -559,7 +561,7 @@ describe('WP6 fixture 3 — conflict RESOLVED by the resolution stage (real git)
           : { name: 'shared.txt', content: `${slug} version\n` },
       beforeStage: async (payload, w) => {
         if (payload.unitSlug !== 'c') return;
-        for (let i = 0; i < 400 && !w.unitStates.includes('b:MERGED'); i++) {
+        for (let i = 0; i < 1200 && !w.unitStates.includes('b:MERGED'); i++) {
           await new Promise((r) => setTimeout(r, 25));
         }
       },
