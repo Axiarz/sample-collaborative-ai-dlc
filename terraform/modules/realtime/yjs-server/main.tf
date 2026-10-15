@@ -226,6 +226,10 @@ resource "aws_ecs_task_definition" "yjs_server" {
     }]
     environment = concat([
       {
+        name  = "AWS_SDK_UA_APP_ID"
+        value = var.aws_sdk_ua_app_id
+      },
+      {
         name  = "COGNITO_USER_POOL_ID"
         value = var.cognito_user_pool_id
       },

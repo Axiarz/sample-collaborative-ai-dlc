@@ -738,6 +738,7 @@ resource "aws_security_group" "agentcore" {
 
 locals {
   runtime_environment_variables = {
+    AWS_SDK_UA_APP_ID             = var.aws_sdk_ua_app_id
     V2_WORKSPACE_DIR              = "/mnt/workspace"
     V2_PROCESS_TABLE              = aws_dynamodb_table.v2_executions.name
     BLOCKS_TABLE                  = var.blocks_table_name
