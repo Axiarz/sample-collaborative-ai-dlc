@@ -29,7 +29,6 @@ import { Logger } from '@aws-lambda-powertools/logger';
 import {
   BedrockAgentCoreClient,
   InvokeAgentRuntimeCommand,
-  StopRuntimeSessionCommand,
 } from '@aws-sdk/client-bedrock-agentcore';
 import { requirePlatformAdmin } from '../shared/authz.js';
 import {
@@ -39,6 +38,13 @@ import {
 import { runtimeTargetInput } from '../shared/runtime-target.js';
 import { unitCompletion, skeletonProblem } from '../shared/unit-completion.js';
 import { incompleteSectionRepair, repairPreviewToken } from './lane-repair.js';
+import { SessionReleaseHandoffError, stopSessions } from '../shared/runtime-session.js';
+import {
+  composeSessionIdFor,
+  intentSessionIdFor,
+  laneSessionIdFor,
+} from '../shared/runtime-session-ids.js';
+import { createSessionCleanupStore } from '../shared/session-cleanup-store.js';
 import { createProcessStore, isTransactionConflict } from '../shared/v2-process-store.js';
 import { isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
 import { deleteIntentCascade, IntentRunningError } from '../shared/intent-deletion.js';
@@ -155,6 +161,12 @@ const ssm = new SSMClient({});
 const s3 = new S3Client({});
 const lambdaClient = new LambdaClient({});
 const agentcore = new BedrockAgentCoreClient({});
+// Failed workspace releases on intent deletion are queued here and retried by
+// the environments status poller (shared/runtime-session.js).
+const sessionCleanupStore = createSessionCleanupStore({
+  ddb,
+  tableName: process.env.ENVIRONMENT_REGISTRY_TABLE,
+});
 const store = createProcessStore({ ddb });
 const logger = new Logger({ persistentKeys: { component: 'intents' } });
 
@@ -317,14 +329,10 @@ const ingestAttachmentUpload = async (event) => {
   }
 };
 const composeReportPrefix = (intentId) => `compose-reports/${intentId}/`;
-const runtimeSessionIdFor = (intentId) => `aidlc-intent-${intentId}`.padEnd(33, '0');
-// Composer one-shots run in a THROWAWAY session keyed by the compose id —
-// stateless, so a fresh microVM (on the CURRENT image) per request is exactly
-// right; see the compose dispatch below for the field incident this avoids.
-const composeSessionIdFor = (composeId) => `aidlc-compose-${composeId}`.padEnd(33, '0');
-// Unit-lane session ids — must mirror v2-orchestrator/section.js laneSessionIdFor.
-const laneSessionIdFor = (intentId, sectionIndex, slug) =>
-  `aidlc-intent-${intentId}-s${sectionIndex}-${slug}`.padEnd(33, '0');
+// Session ids (main, compose, lane) come from shared/runtime-session-ids.js.
+// Composer one-shots run in a THROWAWAY session keyed by the compose id — see
+// the compose dispatch below for the field incident this avoids.
+const runtimeSessionIdFor = intentSessionIdFor;
 const invokeSourceControl = async (input) => {
   if (!SOURCE_CONTROL_FN()) {
     throw Object.assign(new Error('Source-control service is not configured'), {
@@ -445,18 +453,9 @@ const stopRuntimeSessions = async (
   for (const idx of sectionIndexes) {
     for (const slug of unitSlugs) ids.push(laneSessionIdFor(intentId, idx, slug));
   }
-  await mapWithConcurrency(ids, 8, async (id) => {
-    try {
-      await agentcore.send(
-        new StopRuntimeSessionCommand({
-          ...target,
-          runtimeSessionId: id,
-        }),
-      );
-    } catch (err) {
-      logger.warn('stop-runtime-session best-effort miss', err, { id });
-    }
-  });
+  // stop, not release: cancel/rewind/relaunch keep the workspace so the next
+  // launch re-attaches it — see the retention policy in shared/runtime-session.js.
+  await stopSessions({ client: agentcore, target, sessionIds: ids });
 };
 // SSM path of the Admin GLOBAL per-CLI model defaults (written by the agents
 // lambda's PUT /agents/settings). Merged UNDER the project selection at create so
@@ -4030,6 +4029,7 @@ export const handler = async (event, context) => {
           meta,
           yjsTable: process.env.YJS_DOCUMENTS_TABLE,
           agentcoreRuntimeTarget: runtimeTargetInput(meta, AGENTCORE_RUNTIME_ARN()),
+          sessionCleanupStore,
           artifactsBucket: ARTIFACTS_BUCKET(),
           actor: responder.displayName || responder.sub,
           force: false,
@@ -4039,6 +4039,17 @@ export const handler = async (event, context) => {
           return response(409, {
             error:
               'Intent is RUNNING, cannot delete — wait for it to park or finish, or cancel it first',
+          });
+        }
+        if (err instanceof SessionReleaseHandoffError) {
+          // Nothing was removed: the intent still owns its workspace sessions.
+          logger.error('Intent delete: workspace release could not be handed off', err, {
+            intentId,
+            sessionIds: err.sessionIds,
+          });
+          return response(503, {
+            error: 'Could not release the intent workspaces right now; nothing was deleted. Retry.',
+            code: err.code,
           });
         }
         throw err;
