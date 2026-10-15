@@ -5314,12 +5314,23 @@ export const handler = async (event, context) => {
       });
 
       // Retire only after every affected artifact was durably snapshotted.
-      await store.updateExecution({
-        executionId: intentId,
-        fromStatus: meta.status,
-        ifOrchestratorRunId: meta.orchestratorRunId,
-        orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
-      });
+      try {
+        await store.updateExecution({
+          executionId: intentId,
+          fromStatus: meta.status,
+          ifOrchestratorRunId: meta.orchestratorRunId,
+          orchestratorRunId: `retired-${randomBytes(8).toString('hex')}`,
+        });
+      } catch (error) {
+        if (error?.name === 'ConditionalCheckFailedException') {
+          return response(409, {
+            error:
+              'Execution changed while preparing recompose. Refresh and review the stage selection again.',
+            code: 'execution_changed',
+          });
+        }
+        throw error;
+      }
       await retireParkedRun(intentId, `recomposed from ${fromStage.stageId}`);
       await stopRuntimeSessions(intentId, meta);
       for (const stageInstanceId of resetIds) {

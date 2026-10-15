@@ -2970,6 +2970,51 @@ describe('POST /recompose — in-flight reshape', () => {
     expect(events.map((e) => e.eventType)).toContain('v2.execution.recomposed');
   });
 
+  it.each(['ownership race', 'storage failure'])(
+    'stops recompose after a retirement %s',
+    async (failure) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      seedRecomposeFixtures();
+      const intent = await seedRun(sub, projectId, {
+        metaOver: { orchestratorRunId: 'original-run' },
+        rows: [
+          { stageInstanceId: 'si-analyze', stageId: 'analyze', state: 'SUCCEEDED' },
+          { stageInstanceId: 'si-optional', stageId: 'optional', state: 'WAITING_FOR_HUMAN' },
+        ],
+      });
+      const pk = `EXEC#${intent.id}`;
+      seedGate(intent.id, 'keep-pending', { status: 'pending' });
+      if (failure === 'ownership race') {
+        archiveArtifactsSpy.mockImplementationOnce(async () => {
+          procStore.get(keyOf(pk, 'META')).orchestratorRunId = 'concurrent-run';
+          return [];
+        });
+      } else {
+        ddbMock
+          .on(UpdateCommand, {
+            Key: { pk, sk: 'META' },
+            ExpressionAttributeValues: { ':ifOrid': 'original-run' },
+          })
+          .rejects(new Error('storage unavailable'));
+      }
+      const result = await recomposeReq(sub, projectId, intent.id, {
+        composedGrid: { analyze: 'EXECUTE', optional: 'EXECUTE', build: 'SKIP' },
+      });
+      expect(result.statusCode).toBe(failure === 'ownership race' ? 409 : 500);
+      if (failure === 'ownership race')
+        expect(JSON.parse(result.body).code).toBe('execution_changed');
+      expect(procStore.get(keyOf(pk, 'HUMAN#keep-pending')).status).toBe('pending');
+      expect(procStore.get(keyOf(pk, 'STAGE#si-optional'))).toMatchObject({
+        state: 'WAITING_FOR_HUMAN',
+        attempt: 0,
+      });
+      expect(procStore.get(keyOf(pk, 'META')).composedGrid).toBeFalsy();
+      expect(agentcoreMock.commandCalls(StopRuntimeSessionCommand)).toHaveLength(0);
+      expect(orchestratorInvokes()).toHaveLength(0);
+    },
+  );
+
   it('freezes the past: a stage that ran cannot flip to SKIP', async () => {
     const sub = `u-${randomUUID()}`;
     const projectId = await seedV2Project(sub);
