@@ -49,7 +49,9 @@ with `repair_delivery_unverified`. Missing graph data is not proof of no PR;
 provider read failures remain separate errors. Confirmation sends the preview token and, when necessary, an explicitly
 selected dependency-free `walkingSkeleton`. A materially changed preview returns 409. Orphaned-lane previews ignore routine sibling progress and output timestamps;
 run, plan, candidate integration, skip decisions and orphaned gate identity still
-invalidate them. Admission re-reads META immediately before its conditional claim.
+invalidate them. Admission re-reads META and the relevant execution records after
+provider checks, immediately before its conditional claim, and preserves sibling
+stages that completed during those checks.
 Legacy unit rows without a section mapping remain readable, but this recovery
 refuses them rather than guessing which integrated work to preserve.
 

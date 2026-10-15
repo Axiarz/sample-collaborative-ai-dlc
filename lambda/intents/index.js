@@ -4332,7 +4332,7 @@ export const handler = async (event, context) => {
         (records.stages ?? []).map((stage) => [stage.stageInstanceId, stage]),
       );
       const completedStageStates = new Set(['SUCCEEDED', 'SKIPPED']);
-      const resetInstances = sectionInstances.filter((instance) => {
+      let resetInstances = sectionInstances.filter((instance) => {
         const row = stagesByInstance.get(instance.stageInstanceId);
         return row && !completedStageStates.has(row.state);
       });
@@ -4513,17 +4513,34 @@ export const handler = async (event, context) => {
         priorDurableExecutionArn = listed.DurableExecutions?.[0]?.DurableExecutionArn ?? null;
       }
 
-      // Re-read after provider checks, immediately before the CAS. Output-only
-      // META updates during those reads must not starve a reviewed orphan repair.
+      // Re-read after provider checks, immediately before the CAS. Ordinary
+      // sibling progress is allowed, but new integration/decisions/gates change
+      // the reviewed recovery. Preserve stages completed during those reads.
+      const claimRecords =
+        preview.kind === 'orphaned-lanes'
+          ? await store.getExecutionRecords(intentId, {
+              includeOutputs: false,
+              consistentRead: true,
+            })
+          : records;
       const claimMeta =
         preview.kind === 'orphaned-lanes'
           ? await store.getExecution(intentId, { consistentRead: true })
           : meta;
-      if (!claimMeta || repairPreviewToken(claimMeta, records, preview) !== previewToken) {
+      if (!claimMeta || repairPreviewToken(claimMeta, claimRecords, preview) !== previewToken) {
         return response(409, {
           error: 'Execution changed. Refresh the recovery preview.',
           code: 'repair_preview_changed',
         });
+      }
+      if (preview.kind === 'orphaned-lanes') {
+        stagesByInstance.clear();
+        for (const stage of claimRecords.stages ?? [])
+          stagesByInstance.set(stage.stageInstanceId, stage);
+        resetInstances = resetInstances.filter(
+          (instance) =>
+            !completedStageStates.has(stagesByInstance.get(instance.stageInstanceId)?.state),
+        );
       }
       const repairRunId = `retired-${randomBytes(8).toString('hex')}`;
       try {
