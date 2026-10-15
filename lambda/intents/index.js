@@ -4214,6 +4214,13 @@ export const handler = async (event, context) => {
         savedRepair?.preview ?? incompleteSectionRepair(meta, records, planResult.plan);
       if (incompleteRepair?.error)
         return response(409, { error: incompleteRepair.error, code: incompleteRepair.code });
+      if (meta.status === 'SUCCEEDED' && incompleteRepair?.kind !== 'incomplete-section') {
+        return response(409, {
+          error:
+            'Completed or accepted partial delivery cannot be reopened through generic lane repair.',
+          code: 'repair_not_needed',
+        });
+      }
       const pendingByStage = new Map(
         (records.humanTasks ?? [])
           .filter((gate) => gate.status === 'pending' && gate.stageInstanceId)

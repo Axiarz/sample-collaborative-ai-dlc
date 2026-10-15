@@ -1,3 +1,4 @@
+import { unitPlanIdentity } from '../../shared/unit-completion.js';
 import { beforeAll, beforeEach, afterAll, describe, it, expect, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -6556,6 +6557,77 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
       request.operation === 'pr-status' ? { state: 'open', sourceBranch: 'aidlc/feature' } : null;
     return { sub, projectId, intent, pk };
   };
+
+  it.each(['complete', 'partial', 'legacy-partial'])(
+    'does not reopen SUCCEEDED %s delivery through stale PR-review rows',
+    async (outcome) => {
+      const { sub, projectId, intent, pk } = await falseSuccess();
+      const feature = procStore.get(keyOf(pk, 'UNIT#S1#feature'));
+      feature.state = outcome === 'complete' ? 'MERGED' : 'PR_DRAFT';
+      const slug = outcome === 'complete' ? 'old-plan-unit' : 'feature';
+      procStore.get(keyOf(pk, `UNIT#S1#${slug}`)).state = 'PR_DRAFT';
+      if (outcome === 'partial')
+        feature.completionSkip = {
+          humanTaskId: 'accepted-skip',
+          planIdentity: unitPlanIdentity(procStore.get(keyOf(pk, 'UNITPLAN'))),
+        };
+      if (outcome === 'legacy-partial') {
+        seedGate(intent.id, 'eg-halt-s1-r0', { status: 'answered' });
+        Object.assign(procStore.get(keyOf(pk, 'HUMAN#eg-halt-s1-r0')), {
+          orchestratorRunId: 'finished-run',
+          answer: { decision: 'skip' },
+        });
+      }
+      const sk = `UNITPR#S1#${slug}#owner%2Frepo`;
+      procStore.set(keyOf(pk, sk), {
+        pk,
+        sk,
+        sectionIndex: 1,
+        unitSlug: slug,
+        repository: 'owner/repo',
+        number: 12,
+        state: 'DRAFT',
+      });
+      const before = structuredClone([...procStore.entries()]);
+      for (const input of [{}, { preview: true }]) {
+        const result = await repair(sub, projectId, intent.id, input);
+        expect(result.statusCode).toBe(409);
+        expect(JSON.parse(result.body).code).toBe('repair_not_needed');
+      }
+      expect([...procStore.entries()]).toEqual(before);
+      expect(archiveArtifactsSpy).not.toHaveBeenCalled();
+      expect(orchestratorInvokes()).toHaveLength(0);
+    },
+  );
+
+  it('recovers genuinely unfinished work while preserving another unit’s accepted skip', async () => {
+    const { sub, projectId, intent, pk } = await falseSuccess();
+    const plan = procStore.get(keyOf(pk, 'UNITPLAN'));
+    plan.units.push({ slug: 'omitted', dependsOn: ['foundation'] });
+    plan.batches[1].push('omitted');
+    const skipped = {
+      pk,
+      sk: 'UNIT#S1#omitted',
+      slug: 'omitted',
+      sectionIndex: 1,
+      state: 'PR_DRAFT',
+      completionSkip: { humanTaskId: 'accepted-skip', planIdentity: unitPlanIdentity(plan) },
+    };
+    procStore.set(keyOf(pk, skipped.sk), skipped);
+    const { preview } = JSON.parse(
+      (await repair(sub, projectId, intent.id, { preview: true })).body,
+    );
+    expect(preview.laneSlugs).toEqual(['feature']);
+    expect(
+      (
+        await repair(sub, projectId, intent.id, {
+          previewToken: preview.previewToken,
+          walkingSkeleton: 'foundation',
+        })
+      ).statusCode,
+    ).toBe(202);
+    expect(procStore.get(keyOf(pk, skipped.sk))).toEqual(skipped);
+  });
 
   it('previews and recovers terminal incomplete work without resetting integration or historical rows', async () => {
     const { sub, projectId, intent, pk } = await falseSuccess();

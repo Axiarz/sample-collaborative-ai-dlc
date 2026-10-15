@@ -66,6 +66,8 @@ boundary; completed stages of unfinished lanes are preserved.
 
 New human skips persist a per-unit `completionSkip` receipt tied to the unit-plan
 identity and answered gate. Original events and answers remain immutable.
+A SUCCEEDED intent is admitted only for actual incomplete-section recovery;
+historical PR-review rows cannot reopen completed or accepted partial delivery.
 Legacy skips without receipts are shown as accepted partial delivery when the
 current run's answered halt gate records that choice; they are not silently
 reinterpreted as false success.
