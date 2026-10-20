@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Amplify } from 'aws-amplify';
 
 const authMocks = vi.hoisted(() => ({
   signIn: vi.fn(),
@@ -142,6 +143,34 @@ describe('SSO frontend configuration', () => {
 
   it('does not grant hosted SSO tokens Cognito self-service write access', () => {
     expect(cognitoOauthScopes).not.toContain('aws.cognito.signin.user.admin');
+  });
+
+  it('uses the configured Cognito User Pool endpoint for a local emulator', async () => {
+    vi.resetModules();
+    vi.stubEnv('VITE_COGNITO_USER_POOL_ENDPOINT', 'http://localhost:8787/cognito-idp');
+
+    await import('./auth');
+
+    expect(Amplify.configure).toHaveBeenCalledWith({
+      Auth: {
+        Cognito: expect.objectContaining({
+          userPoolEndpoint: 'http://localhost:8787/cognito-idp',
+        }),
+      },
+    });
+  });
+
+  it('keeps the default AWS endpoint when no override is configured', async () => {
+    vi.resetModules();
+    vi.stubEnv('VITE_COGNITO_USER_POOL_ENDPOINT', '');
+
+    await import('./auth');
+
+    expect(Amplify.configure).toHaveBeenCalledWith({
+      Auth: {
+        Cognito: expect.not.objectContaining({ userPoolEndpoint: expect.anything() }),
+      },
+    });
   });
 
   it.each(['invalid_grant', 'Pre token generation failed'])(

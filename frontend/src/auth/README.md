@@ -20,6 +20,11 @@ VITE_AWS_USER_POOL_ID=your-user-pool-id
 VITE_AWS_USER_POOL_CLIENT_ID=your-user-pool-client-id
 ```
 
+For a Cognito-compatible local service, set
+`VITE_COGNITO_USER_POOL_ENDPOINT` to its browser-accessible URL when building
+the frontend. Leave it unset for AWS Cognito. This Vite setting is baked into
+the build, so changing the target requires rebuilding the frontend.
+
 ## Usage
 
 ### AuthProvider

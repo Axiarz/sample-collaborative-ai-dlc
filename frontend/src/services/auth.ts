@@ -77,6 +77,9 @@ const cognitoConfig: Record<string, unknown> = {
   userPoolId: import.meta.env.VITE_AWS_USER_POOL_ID,
   userPoolClientId: import.meta.env.VITE_AWS_USER_POOL_CLIENT_ID,
 };
+if (import.meta.env.VITE_COGNITO_USER_POOL_ENDPOINT) {
+  cognitoConfig.userPoolEndpoint = import.meta.env.VITE_COGNITO_USER_POOL_ENDPOINT;
+}
 if (authConfiguration.mode !== 'local' && hostedUiOrigin) {
   cognitoConfig.loginWith = {
     oauth: {
